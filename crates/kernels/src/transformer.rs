@@ -20,6 +20,7 @@
 
 use crate::cache::KernelCache;
 use crate::device::{DeviceError, WarpDevice};
+use crate::kv_cache::LayerKVCache;
 use crate::tensor::GpuTensor;
 use crate::ops;
 
@@ -90,7 +91,7 @@ impl TransformerConfig {
             hidden_size: 1024,
             num_heads: 16,
             num_kv_heads: 16,
-            head_dim: 32, // Keep <=32 for flash attention
+            head_dim: 64, // Extended attention handles >32
             ffn_dim: 2048,
             rope_base: 10000.0,
             norm_eps: 1e-6,
@@ -156,17 +157,10 @@ pub fn transformer_block_forward(
     let shape_attn = warp_ir::Shape::from_static(&[attn_batch as usize, n as usize, d as usize]);
     let mut attn_out = GpuTensor::<f32>::zeros(device, shape_attn, warp_ir::DType::F32)?;
 
-    if d <= 32 {
-        crate::attention::attention_flash(
-            cache, device, &q_rope, &k_rope, &v_proj,
-            &mut attn_out, attn_batch, n, d, true,
-        )?;
-    } else {
-        crate::attention::attention_naive(
-            cache, device, &q_rope, &k_rope, &v_proj,
-            &mut attn_out, attn_batch, n, d, true,
-        )?;
-    }
+    crate::attention_ext::attention_best(
+        cache, device, &q_rope, &k_rope, &v_proj,
+        &mut attn_out, attn_batch, n, d, true,
+    )?;
 
     // 5. Output projection
     let mut attn_projected = GpuTensor::<f32>::zeros(device, shape_bnh.clone(), warp_ir::DType::F32)?;
@@ -199,6 +193,97 @@ pub fn transformer_block_forward(
     // 11. Final residual add
     let mut output = GpuTensor::<f32>::zeros(device, shape_bnh, warp_ir::DType::F32)?;
     ops::add(cache, device, &residual1, &ffn_out, &mut output)?;
+
+    Ok(output)
+}
+
+/// Forward pass with KV cache — for decode (single token at a time).
+///
+/// During prefill: call transformer_block_forward (processes full prompt).
+/// During decode: call this function (processes one new token, uses cached K/V).
+///
+/// x: [batch, 1, hidden_size] — single token's hidden state
+/// kv: layer KV cache (mutated: new K/V appended)
+/// Returns: [batch, 1, hidden_size]
+pub fn transformer_block_decode(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    x: &GpuTensor<f32>,
+    weights: &TransformerBlockWeights,
+    config: &TransformerConfig,
+    kv: &mut LayerKVCache,
+    batch: u32,
+    pos: u32,
+) -> Result<GpuTensor<f32>, DeviceError> {
+    let h = config.hidden_size;
+    let d = config.head_dim;
+    let kv_dim = config.kv_dim();
+    let ffn = config.ffn_dim;
+    let n = 1u32; // single token
+    let bn = batch * n;
+
+    let shape_bh = warp_ir::Shape::from_static(&[batch as usize, h as usize]);
+    let shape_bk = warp_ir::Shape::from_static(&[batch as usize, kv_dim as usize]);
+    let shape_bf = warp_ir::Shape::from_static(&[batch as usize, ffn as usize]);
+
+    // 1. RMSNorm
+    let mut normed = GpuTensor::<f32>::zeros(device, shape_bh.clone(), warp_ir::DType::F32)?;
+    ops::rmsnorm(cache, device, x, &weights.attn_norm, &mut normed, h, config.norm_eps)?;
+
+    // 2. Q, K, V projections (single token)
+    let mut q = GpuTensor::<f32>::zeros(device, shape_bh.clone(), warp_ir::DType::F32)?;
+    let mut new_k = GpuTensor::<f32>::zeros(device, shape_bk.clone(), warp_ir::DType::F32)?;
+    let mut new_v = GpuTensor::<f32>::zeros(device, shape_bk.clone(), warp_ir::DType::F32)?;
+
+    ops::gemm(cache, device, &normed, &weights.wq, &mut q, bn, h, h)?;
+    ops::gemm(cache, device, &normed, &weights.wk, &mut new_k, bn, kv_dim, h)?;
+    ops::gemm(cache, device, &normed, &weights.wv, &mut new_v, bn, kv_dim, h)?;
+
+    // 3. RoPE (single position)
+    let mut q_rope = GpuTensor::<f32>::zeros(device, shape_bh.clone(), warp_ir::DType::F32)?;
+    let mut k_rope = GpuTensor::<f32>::zeros(device, shape_bk.clone(), warp_ir::DType::F32)?;
+    crate::rope::rope(cache, device, &q, &mut q_rope, batch * config.num_heads, 1, d, config.rope_base, pos)?;
+    crate::rope::rope(cache, device, &new_k, &mut k_rope, batch * config.num_kv_heads, 1, d, config.rope_base, pos)?;
+
+    // 4. Append K, V to cache
+    kv.append(cache, device, &k_rope, &new_v)?;
+
+    // 5. Decode attention: Q[1, D] attends over full cache K/V
+    let mut attn_out = GpuTensor::<f32>::zeros(device,
+        warp_ir::Shape::from_static(&[batch as usize, d as usize]), warp_ir::DType::F32)?;
+    crate::kv_cache::decode_attention(cache, device, &q_rope, kv, &mut attn_out, d)?;
+
+    // 6. Output projection
+    // Note: attn_out is [batch, head_dim] but we need [batch, hidden_size]
+    // For single-head simplified case, we pad/project
+    let mut attn_projected = GpuTensor::<f32>::zeros(device, shape_bh.clone(), warp_ir::DType::F32)?;
+    ops::gemm(cache, device, &attn_out, &weights.wo, &mut attn_projected, bn, h, d)?;
+
+    // 7. Residual
+    let mut residual = GpuTensor::<f32>::zeros(device, shape_bh.clone(), warp_ir::DType::F32)?;
+    ops::add(cache, device, x, &attn_projected, &mut residual)?;
+
+    // 8. FFN norm
+    let mut ffn_normed = GpuTensor::<f32>::zeros(device, shape_bh.clone(), warp_ir::DType::F32)?;
+    ops::rmsnorm(cache, device, &residual, &weights.ffn_norm, &mut ffn_normed, h, config.norm_eps)?;
+
+    // 9-10. Gate + Up + SwiGLU + Down
+    let mut gate = GpuTensor::<f32>::zeros(device, shape_bf.clone(), warp_ir::DType::F32)?;
+    let mut up = GpuTensor::<f32>::zeros(device, shape_bf.clone(), warp_ir::DType::F32)?;
+    ops::gemm(cache, device, &ffn_normed, &weights.w_gate, &mut gate, bn, ffn, h)?;
+    ops::gemm(cache, device, &ffn_normed, &weights.w_up, &mut up, bn, ffn, h)?;
+
+    let mut gate_act = GpuTensor::<f32>::zeros(device, shape_bf.clone(), warp_ir::DType::F32)?;
+    ops::silu(cache, device, &gate, &mut gate_act)?;
+    let mut swiglu = GpuTensor::<f32>::zeros(device, shape_bf, warp_ir::DType::F32)?;
+    ops::mul(cache, device, &gate_act, &up, &mut swiglu)?;
+
+    let mut ffn_out = GpuTensor::<f32>::zeros(device, shape_bh.clone(), warp_ir::DType::F32)?;
+    ops::gemm(cache, device, &swiglu, &weights.w_down, &mut ffn_out, bn, h, ffn)?;
+
+    // 11. Final residual
+    let mut output = GpuTensor::<f32>::zeros(device, shape_bh, warp_ir::DType::F32)?;
+    ops::add(cache, device, &residual, &ffn_out, &mut output)?;
 
     Ok(output)
 }
