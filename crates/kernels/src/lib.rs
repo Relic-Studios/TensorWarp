@@ -17,7 +17,9 @@ pub mod device;
 pub mod elementwise;
 pub mod gemm;
 pub mod ops;
+pub mod rope;
 pub mod tensor;
+pub mod transformer;
 
 pub use cache::KernelCache;
 pub use device::WarpDevice;
