@@ -11,6 +11,10 @@
 
 pub mod safetensors_loader;
 pub mod llama;
+pub mod onnx;
+pub mod onnx_exec;
 
 pub use safetensors_loader::SafeTensorsLoader;
 pub use llama::{LlamaConfig, LlamaModel};
+pub use onnx::OnnxModel;
+pub use onnx_exec::OnnxExecutor;

@@ -21,6 +21,7 @@
 use crate::cache::KernelCache;
 use crate::device::{DeviceError, WarpDevice};
 use crate::kv_cache::LayerKVCache;
+use crate::quantize;
 use crate::tensor::GpuTensor;
 use crate::ops;
 
@@ -103,6 +104,302 @@ impl TransformerConfig {
     }
 }
 
+/// Q4_0 quantized weights for a single transformer block.
+///
+/// Norm weights stay f32 (tiny, not worth quantizing).
+/// All projection GEMMs use W4A16 — 6.4x weight compression.
+pub struct QuantizedBlockWeights {
+    /// Attention input norm [hidden_size] — f32
+    pub attn_norm: GpuTensor<f32>,
+    /// Q projection [hidden_size, hidden_size] — Q4_0
+    pub wq: GpuTensor<u8>,
+    /// K projection [hidden_size, kv_dim] — Q4_0
+    pub wk: GpuTensor<u8>,
+    /// V projection [hidden_size, kv_dim] — Q4_0
+    pub wv: GpuTensor<u8>,
+    /// Output projection [hidden_size, hidden_size] — Q4_0
+    pub wo: GpuTensor<u8>,
+    /// FFN input norm [hidden_size] — f32
+    pub ffn_norm: GpuTensor<f32>,
+    /// Gate projection [hidden_size, ffn_dim] — Q4_0
+    pub w_gate: GpuTensor<u8>,
+    /// Up projection [hidden_size, ffn_dim] — Q4_0
+    pub w_up: GpuTensor<u8>,
+    /// Down projection [ffn_dim, hidden_size] — Q4_0
+    pub w_down: GpuTensor<u8>,
+}
+
+/// Quantize a full-precision block's weights to Q4_0.
+pub fn quantize_block_weights(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    weights: &TransformerBlockWeights,
+    config: &TransformerConfig,
+) -> Result<QuantizedBlockWeights, DeviceError> {
+    let h = config.hidden_size;
+    let kv = config.kv_dim();
+    let ffn = config.ffn_dim;
+
+    Ok(QuantizedBlockWeights {
+        attn_norm: GpuTensor::from_host(device,
+            &weights.attn_norm.to_host(device)?,
+            weights.attn_norm.shape.clone(), warp_ir::DType::F32)?,
+        wq: quantize::quantize_weights_q4_0(cache, device, &weights.wq, h, h)?,
+        wk: quantize::quantize_weights_q4_0(cache, device, &weights.wk, h, kv)?,
+        wv: quantize::quantize_weights_q4_0(cache, device, &weights.wv, h, kv)?,
+        wo: quantize::quantize_weights_q4_0(cache, device, &weights.wo, h, h)?,
+        ffn_norm: GpuTensor::from_host(device,
+            &weights.ffn_norm.to_host(device)?,
+            weights.ffn_norm.shape.clone(), warp_ir::DType::F32)?,
+        w_gate: quantize::quantize_weights_q4_0(cache, device, &weights.w_gate, h, ffn)?,
+        w_up: quantize::quantize_weights_q4_0(cache, device, &weights.w_up, h, ffn)?,
+        w_down: quantize::quantize_weights_q4_0(cache, device, &weights.w_down, ffn, h)?,
+    })
+}
+
+/// Forward pass of a single transformer block with Q4_0 quantized weights.
+///
+/// Same computation as `transformer_block_forward` but all 7 projection
+/// GEMMs use W4A16 dequantize-on-the-fly.
+pub fn transformer_block_forward_q4(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    x: &GpuTensor<f32>,
+    weights: &QuantizedBlockWeights,
+    config: &TransformerConfig,
+    batch: u32,
+    seq_len: u32,
+    pos_offset: u32,
+) -> Result<GpuTensor<f32>, DeviceError> {
+    let h = config.hidden_size;
+    let d = config.head_dim;
+    let kv_dim = config.kv_dim();
+    let ffn = config.ffn_dim;
+    let bsz = batch;
+    let n = seq_len;
+
+    let shape_bnh = warp_ir::Shape::from_static(&[bsz as usize, n as usize, h as usize]);
+    let shape_bnk = warp_ir::Shape::from_static(&[bsz as usize, n as usize, kv_dim as usize]);
+    let shape_bnf = warp_ir::Shape::from_static(&[bsz as usize, n as usize, ffn as usize]);
+
+    // 1. RMSNorm
+    let mut normed = GpuTensor::<f32>::zeros(device, shape_bnh.clone(), warp_ir::DType::F32)?;
+    ops::rmsnorm(cache, device, x, &weights.attn_norm, &mut normed, h, config.norm_eps)?;
+
+    // 2. Q, K, V projections — W4A16
+    let bn = bsz * n;
+    let mut q = GpuTensor::<f32>::zeros(device, shape_bnh.clone(), warp_ir::DType::F32)?;
+    let mut k_proj = GpuTensor::<f32>::zeros(device, shape_bnk.clone(), warp_ir::DType::F32)?;
+    let mut v_proj = GpuTensor::<f32>::zeros(device, shape_bnk.clone(), warp_ir::DType::F32)?;
+
+    quantize::gemm_q4_0(cache, device, &normed, &weights.wq, &mut q, bn, h, h)?;
+    quantize::gemm_q4_0(cache, device, &normed, &weights.wk, &mut k_proj, bn, kv_dim, h)?;
+    quantize::gemm_q4_0(cache, device, &normed, &weights.wv, &mut v_proj, bn, kv_dim, h)?;
+
+    // 3. RoPE
+    let mut q_rope = GpuTensor::<f32>::zeros(device, shape_bnh.clone(), warp_ir::DType::F32)?;
+    let mut k_rope = GpuTensor::<f32>::zeros(device, shape_bnk.clone(), warp_ir::DType::F32)?;
+    crate::rope::rope(cache, device, &q, &mut q_rope, bsz * config.num_heads, n, d, config.rope_base, pos_offset)?;
+    crate::rope::rope(cache, device, &k_proj, &mut k_rope, bsz * config.num_kv_heads, n, d, config.rope_base, pos_offset)?;
+
+    // 4. Attention
+    let attn_batch = bsz * config.num_heads;
+    let shape_attn = warp_ir::Shape::from_static(&[attn_batch as usize, n as usize, d as usize]);
+    let mut attn_out = GpuTensor::<f32>::zeros(device, shape_attn, warp_ir::DType::F32)?;
+    crate::attention_ext::attention_best(
+        cache, device, &q_rope, &k_rope, &v_proj,
+        &mut attn_out, attn_batch, n, d, true,
+    )?;
+
+    // 5. Output projection — W4A16
+    let mut attn_projected = GpuTensor::<f32>::zeros(device, shape_bnh.clone(), warp_ir::DType::F32)?;
+    quantize::gemm_q4_0(cache, device, &attn_out, &weights.wo, &mut attn_projected, bn, h, h)?;
+
+    // 6+7. Fused residual add + FFN norm (2 launches → 1)
+    let mut ffn_normed = GpuTensor::<f32>::zeros(device, shape_bnh.clone(), warp_ir::DType::F32)?;
+    let mut residual1 = GpuTensor::<f32>::zeros(device, shape_bnh.clone(), warp_ir::DType::F32)?;
+    ops::fused_residual_rmsnorm(cache, device, &attn_projected, x, &weights.ffn_norm,
+        &mut ffn_normed, &mut residual1, h, config.norm_eps)?;
+
+    // 8. Gate + Up — W4A16
+    let mut gate = GpuTensor::<f32>::zeros(device, shape_bnf.clone(), warp_ir::DType::F32)?;
+    let mut up = GpuTensor::<f32>::zeros(device, shape_bnf.clone(), warp_ir::DType::F32)?;
+    quantize::gemm_q4_0(cache, device, &ffn_normed, &weights.w_gate, &mut gate, bn, ffn, h)?;
+    quantize::gemm_q4_0(cache, device, &ffn_normed, &weights.w_up, &mut up, bn, ffn, h)?;
+
+    // 9. Fused SwiGLU: silu(gate) * up (2 launches → 1)
+    let mut swiglu_out = GpuTensor::<f32>::zeros(device, shape_bnf, warp_ir::DType::F32)?;
+    ops::fused_silu_mul(cache, device, &gate, &up, &mut swiglu_out)?;
+
+    // 10. Down projection — W4A16
+    let mut ffn_out = GpuTensor::<f32>::zeros(device, shape_bnh.clone(), warp_ir::DType::F32)?;
+    quantize::gemm_q4_0(cache, device, &swiglu_out, &weights.w_down, &mut ffn_out, bn, h, ffn)?;
+
+    // 11. Residual
+    let mut output = GpuTensor::<f32>::zeros(device, shape_bnh, warp_ir::DType::F32)?;
+    ops::add(cache, device, &residual1, &ffn_out, &mut output)?;
+
+    Ok(output)
+}
+
+/// Prefill with Q4_0 quantized weights — populates KV cache.
+pub fn transformer_block_prefill_q4(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    x: &GpuTensor<f32>,
+    weights: &QuantizedBlockWeights,
+    config: &TransformerConfig,
+    kv: &mut LayerKVCache,
+    batch: u32,
+    seq_len: u32,
+    pos_offset: u32,
+) -> Result<GpuTensor<f32>, DeviceError> {
+    let h = config.hidden_size;
+    let d = config.head_dim;
+    let kv_dim = config.kv_dim();
+    let ffn = config.ffn_dim;
+    let bsz = batch;
+    let n = seq_len;
+
+    let shape_bnh = warp_ir::Shape::from_static(&[bsz as usize, n as usize, h as usize]);
+    let shape_bnk = warp_ir::Shape::from_static(&[bsz as usize, n as usize, kv_dim as usize]);
+    let shape_bnf = warp_ir::Shape::from_static(&[bsz as usize, n as usize, ffn as usize]);
+
+    let mut normed = GpuTensor::<f32>::zeros(device, shape_bnh.clone(), warp_ir::DType::F32)?;
+    ops::rmsnorm(cache, device, x, &weights.attn_norm, &mut normed, h, config.norm_eps)?;
+
+    let bn = bsz * n;
+    let mut q = GpuTensor::<f32>::zeros(device, shape_bnh.clone(), warp_ir::DType::F32)?;
+    let mut k_proj = GpuTensor::<f32>::zeros(device, shape_bnk.clone(), warp_ir::DType::F32)?;
+    let mut v_proj = GpuTensor::<f32>::zeros(device, shape_bnk.clone(), warp_ir::DType::F32)?;
+
+    quantize::gemm_q4_0(cache, device, &normed, &weights.wq, &mut q, bn, h, h)?;
+    quantize::gemm_q4_0(cache, device, &normed, &weights.wk, &mut k_proj, bn, kv_dim, h)?;
+    quantize::gemm_q4_0(cache, device, &normed, &weights.wv, &mut v_proj, bn, kv_dim, h)?;
+
+    let mut q_rope = GpuTensor::<f32>::zeros(device, shape_bnh.clone(), warp_ir::DType::F32)?;
+    let mut k_rope = GpuTensor::<f32>::zeros(device, shape_bnk.clone(), warp_ir::DType::F32)?;
+    crate::rope::rope(cache, device, &q, &mut q_rope, bsz * config.num_heads, n, d, config.rope_base, pos_offset)?;
+    crate::rope::rope(cache, device, &k_proj, &mut k_rope, bsz * config.num_kv_heads, n, d, config.rope_base, pos_offset)?;
+
+    // Store K/V in cache
+    kv.prefill(cache, device, &k_rope, &v_proj, n)?;
+
+    let attn_batch = bsz * config.num_heads;
+    let shape_attn = warp_ir::Shape::from_static(&[attn_batch as usize, n as usize, d as usize]);
+    let mut attn_out = GpuTensor::<f32>::zeros(device, shape_attn, warp_ir::DType::F32)?;
+    crate::attention_ext::attention_best(
+        cache, device, &q_rope, &k_rope, &v_proj,
+        &mut attn_out, attn_batch, n, d, true,
+    )?;
+
+    let mut attn_projected = GpuTensor::<f32>::zeros(device, shape_bnh.clone(), warp_ir::DType::F32)?;
+    quantize::gemm_q4_0(cache, device, &attn_out, &weights.wo, &mut attn_projected, bn, h, h)?;
+
+    let mut residual1 = GpuTensor::<f32>::zeros(device, shape_bnh.clone(), warp_ir::DType::F32)?;
+    ops::add(cache, device, x, &attn_projected, &mut residual1)?;
+
+    let mut ffn_normed = GpuTensor::<f32>::zeros(device, shape_bnh.clone(), warp_ir::DType::F32)?;
+    ops::rmsnorm(cache, device, &residual1, &weights.ffn_norm, &mut ffn_normed, h, config.norm_eps)?;
+
+    let mut gate = GpuTensor::<f32>::zeros(device, shape_bnf.clone(), warp_ir::DType::F32)?;
+    let mut up = GpuTensor::<f32>::zeros(device, shape_bnf.clone(), warp_ir::DType::F32)?;
+    quantize::gemm_q4_0(cache, device, &ffn_normed, &weights.w_gate, &mut gate, bn, ffn, h)?;
+    quantize::gemm_q4_0(cache, device, &ffn_normed, &weights.w_up, &mut up, bn, ffn, h)?;
+
+    let mut gate_activated = GpuTensor::<f32>::zeros(device, shape_bnf.clone(), warp_ir::DType::F32)?;
+    ops::silu(cache, device, &gate, &mut gate_activated)?;
+    let mut swiglu_out = GpuTensor::<f32>::zeros(device, shape_bnf, warp_ir::DType::F32)?;
+    ops::mul(cache, device, &gate_activated, &up, &mut swiglu_out)?;
+
+    let mut ffn_out = GpuTensor::<f32>::zeros(device, shape_bnh.clone(), warp_ir::DType::F32)?;
+    quantize::gemm_q4_0(cache, device, &swiglu_out, &weights.w_down, &mut ffn_out, bn, h, ffn)?;
+
+    let mut output = GpuTensor::<f32>::zeros(device, shape_bnh, warp_ir::DType::F32)?;
+    ops::add(cache, device, &residual1, &ffn_out, &mut output)?;
+
+    Ok(output)
+}
+
+/// Decode with Q4_0 quantized weights — single token, uses KV cache.
+pub fn transformer_block_decode_q4(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    x: &GpuTensor<f32>,
+    weights: &QuantizedBlockWeights,
+    config: &TransformerConfig,
+    kv: &mut LayerKVCache,
+    batch: u32,
+    pos: u32,
+) -> Result<GpuTensor<f32>, DeviceError> {
+    let h = config.hidden_size;
+    let d = config.head_dim;
+    let kv_dim = config.kv_dim();
+    let ffn = config.ffn_dim;
+    let n = 1u32;
+    let bn = batch * n;
+
+    let shape_bh = warp_ir::Shape::from_static(&[batch as usize, h as usize]);
+    let shape_bk = warp_ir::Shape::from_static(&[batch as usize, kv_dim as usize]);
+    let shape_bf = warp_ir::Shape::from_static(&[batch as usize, ffn as usize]);
+
+    // 1. RMSNorm
+    let mut normed = GpuTensor::<f32>::zeros(device, shape_bh.clone(), warp_ir::DType::F32)?;
+    ops::rmsnorm(cache, device, x, &weights.attn_norm, &mut normed, h, config.norm_eps)?;
+
+    // 2. Q, K, V — W4A16
+    let mut q = GpuTensor::<f32>::zeros(device, shape_bh.clone(), warp_ir::DType::F32)?;
+    let mut new_k = GpuTensor::<f32>::zeros(device, shape_bk.clone(), warp_ir::DType::F32)?;
+    let mut new_v = GpuTensor::<f32>::zeros(device, shape_bk.clone(), warp_ir::DType::F32)?;
+
+    quantize::gemm_q4_0(cache, device, &normed, &weights.wq, &mut q, bn, h, h)?;
+    quantize::gemm_q4_0(cache, device, &normed, &weights.wk, &mut new_k, bn, kv_dim, h)?;
+    quantize::gemm_q4_0(cache, device, &normed, &weights.wv, &mut new_v, bn, kv_dim, h)?;
+
+    // 3. RoPE
+    let mut q_rope = GpuTensor::<f32>::zeros(device, shape_bh.clone(), warp_ir::DType::F32)?;
+    let mut k_rope = GpuTensor::<f32>::zeros(device, shape_bk.clone(), warp_ir::DType::F32)?;
+    crate::rope::rope(cache, device, &q, &mut q_rope, batch * config.num_heads, 1, d, config.rope_base, pos)?;
+    crate::rope::rope(cache, device, &new_k, &mut k_rope, batch * config.num_kv_heads, 1, d, config.rope_base, pos)?;
+
+    // 4. Append to KV cache
+    kv.append(cache, device, &k_rope, &new_v)?;
+
+    // 5. Decode attention
+    let mut attn_out = GpuTensor::<f32>::zeros(device,
+        warp_ir::Shape::from_static(&[batch as usize, d as usize]), warp_ir::DType::F32)?;
+    crate::kv_cache::decode_attention(cache, device, &q_rope, kv, &mut attn_out, d)?;
+
+    // 6. Output projection — W4A16
+    let mut attn_projected = GpuTensor::<f32>::zeros(device, shape_bh.clone(), warp_ir::DType::F32)?;
+    quantize::gemm_q4_0(cache, device, &attn_out, &weights.wo, &mut attn_projected, bn, h, d)?;
+
+    // 7+8. Fused residual + FFN norm (2 launches → 1)
+    let mut ffn_normed = GpuTensor::<f32>::zeros(device, shape_bh.clone(), warp_ir::DType::F32)?;
+    let mut residual = GpuTensor::<f32>::zeros(device, shape_bh.clone(), warp_ir::DType::F32)?;
+    ops::fused_residual_rmsnorm(cache, device, &attn_projected, x, &weights.ffn_norm,
+        &mut ffn_normed, &mut residual, h, config.norm_eps)?;
+
+    // 9-10. Gate + Up + Fused SwiGLU + Down — W4A16
+    let mut gate = GpuTensor::<f32>::zeros(device, shape_bf.clone(), warp_ir::DType::F32)?;
+    let mut up = GpuTensor::<f32>::zeros(device, shape_bf.clone(), warp_ir::DType::F32)?;
+    quantize::gemm_q4_0(cache, device, &ffn_normed, &weights.w_gate, &mut gate, bn, ffn, h)?;
+    quantize::gemm_q4_0(cache, device, &ffn_normed, &weights.w_up, &mut up, bn, ffn, h)?;
+
+    // Fused SwiGLU (2 launches → 1)
+    let mut swiglu = GpuTensor::<f32>::zeros(device, shape_bf, warp_ir::DType::F32)?;
+    ops::fused_silu_mul(cache, device, &gate, &up, &mut swiglu)?;
+
+    let mut ffn_out = GpuTensor::<f32>::zeros(device, shape_bh.clone(), warp_ir::DType::F32)?;
+    quantize::gemm_q4_0(cache, device, &swiglu, &weights.w_down, &mut ffn_out, bn, h, ffn)?;
+
+    // 11. Residual
+    let mut output = GpuTensor::<f32>::zeros(device, shape_bh, warp_ir::DType::F32)?;
+    ops::add(cache, device, &residual, &ffn_out, &mut output)?;
+
+    Ok(output)
+}
+
 /// Forward pass of a single transformer block.
 ///
 /// x: [batch, seq_len, hidden_size]
@@ -166,13 +463,11 @@ pub fn transformer_block_forward(
     let mut attn_projected = GpuTensor::<f32>::zeros(device, shape_bnh.clone(), warp_ir::DType::F32)?;
     ops::gemm(cache, device, &attn_out, &weights.wo, &mut attn_projected, bn, h, h)?;
 
-    // 6. Residual add: x = x + attn_out
-    let mut residual1 = GpuTensor::<f32>::zeros(device, shape_bnh.clone(), warp_ir::DType::F32)?;
-    ops::add(cache, device, x, &attn_projected, &mut residual1)?;
-
-    // 7. FFN norm
+    // 6+7. Fused residual + RMSNorm (2 launches → 1)
     let mut ffn_normed = GpuTensor::<f32>::zeros(device, shape_bnh.clone(), warp_ir::DType::F32)?;
-    ops::rmsnorm(cache, device, &residual1, &weights.ffn_norm, &mut ffn_normed, h, config.norm_eps)?;
+    let mut residual1 = GpuTensor::<f32>::zeros(device, shape_bnh.clone(), warp_ir::DType::F32)?;
+    ops::fused_residual_rmsnorm(cache, device, &attn_projected, x, &weights.ffn_norm,
+        &mut ffn_normed, &mut residual1, h, config.norm_eps)?;
 
     // 8. Gate + Up projections
     let mut gate = GpuTensor::<f32>::zeros(device, shape_bnf.clone(), warp_ir::DType::F32)?;
@@ -180,17 +475,106 @@ pub fn transformer_block_forward(
     ops::gemm(cache, device, &ffn_normed, &weights.w_gate, &mut gate, bn, ffn, h)?;
     ops::gemm(cache, device, &ffn_normed, &weights.w_up, &mut up, bn, ffn, h)?;
 
-    // 9. SwiGLU: silu(gate) * up
-    let mut gate_activated = GpuTensor::<f32>::zeros(device, shape_bnf.clone(), warp_ir::DType::F32)?;
-    ops::silu(cache, device, &gate, &mut gate_activated)?;
+    // 9. Fused SwiGLU: silu(gate) * up (2 launches → 1)
     let mut swiglu_out = GpuTensor::<f32>::zeros(device, shape_bnf, warp_ir::DType::F32)?;
-    ops::mul(cache, device, &gate_activated, &up, &mut swiglu_out)?;
+    ops::fused_silu_mul(cache, device, &gate, &up, &mut swiglu_out)?;
 
     // 10. Down projection
     let mut ffn_out = GpuTensor::<f32>::zeros(device, shape_bnh.clone(), warp_ir::DType::F32)?;
     ops::gemm(cache, device, &swiglu_out, &weights.w_down, &mut ffn_out, bn, h, ffn)?;
 
     // 11. Final residual add
+    let mut output = GpuTensor::<f32>::zeros(device, shape_bnh, warp_ir::DType::F32)?;
+    ops::add(cache, device, &residual1, &ffn_out, &mut output)?;
+
+    Ok(output)
+}
+
+/// Prefill pass — like forward but also populates the KV cache for this layer.
+///
+/// x: [batch, seq_len, hidden_size]
+/// kv: layer KV cache (mutated: K/V from all positions stored)
+/// Returns: [batch, seq_len, hidden_size]
+pub fn transformer_block_prefill(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    x: &GpuTensor<f32>,
+    weights: &TransformerBlockWeights,
+    config: &TransformerConfig,
+    kv: &mut LayerKVCache,
+    batch: u32,
+    seq_len: u32,
+    pos_offset: u32,
+) -> Result<GpuTensor<f32>, DeviceError> {
+    let h = config.hidden_size;
+    let d = config.head_dim;
+    let kv_dim = config.kv_dim();
+    let ffn = config.ffn_dim;
+    let bsz = batch;
+    let n = seq_len;
+
+    let shape_bnh = warp_ir::Shape::from_static(&[bsz as usize, n as usize, h as usize]);
+    let shape_bnk = warp_ir::Shape::from_static(&[bsz as usize, n as usize, kv_dim as usize]);
+    let shape_bnf = warp_ir::Shape::from_static(&[bsz as usize, n as usize, ffn as usize]);
+
+    // 1. Attention input norm
+    let mut normed = GpuTensor::<f32>::zeros(device, shape_bnh.clone(), warp_ir::DType::F32)?;
+    ops::rmsnorm(cache, device, x, &weights.attn_norm, &mut normed, h, config.norm_eps)?;
+
+    // 2. Q, K, V projections
+    let bn = bsz * n;
+    let mut q = GpuTensor::<f32>::zeros(device, shape_bnh.clone(), warp_ir::DType::F32)?;
+    let mut k_proj = GpuTensor::<f32>::zeros(device, shape_bnk.clone(), warp_ir::DType::F32)?;
+    let mut v_proj = GpuTensor::<f32>::zeros(device, shape_bnk.clone(), warp_ir::DType::F32)?;
+
+    ops::gemm(cache, device, &normed, &weights.wq, &mut q, bn, h, h)?;
+    ops::gemm(cache, device, &normed, &weights.wk, &mut k_proj, bn, kv_dim, h)?;
+    ops::gemm(cache, device, &normed, &weights.wv, &mut v_proj, bn, kv_dim, h)?;
+
+    // 3. RoPE on Q and K
+    let mut q_rope = GpuTensor::<f32>::zeros(device, shape_bnh.clone(), warp_ir::DType::F32)?;
+    let mut k_rope = GpuTensor::<f32>::zeros(device, shape_bnk.clone(), warp_ir::DType::F32)?;
+    crate::rope::rope(cache, device, &q, &mut q_rope, bsz * config.num_heads, n, d, config.rope_base, pos_offset)?;
+    crate::rope::rope(cache, device, &k_proj, &mut k_rope, bsz * config.num_kv_heads, n, d, config.rope_base, pos_offset)?;
+
+    // 3.5. Store K/V in cache for future decode steps
+    kv.prefill(cache, device, &k_rope, &v_proj, n)?;
+
+    // 4. Flash Attention
+    let attn_batch = bsz * config.num_heads;
+    let shape_attn = warp_ir::Shape::from_static(&[attn_batch as usize, n as usize, d as usize]);
+    let mut attn_out = GpuTensor::<f32>::zeros(device, shape_attn, warp_ir::DType::F32)?;
+
+    crate::attention_ext::attention_best(
+        cache, device, &q_rope, &k_rope, &v_proj,
+        &mut attn_out, attn_batch, n, d, true,
+    )?;
+
+    // 5. Output projection
+    let mut attn_projected = GpuTensor::<f32>::zeros(device, shape_bnh.clone(), warp_ir::DType::F32)?;
+    ops::gemm(cache, device, &attn_out, &weights.wo, &mut attn_projected, bn, h, h)?;
+
+    // 6+7. Fused residual + FFN norm
+    let mut ffn_normed = GpuTensor::<f32>::zeros(device, shape_bnh.clone(), warp_ir::DType::F32)?;
+    let mut residual1 = GpuTensor::<f32>::zeros(device, shape_bnh.clone(), warp_ir::DType::F32)?;
+    ops::fused_residual_rmsnorm(cache, device, &attn_projected, x, &weights.ffn_norm,
+        &mut ffn_normed, &mut residual1, h, config.norm_eps)?;
+
+    // 8. Gate + Up
+    let mut gate = GpuTensor::<f32>::zeros(device, shape_bnf.clone(), warp_ir::DType::F32)?;
+    let mut up = GpuTensor::<f32>::zeros(device, shape_bnf.clone(), warp_ir::DType::F32)?;
+    ops::gemm(cache, device, &ffn_normed, &weights.w_gate, &mut gate, bn, ffn, h)?;
+    ops::gemm(cache, device, &ffn_normed, &weights.w_up, &mut up, bn, ffn, h)?;
+
+    // 9. Fused SwiGLU
+    let mut swiglu_out = GpuTensor::<f32>::zeros(device, shape_bnf, warp_ir::DType::F32)?;
+    ops::fused_silu_mul(cache, device, &gate, &up, &mut swiglu_out)?;
+
+    // 10. Down projection
+    let mut ffn_out = GpuTensor::<f32>::zeros(device, shape_bnh.clone(), warp_ir::DType::F32)?;
+    ops::gemm(cache, device, &swiglu_out, &weights.w_down, &mut ffn_out, bn, h, ffn)?;
+
+    // 11. Final residual
     let mut output = GpuTensor::<f32>::zeros(device, shape_bnh, warp_ir::DType::F32)?;
     ops::add(cache, device, &residual1, &ffn_out, &mut output)?;
 
@@ -259,24 +643,20 @@ pub fn transformer_block_decode(
     let mut attn_projected = GpuTensor::<f32>::zeros(device, shape_bh.clone(), warp_ir::DType::F32)?;
     ops::gemm(cache, device, &attn_out, &weights.wo, &mut attn_projected, bn, h, d)?;
 
-    // 7. Residual
-    let mut residual = GpuTensor::<f32>::zeros(device, shape_bh.clone(), warp_ir::DType::F32)?;
-    ops::add(cache, device, x, &attn_projected, &mut residual)?;
-
-    // 8. FFN norm
+    // 7+8. Fused residual + FFN norm
     let mut ffn_normed = GpuTensor::<f32>::zeros(device, shape_bh.clone(), warp_ir::DType::F32)?;
-    ops::rmsnorm(cache, device, &residual, &weights.ffn_norm, &mut ffn_normed, h, config.norm_eps)?;
+    let mut residual = GpuTensor::<f32>::zeros(device, shape_bh.clone(), warp_ir::DType::F32)?;
+    ops::fused_residual_rmsnorm(cache, device, &attn_projected, x, &weights.ffn_norm,
+        &mut ffn_normed, &mut residual, h, config.norm_eps)?;
 
-    // 9-10. Gate + Up + SwiGLU + Down
+    // 9-10. Gate + Up + Fused SwiGLU + Down
     let mut gate = GpuTensor::<f32>::zeros(device, shape_bf.clone(), warp_ir::DType::F32)?;
     let mut up = GpuTensor::<f32>::zeros(device, shape_bf.clone(), warp_ir::DType::F32)?;
     ops::gemm(cache, device, &ffn_normed, &weights.w_gate, &mut gate, bn, ffn, h)?;
     ops::gemm(cache, device, &ffn_normed, &weights.w_up, &mut up, bn, ffn, h)?;
 
-    let mut gate_act = GpuTensor::<f32>::zeros(device, shape_bf.clone(), warp_ir::DType::F32)?;
-    ops::silu(cache, device, &gate, &mut gate_act)?;
     let mut swiglu = GpuTensor::<f32>::zeros(device, shape_bf, warp_ir::DType::F32)?;
-    ops::mul(cache, device, &gate_act, &up, &mut swiglu)?;
+    ops::fused_silu_mul(cache, device, &gate, &up, &mut swiglu)?;
 
     let mut ffn_out = GpuTensor::<f32>::zeros(device, shape_bh.clone(), warp_ir::DType::F32)?;
     ops::gemm(cache, device, &swiglu, &weights.w_down, &mut ffn_out, bn, h, ffn)?;

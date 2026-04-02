@@ -483,6 +483,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tensorwarp"
+version = "0.1.0"
+dependencies = [
+ "cudarc",
+ "env_logger",
+ "half",
+ "log",
+ "warp-ir",
+ "warp-kernels",
+ "warp-loader",
+]
+
+[[package]]
 name = "thiserror"
 version = "2.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"

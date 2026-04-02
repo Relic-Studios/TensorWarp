@@ -6,7 +6,7 @@
 //! - Device memory allocation
 //! - Device info queries
 
-use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream, LaunchConfig};
+use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream, LaunchConfig, sys};
 use cudarc::driver::result::DriverError;
 use cudarc::nvrtc;
 use std::sync::Arc;
@@ -31,9 +31,14 @@ impl WarpDevice {
         let ctx = CudaContext::new(ordinal).map_err(|e| DeviceError::Init(e.to_string()))?;
         let stream = ctx.default_stream();
 
-        // TODO: query actual compute capability via CUDA driver API
-        // For now default to Ada (RTX 4090)
-        let (major, minor) = (8, 9);
+        let major = ctx
+            .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
+            .map_err(|e| DeviceError::Init(format!("failed to query compute capability major: {e}")))?
+            as u32;
+        let minor = ctx
+            .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
+            .map_err(|e| DeviceError::Init(format!("failed to query compute capability minor: {e}")))?
+            as u32;
         let sm_version = major * 10 + minor;
 
         Ok(Self {
@@ -134,6 +139,23 @@ impl WarpDevice {
         self.stream
             .synchronize()
             .map_err(|e| DeviceError::Sync(e.to_string()))
+    }
+
+    /// NVRTC arch string for this device (e.g., "compute_89").
+    pub fn arch_flag(&self) -> String {
+        format!("compute_{}", self.sm_version)
+    }
+
+    /// Create a clone of this device pointing to a different stream.
+    /// Used for CUDA graph capture — the capture stream records kernel launches.
+    pub fn with_stream(&self, stream: std::sync::Arc<CudaStream>) -> Self {
+        Self {
+            ctx: self.ctx.clone(),
+            stream,
+            ordinal: self.ordinal,
+            compute_capability: self.compute_capability,
+            sm_version: self.sm_version,
+        }
     }
 
     /// Summary string for this device.

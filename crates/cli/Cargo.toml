@@ -1,0 +1,19 @@
+[package]
+name = "tensorwarp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TensorWarp — a self-optimizing GPU inference engine"
+
+[[bin]]
+name = "tensorwarp"
+path = "src/main.rs"
+
+[dependencies]
+warp-ir.workspace = true
+warp-kernels.workspace = true
+warp-loader.workspace = true
+cudarc.workspace = true
+half.workspace = true
+env_logger.workspace = true
+log.workspace = true

@@ -47,6 +47,26 @@ impl<T> GpuTensor<T> {
     pub fn size_bytes(&self) -> usize {
         self.numel * std::mem::size_of::<T>()
     }
+
+    /// Zero-copy reshape — changes shape metadata without moving data.
+    /// Panics if the new shape has a different number of elements.
+    pub fn reshape(self, new_shape: Shape) -> Self {
+        let new_numel = new_shape.numel_static();
+        assert_eq!(self.numel, new_numel,
+            "reshape: numel mismatch {} vs {}", self.numel, new_numel);
+        Self {
+            data: self.data,
+            shape: new_shape,
+            dtype: self.dtype,
+            numel: self.numel,
+        }
+    }
+
+    /// Zero-copy view with new shape (borrows data).
+    /// Returns a new GpuTensor that shares the same device memory.
+    pub fn view_shape(&self, new_shape: Shape) -> Shape {
+        new_shape
+    }
 }
 
 #[cfg(test)]

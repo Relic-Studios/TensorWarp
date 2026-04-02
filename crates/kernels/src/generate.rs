@@ -16,7 +16,10 @@ use crate::kv_cache::ModelKVCache;
 use crate::ops;
 use crate::sampling;
 use crate::tensor::GpuTensor;
-use crate::transformer::{TransformerBlockWeights, TransformerConfig};
+use crate::transformer::{
+    TransformerBlockWeights, TransformerConfig,
+    QuantizedBlockWeights, quantize_block_weights,
+};
 
 /// Configuration for text generation.
 #[derive(Debug, Clone)]
@@ -38,43 +41,6 @@ impl Default for GenerateConfig {
             temperature: 1.0,
             eos_token_id: Some(2), // common EOS for LLaMA
             greedy: true,
-        }
-    }
-}
-
-/// KV cache for autoregressive decoding.
-/// Stores precomputed K and V tensors for each layer to avoid recomputation.
-pub struct KVCache {
-    /// Per-layer K cache: [num_layers][max_seq, kv_dim]
-    pub k_cache: Vec<Vec<f32>>,
-    /// Per-layer V cache: [num_layers][max_seq, kv_dim]
-    pub v_cache: Vec<Vec<f32>>,
-    /// Current sequence length in cache.
-    pub seq_len: usize,
-    /// Maximum sequence length the cache can hold.
-    pub max_seq_len: usize,
-    /// KV dimension per layer.
-    pub kv_dim: usize,
-}
-
-impl KVCache {
-    pub fn new(num_layers: usize, max_seq_len: usize, kv_dim: usize) -> Self {
-        Self {
-            k_cache: vec![vec![0.0f32; max_seq_len * kv_dim]; num_layers],
-            v_cache: vec![vec![0.0f32; max_seq_len * kv_dim]; num_layers],
-            seq_len: 0,
-            max_seq_len,
-            kv_dim,
-        }
-    }
-
-    pub fn reset(&mut self) {
-        self.seq_len = 0;
-        for layer in &mut self.k_cache {
-            layer.fill(0.0);
-        }
-        for layer in &mut self.v_cache {
-            layer.fill(0.0);
         }
     }
 }
@@ -213,6 +179,92 @@ impl GenerationEngine {
         Ok(generated)
     }
 
+    /// Run prefill forward pass: tokens → logits, populating KV cache per layer.
+    fn forward_prefill(
+        &self,
+        device: &WarpDevice,
+        input_ids: &[i32],
+        kv_cache: &mut ModelKVCache,
+    ) -> Result<GpuTensor<f32>, DeviceError> {
+        let seq_len = input_ids.len() as u32;
+        let h = self.config.hidden_size;
+        let batch = 1u32;
+
+        // 1. Embedding lookup
+        let ids = GpuTensor::from_host(device, input_ids,
+            Shape::from_static(&[seq_len as usize]), DType::I32)?;
+        let mut hidden = GpuTensor::<f32>::zeros(device,
+            Shape::from_static(&[seq_len as usize, h as usize]), DType::F32)?;
+        sampling::embedding(&self.cache, device, &self.embed_tokens, &ids,
+            &mut hidden, seq_len, h)?;
+
+        // 2. Run through all transformer layers — prefill variant saves K/V
+        for (i, layer) in self.layers.iter().enumerate() {
+            hidden = crate::transformer::transformer_block_prefill(
+                &self.cache, device, &hidden, layer, &self.config,
+                &mut kv_cache.layers[i],
+                batch, seq_len, 0,
+            )?;
+        }
+
+        // 3. Final RMSNorm
+        let mut normed = GpuTensor::<f32>::zeros(device,
+            Shape::from_static(&[seq_len as usize, h as usize]), DType::F32)?;
+        ops::rmsnorm(&self.cache, device, &hidden, &self.final_norm,
+            &mut normed, h, self.config.norm_eps)?;
+
+        // 4. LM head projection
+        let mut logits = GpuTensor::<f32>::zeros(device,
+            Shape::from_static(&[seq_len as usize, self.vocab_size as usize]), DType::F32)?;
+        ops::gemm(&self.cache, device, &normed, &self.lm_head, &mut logits,
+            seq_len, self.vocab_size, h)?;
+
+        Ok(logits)
+    }
+
+    /// Run decode forward pass for a single token, using KV cache.
+    fn forward_decode(
+        &self,
+        device: &WarpDevice,
+        token_id: i32,
+        kv_cache: &mut ModelKVCache,
+        pos: u32,
+    ) -> Result<GpuTensor<f32>, DeviceError> {
+        let h = self.config.hidden_size;
+        let batch = 1u32;
+
+        // 1. Embedding lookup (single token)
+        let ids = GpuTensor::from_host(device, &[token_id],
+            Shape::from_static(&[1]), DType::I32)?;
+        let mut hidden = GpuTensor::<f32>::zeros(device,
+            Shape::from_static(&[1, h as usize]), DType::F32)?;
+        sampling::embedding(&self.cache, device, &self.embed_tokens, &ids,
+            &mut hidden, 1, h)?;
+
+        // 2. Run through all transformer layers — decode variant uses KV cache
+        for (i, layer) in self.layers.iter().enumerate() {
+            hidden = crate::transformer::transformer_block_decode(
+                &self.cache, device, &hidden, layer, &self.config,
+                &mut kv_cache.layers[i],
+                batch, pos,
+            )?;
+        }
+
+        // 3. Final RMSNorm
+        let mut normed = GpuTensor::<f32>::zeros(device,
+            Shape::from_static(&[1, h as usize]), DType::F32)?;
+        ops::rmsnorm(&self.cache, device, &hidden, &self.final_norm,
+            &mut normed, h, self.config.norm_eps)?;
+
+        // 4. LM head projection → [1, vocab_size]
+        let mut logits = GpuTensor::<f32>::zeros(device,
+            Shape::from_static(&[1, self.vocab_size as usize]), DType::F32)?;
+        ops::gemm(&self.cache, device, &normed, &self.lm_head, &mut logits,
+            1, self.vocab_size, h)?;
+
+        Ok(logits)
+    }
+
     /// Generate with KV cache — O(N) per token instead of O(N²).
     ///
     /// Phase 1 (prefill): run full prompt through all layers, populate cache.
@@ -224,7 +276,6 @@ impl GenerationEngine {
         gen_config: &GenerateConfig,
         max_seq_len: u32,
     ) -> Result<GenerationResult, DeviceError> {
-        let h = self.config.hidden_size;
         let kv_dim = self.config.kv_dim();
         let num_layers = self.layers.len() as u32;
         let vocab = self.vocab_size as usize;
@@ -234,8 +285,8 @@ impl GenerationEngine {
 
         let prefill_start = std::time::Instant::now();
 
-        // Phase 1: Prefill — run full prompt, populate KV cache
-        let logits = self.forward(device, prompt_ids)?;
+        // Phase 1: Prefill — process full prompt, populate KV cache per layer
+        let logits = self.forward_prefill(device, prompt_ids, &mut kv_cache)?;
         device.synchronize()?;
         let prefill_time = prefill_start.elapsed();
 
@@ -244,20 +295,12 @@ impl GenerationEngine {
         let prompt_len = prompt_ids.len();
         let mut last_logits = all_logits[(prompt_len - 1) * vocab..prompt_len * vocab].to_vec();
 
-        // Mark cache as filled with prompt positions
-        // (In the full implementation, prefill would populate the cache per-layer.
-        // For now, we skip cache-backed decode and fall back to the non-cached path
-        // for the decode phase. The KV cache infrastructure is ready to wire.)
-        for layer_cache in &mut kv_cache.layers {
-            layer_cache.len = prompt_len as u32;
-        }
-
         let decode_start = std::time::Instant::now();
         let mut generated = Vec::new();
-        let mut all_ids = prompt_ids.to_vec();
+        let mut pos = prompt_len as u32;
 
-        // Phase 2: Decode — one token at a time
-        for step in 0..gen_config.max_tokens {
+        // Phase 2: Decode — one token at a time using KV cache
+        for _step in 0..gen_config.max_tokens {
             // Apply temperature
             let scaled: Vec<f32> = if gen_config.temperature != 1.0 {
                 last_logits.iter().map(|&v| v / gen_config.temperature).collect()
@@ -279,17 +322,13 @@ impl GenerationEngine {
             }
 
             generated.push(next_token);
-            all_ids.push(next_token);
 
-            // Forward pass for next token
-            // TODO: use transformer_block_decode with KV cache for O(1) per layer
-            // For now, full forward pass (will be replaced when KV cache is fully wired)
-            let logits = self.forward(device, &all_ids)?;
+            // Decode forward: single token, KV cache handles history
+            let logits = self.forward_decode(device, next_token, &mut kv_cache, pos)?;
             device.synchronize()?;
 
-            let all_logits = logits.to_host(device)?;
-            let seq_len = all_ids.len();
-            last_logits = all_logits[(seq_len - 1) * vocab..seq_len * vocab].to_vec();
+            last_logits = logits.to_host(device)?;
+            pos += 1;
         }
 
         let decode_time = decode_start.elapsed();
@@ -378,6 +417,220 @@ pub fn create_test_engine(
         lm_head,
         cache: KernelCache::new(),
     })
+}
+
+/// Generation engine with Q4_0 quantized weights — 6.4x less weight memory.
+///
+/// Embedding and LM head stay f32 (they're accessed sparsely).
+/// All transformer projection GEMMs use W4A16.
+pub struct QuantizedGenerationEngine {
+    pub config: TransformerConfig,
+    pub vocab_size: u32,
+    pub embed_tokens: GpuTensor<f32>,
+    pub layers: Vec<QuantizedBlockWeights>,
+    pub final_norm: GpuTensor<f32>,
+    pub lm_head: GpuTensor<f32>,
+    pub cache: KernelCache,
+}
+
+impl QuantizedGenerationEngine {
+    /// Quantize a full-precision engine to Q4_0.
+    pub fn from_f32(
+        device: &WarpDevice,
+        engine: &GenerationEngine,
+    ) -> Result<Self, DeviceError> {
+        let mut q_layers = Vec::with_capacity(engine.layers.len());
+        for layer in &engine.layers {
+            q_layers.push(quantize_block_weights(
+                &engine.cache, device, layer, &engine.config,
+            )?);
+        }
+
+        // Clone embedding, norm, lm_head (stay f32)
+        let embed_host = engine.embed_tokens.to_host(device)?;
+        let norm_host = engine.final_norm.to_host(device)?;
+        let lm_host = engine.lm_head.to_host(device)?;
+
+        Ok(Self {
+            config: engine.config.clone(),
+            vocab_size: engine.vocab_size,
+            embed_tokens: GpuTensor::from_host(device, &embed_host,
+                engine.embed_tokens.shape.clone(), DType::F32)?,
+            layers: q_layers,
+            final_norm: GpuTensor::from_host(device, &norm_host,
+                engine.final_norm.shape.clone(), DType::F32)?,
+            lm_head: GpuTensor::from_host(device, &lm_host,
+                engine.lm_head.shape.clone(), DType::F32)?,
+            cache: KernelCache::new(),
+        })
+    }
+
+    /// Prefill forward pass — populates KV cache.
+    fn forward_prefill(
+        &self,
+        device: &WarpDevice,
+        input_ids: &[i32],
+        kv_cache: &mut ModelKVCache,
+    ) -> Result<GpuTensor<f32>, DeviceError> {
+        let seq_len = input_ids.len() as u32;
+        let h = self.config.hidden_size;
+
+        let ids = GpuTensor::from_host(device, input_ids,
+            Shape::from_static(&[seq_len as usize]), DType::I32)?;
+        let mut hidden = GpuTensor::<f32>::zeros(device,
+            Shape::from_static(&[seq_len as usize, h as usize]), DType::F32)?;
+        sampling::embedding(&self.cache, device, &self.embed_tokens, &ids,
+            &mut hidden, seq_len, h)?;
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            hidden = crate::transformer::transformer_block_prefill_q4(
+                &self.cache, device, &hidden, layer, &self.config,
+                &mut kv_cache.layers[i], 1, seq_len, 0,
+            )?;
+        }
+
+        let mut normed = GpuTensor::<f32>::zeros(device,
+            Shape::from_static(&[seq_len as usize, h as usize]), DType::F32)?;
+        ops::rmsnorm(&self.cache, device, &hidden, &self.final_norm,
+            &mut normed, h, self.config.norm_eps)?;
+
+        let mut logits = GpuTensor::<f32>::zeros(device,
+            Shape::from_static(&[seq_len as usize, self.vocab_size as usize]), DType::F32)?;
+        ops::gemm(&self.cache, device, &normed, &self.lm_head, &mut logits,
+            seq_len, self.vocab_size, h)?;
+
+        Ok(logits)
+    }
+
+    /// Decode forward pass — single token with KV cache.
+    fn forward_decode(
+        &self,
+        device: &WarpDevice,
+        token_id: i32,
+        kv_cache: &mut ModelKVCache,
+        pos: u32,
+    ) -> Result<GpuTensor<f32>, DeviceError> {
+        let h = self.config.hidden_size;
+
+        let ids = GpuTensor::from_host(device, &[token_id],
+            Shape::from_static(&[1]), DType::I32)?;
+        let mut hidden = GpuTensor::<f32>::zeros(device,
+            Shape::from_static(&[1, h as usize]), DType::F32)?;
+        sampling::embedding(&self.cache, device, &self.embed_tokens, &ids,
+            &mut hidden, 1, h)?;
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            hidden = crate::transformer::transformer_block_decode_q4(
+                &self.cache, device, &hidden, layer, &self.config,
+                &mut kv_cache.layers[i], 1, pos,
+            )?;
+        }
+
+        let mut normed = GpuTensor::<f32>::zeros(device,
+            Shape::from_static(&[1, h as usize]), DType::F32)?;
+        ops::rmsnorm(&self.cache, device, &hidden, &self.final_norm,
+            &mut normed, h, self.config.norm_eps)?;
+
+        let mut logits = GpuTensor::<f32>::zeros(device,
+            Shape::from_static(&[1, self.vocab_size as usize]), DType::F32)?;
+        ops::gemm(&self.cache, device, &normed, &self.lm_head, &mut logits,
+            1, self.vocab_size, h)?;
+
+        Ok(logits)
+    }
+
+    /// Generate with KV cache using quantized weights.
+    pub fn generate_with_cache(
+        &self,
+        device: &WarpDevice,
+        prompt_ids: &[i32],
+        gen_config: &GenerateConfig,
+        max_seq_len: u32,
+    ) -> Result<GenerationResult, DeviceError> {
+        let kv_dim = self.config.kv_dim();
+        let num_layers = self.layers.len() as u32;
+        let vocab = self.vocab_size as usize;
+
+        let mut kv_cache = ModelKVCache::new(device, num_layers, max_seq_len, kv_dim)?;
+
+        let prefill_start = std::time::Instant::now();
+        let logits = self.forward_prefill(device, prompt_ids, &mut kv_cache)?;
+        device.synchronize()?;
+        let prefill_time = prefill_start.elapsed();
+
+        let all_logits = logits.to_host(device)?;
+        let prompt_len = prompt_ids.len();
+        let mut last_logits = all_logits[(prompt_len - 1) * vocab..prompt_len * vocab].to_vec();
+
+        let decode_start = std::time::Instant::now();
+        let mut generated = Vec::new();
+        let mut pos = prompt_len as u32;
+
+        for _step in 0..gen_config.max_tokens {
+            let scaled: Vec<f32> = if gen_config.temperature != 1.0 {
+                last_logits.iter().map(|&v| v / gen_config.temperature).collect()
+            } else {
+                last_logits.clone()
+            };
+
+            let next_token = scaled.iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .map(|(idx, _)| idx as i32)
+                .unwrap_or(0);
+
+            if let Some(eos) = gen_config.eos_token_id {
+                if next_token == eos { break; }
+            }
+
+            generated.push(next_token);
+
+            let logits = self.forward_decode(device, next_token, &mut kv_cache, pos)?;
+            device.synchronize()?;
+
+            last_logits = logits.to_host(device)?;
+            pos += 1;
+        }
+
+        let decode_time = decode_start.elapsed();
+
+        Ok(GenerationResult {
+            tokens: generated.clone(),
+            prefill_time,
+            decode_time,
+            tokens_generated: generated.len(),
+            prefill_tokens: prompt_len,
+            tokens_per_sec: if decode_time.as_secs_f64() > 0.0 {
+                generated.len() as f64 / decode_time.as_secs_f64()
+            } else { 0.0 },
+            kv_cache_memory_bytes: kv_cache.memory_bytes(),
+        })
+    }
+}
+
+/// Estimate weight memory for f32 vs Q4_0 for a given config.
+pub fn weight_memory_estimate(config: &TransformerConfig, num_layers: u32, vocab_size: u32) -> (usize, usize) {
+    let h = config.hidden_size as usize;
+    let kv = config.kv_dim() as usize;
+    let ffn = config.ffn_dim as usize;
+    let v = vocab_size as usize;
+
+    // Per layer: wq[h,h] + wk[h,kv] + wv[h,kv] + wo[h,h] + w_gate[h,ffn] + w_up[h,ffn] + w_down[ffn,h] + norms[2*h]
+    let per_layer_params = h*h + h*kv + h*kv + h*h + h*ffn + h*ffn + ffn*h + 2*h;
+    let global_params = v*h + h + h*v; // embed + final_norm + lm_head
+
+    let total_params = per_layer_params * num_layers as usize + global_params;
+    let f32_bytes = total_params * 4;
+
+    // Q4_0: projection weights quantized (everything except norms, embed, lm_head)
+    let proj_params_per_layer = h*h + h*kv + h*kv + h*h + h*ffn + h*ffn + ffn*h;
+    let norm_params_per_layer = 2 * h;
+    let proj_blocks_per_layer = proj_params_per_layer / 32; // BLOCK_SIZE
+    let q4_proj_bytes = proj_blocks_per_layer * 20; // Q4_0_BLOCK_BYTES
+    let q4_per_layer = q4_proj_bytes + norm_params_per_layer * 4;
+    let q4_bytes = q4_per_layer * num_layers as usize + global_params * 4;
+
+    (f32_bytes, q4_bytes)
 }
 
 #[cfg(test)]
@@ -502,5 +755,86 @@ mod tests {
         assert_eq!(result.tokens_generated, 16);
         assert!(result.tokens.iter().all(|&t| t >= 0 && t < 256));
         println!("{}", engine.cache.stats());
+    }
+
+    #[test]
+    fn quantized_generation() {
+        let dev = match setup() {
+            Some(d) => d,
+            None => { println!("No CUDA, skipping"); return; }
+        };
+
+        // Use small config — head_dim must be >= 32 (BLOCK_SIZE) for Q4_0 decode
+        let config = TransformerConfig::small();
+        let num_layers = 4u32;
+        let vocab_size = 256u32;
+
+        // Create f32 engine, then quantize
+        let f32_engine = create_test_engine(&dev, config.clone(), num_layers, vocab_size).unwrap();
+        let q4_engine = QuantizedGenerationEngine::from_f32(&dev, &f32_engine).unwrap();
+
+        let prompt = vec![1i32, 2, 3, 4, 5, 6, 7, 8];
+        let gen_config = GenerateConfig {
+            max_tokens: 16,
+            greedy: true,
+            eos_token_id: None,
+            ..Default::default()
+        };
+
+        // F32 generation
+        let f32_result = f32_engine.generate_with_cache(&dev, &prompt, &gen_config, 256).unwrap();
+
+        // Q4_0 generation
+        let q4_result = q4_engine.generate_with_cache(&dev, &prompt, &gen_config, 256).unwrap();
+
+        println!("\n=== F32 vs Q4_0 Generation ===");
+        println!("F32:  {}", f32_result);
+        println!("Q4_0: {}", q4_result);
+
+        // Memory savings
+        let (f32_bytes, q4_bytes) = weight_memory_estimate(&config, num_layers, vocab_size);
+        println!("Weight memory:");
+        println!("  F32:  {:.2} KB", f32_bytes as f64 / 1024.0);
+        println!("  Q4_0: {:.2} KB ({:.1}x smaller)", q4_bytes as f64 / 1024.0,
+            f32_bytes as f64 / q4_bytes as f64);
+
+        // Both should produce valid tokens
+        assert_eq!(q4_result.tokens_generated, 16);
+        assert!(q4_result.tokens.iter().all(|&t| t >= 0 && t < vocab_size as i32));
+
+        // Q4 should be faster (less memory bandwidth for weights)
+        println!("Speed comparison:");
+        println!("  F32 decode:  {:.1} tokens/sec", f32_result.tokens_per_sec);
+        println!("  Q4_0 decode: {:.1} tokens/sec", q4_result.tokens_per_sec);
+        if q4_result.tokens_per_sec > 0.0 && f32_result.tokens_per_sec > 0.0 {
+            println!("  Speedup:     {:.2}x", q4_result.tokens_per_sec / f32_result.tokens_per_sec);
+        }
+
+        // Tokens may differ (quantization changes weights) but both should be deterministic
+        let q4_result2 = q4_engine.generate_with_cache(&dev, &prompt, &gen_config, 256).unwrap();
+        assert_eq!(q4_result.tokens, q4_result2.tokens, "Q4_0 generation not deterministic!");
+        println!("Q4_0 deterministic: confirmed");
+    }
+
+    #[test]
+    fn weight_memory_scaling() {
+        // Show memory savings at real model scales
+        println!("\n=== Weight Memory Estimates ===");
+
+        let configs = vec![
+            ("tiny (H=64, 4L)",    TransformerConfig::tiny(),   4u32,  256u32),
+            ("small (H=256, 8L)",  TransformerConfig::small(),  8,     32000),
+            ("medium (H=1024, 16L)", TransformerConfig::medium(), 16,  32000),
+            ("LLaMA-7B-like",      TransformerConfig {
+                hidden_size: 4096, num_heads: 32, num_kv_heads: 32,
+                head_dim: 128, ffn_dim: 11008, rope_base: 10000.0, norm_eps: 1e-6,
+            }, 32, 32000),
+        ];
+
+        for (name, config, layers, vocab) in configs {
+            let (f32_b, q4_b) = weight_memory_estimate(&config, layers, vocab);
+            println!("  {name:25} F32={:>8.1} MB  Q4_0={:>8.1} MB  ({:.1}x smaller)",
+                f32_b as f64 / 1e6, q4_b as f64 / 1e6, f32_b as f64 / q4_b as f64);
+        }
     }
 }

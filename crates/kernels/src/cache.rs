@@ -13,12 +13,17 @@ use std::time::{Duration, Instant};
 
 use crate::device::{DeviceError, WarpDevice};
 
-/// Thread-safe kernel compilation cache.
+/// Thread-safe kernel compilation cache with optional disk persistence.
+///
+/// Session cache: in-memory FxHashMap, ~1μs lookups.
+/// Disk cache: PTX files in a cache directory, eliminates NVRTC on restart.
 pub struct KernelCache {
     cache: Mutex<FxHashMap<u64, (CudaFunction, Duration)>>,
     hits: Mutex<u64>,
     misses: Mutex<u64>,
     total_compile_time: Mutex<Duration>,
+    /// Directory for persistent PTX cache. None = session-only.
+    disk_cache_dir: Option<std::path::PathBuf>,
 }
 
 impl KernelCache {
@@ -28,10 +33,28 @@ impl KernelCache {
             hits: Mutex::new(0),
             misses: Mutex::new(0),
             total_compile_time: Mutex::new(Duration::ZERO),
+            disk_cache_dir: None,
+        }
+    }
+
+    /// Create a cache with disk persistence.
+    /// Compiled PTX is saved to `dir` and reloaded on subsequent runs,
+    /// skipping NVRTC compilation entirely.
+    pub fn with_disk_cache(dir: impl Into<std::path::PathBuf>) -> Self {
+        let dir = dir.into();
+        let _ = std::fs::create_dir_all(&dir);
+        Self {
+            cache: Mutex::new(FxHashMap::default()),
+            hits: Mutex::new(0),
+            misses: Mutex::new(0),
+            total_compile_time: Mutex::new(Duration::ZERO),
+            disk_cache_dir: Some(dir),
         }
     }
 
     /// Get or compile a CUDA kernel. Returns cached version if available.
+    ///
+    /// Lookup order: memory cache → disk cache → NVRTC compile.
     pub fn get_or_compile(
         &self,
         device: &WarpDevice,
@@ -40,7 +63,7 @@ impl KernelCache {
     ) -> Result<CudaFunction, DeviceError> {
         let key = hash_source(cuda_src, func_name);
 
-        // Fast path: cache hit
+        // Fast path: memory cache hit
         {
             let cache = self.cache.lock().unwrap();
             if let Some((func, _)) = cache.get(&key) {
@@ -49,9 +72,41 @@ impl KernelCache {
             }
         }
 
-        // Slow path: compile and cache
+        // Medium path: disk cache hit (load pre-compiled PTX file)
+        if let Some(ref dir) = self.disk_cache_dir {
+            let ptx_path = dir.join(format!("{:016x}.ptx", key));
+            if ptx_path.exists() {
+                let start = Instant::now();
+                let ptx = cudarc::nvrtc::Ptx::from_file(&ptx_path);
+                if let Ok(module) = device.ctx.load_module(ptx) {
+                    if let Ok(function) = module.load_function(func_name) {
+                        let load_time = start.elapsed();
+                        let mut cache = self.cache.lock().unwrap();
+                        cache.insert(key, (function.clone(), load_time));
+                        *self.hits.lock().unwrap() += 1;
+                        return Ok(function);
+                    }
+                }
+                // Corrupted cache file — fall through to recompile
+            }
+        }
+
+        // Slow path: NVRTC compile
         let start = Instant::now();
-        let (_module, function) = device.load_cuda_source(cuda_src, func_name)?;
+        let ptx = cudarc::nvrtc::compile_ptx(cuda_src)
+            .map_err(|e| DeviceError::PtxLoad(e.to_string()))?;
+
+        // Save PTX to disk cache for next startup
+        if let Some(ref dir) = self.disk_cache_dir {
+            let ptx_path = dir.join(format!("{:016x}.ptx", key));
+            let ptx_text = ptx.to_src();
+            let _ = std::fs::write(&ptx_path, ptx_text);
+        }
+
+        let module = device.ctx.load_module(ptx)
+            .map_err(|e| DeviceError::PtxLoad(e.to_string()))?;
+        let function = module.load_function(func_name)
+            .map_err(|e| DeviceError::FuncNotFound(e.to_string()))?;
         let compile_time = start.elapsed();
 
         {

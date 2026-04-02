@@ -18,6 +18,44 @@ use crate::cache::KernelCache;
 use crate::device::{DeviceError, WarpDevice};
 use crate::tensor::GpuTensor;
 
+/// Bulk-copy K/V from prefill into the cache.
+/// Copies [seq_len, dim] contiguous data starting at position 0.
+const KV_CACHE_PREFILL_SRC: &str = r#"
+extern "C" __global__ void warp_kv_cache_prefill(
+    float *cache,            // [max_seq, dim]
+    const float *src,        // [seq_len, dim]
+    unsigned int seq_len,
+    unsigned int dim,
+    unsigned int max_seq
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = seq_len * dim;
+    if (idx >= total) return;
+    unsigned int pos = idx / dim;
+    if (pos >= max_seq) return;
+    cache[idx] = src[idx];
+}
+"#;
+
+/// Fused K+V append — writes both in a single kernel launch.
+const KV_CACHE_APPEND_FUSED_SRC: &str = r#"
+extern "C" __global__ void warp_kv_cache_append_fused(
+    float *k_cache,          // [max_seq, dim]
+    float *v_cache,          // [max_seq, dim]
+    const float *new_k,      // [1, dim]
+    const float *new_v,      // [1, dim]
+    unsigned int pos,
+    unsigned int dim,
+    unsigned int max_seq
+) {
+    unsigned int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= dim) return;
+    if (pos >= max_seq) return;
+    k_cache[pos * dim + d] = new_k[d];
+    v_cache[pos * dim + d] = new_v[d];
+}
+"#;
+
 /// Append new K/V values to the cache at the current position.
 const KV_CACHE_APPEND_SRC: &str = r#"
 extern "C" __global__ void warp_kv_cache_append(
@@ -56,7 +94,50 @@ impl LayerKVCache {
         Ok(Self { k, v, len: 0, max_seq_len, kv_dim })
     }
 
+    /// Bulk-write K and V from a prefill pass.
+    /// k_all and v_all are [seq_len, kv_dim] — the full prompt's projections.
+    pub fn prefill(
+        &mut self,
+        kernel_cache: &KernelCache,
+        device: &WarpDevice,
+        k_all: &GpuTensor<f32>,  // [seq_len, kv_dim]
+        v_all: &GpuTensor<f32>,  // [seq_len, kv_dim]
+        seq_len: u32,
+    ) -> Result<(), DeviceError> {
+        let f = kernel_cache.get_or_compile(device, KV_CACHE_PREFILL_SRC, "warp_kv_cache_prefill")?;
+        let total = seq_len * self.kv_dim;
+        let cfg = LaunchConfig::for_num_elems(total);
+
+        // Copy K
+        unsafe {
+            device.stream.launch_builder(&f)
+                .arg(&mut self.k.data)
+                .arg(&k_all.data)
+                .arg(&seq_len)
+                .arg(&self.kv_dim)
+                .arg(&self.max_seq_len)
+                .launch(cfg)
+                .map_err(|e: cudarc::driver::result::DriverError| DeviceError::Launch(e.to_string()))?;
+        }
+
+        // Copy V
+        unsafe {
+            device.stream.launch_builder(&f)
+                .arg(&mut self.v.data)
+                .arg(&v_all.data)
+                .arg(&seq_len)
+                .arg(&self.kv_dim)
+                .arg(&self.max_seq_len)
+                .launch(cfg)
+                .map_err(|e: cudarc::driver::result::DriverError| DeviceError::Launch(e.to_string()))?;
+        }
+
+        self.len = seq_len;
+        Ok(())
+    }
+
     /// Append K and V vectors for one new token position.
+    /// Uses a fused kernel to write both K and V in a single launch.
     pub fn append(
         &mut self,
         kernel_cache: &KernelCache,
@@ -64,25 +145,15 @@ impl LayerKVCache {
         new_k: &GpuTensor<f32>,  // [1, kv_dim]
         new_v: &GpuTensor<f32>,  // [1, kv_dim]
     ) -> Result<(), DeviceError> {
-        let f = kernel_cache.get_or_compile(device, KV_CACHE_APPEND_SRC, "warp_kv_cache_append")?;
+        let f = kernel_cache.get_or_compile(device, KV_CACHE_APPEND_FUSED_SRC, "warp_kv_cache_append_fused")?;
         let cfg = LaunchConfig::for_num_elems(self.kv_dim);
 
-        // Append K
+        // Fused K+V append (2 launches → 1)
         unsafe {
             device.stream.launch_builder(&f)
                 .arg(&mut self.k.data)
-                .arg(&new_k.data)
-                .arg(&self.len)
-                .arg(&self.kv_dim)
-                .arg(&self.max_seq_len)
-                .launch(cfg)
-                .map_err(|e: cudarc::driver::result::DriverError| DeviceError::Launch(e.to_string()))?;
-        }
-
-        // Append V
-        unsafe {
-            device.stream.launch_builder(&f)
                 .arg(&mut self.v.data)
+                .arg(&new_k.data)
                 .arg(&new_v.data)
                 .arg(&self.len)
                 .arg(&self.kv_dim)

@@ -54,6 +54,230 @@ extern "C" __global__ void warp_silu(float *out, const float *x, size_t n) {
 }
 "#;
 
+const SUB_SRC: &str = r#"
+extern "C" __global__ void warp_sub(float *out, const float *a, const float *b, size_t n) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { out[i] = a[i] - b[i]; }
+}
+"#;
+
+const DIV_SRC: &str = r#"
+extern "C" __global__ void warp_div(float *out, const float *a, const float *b, size_t n) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { out[i] = a[i] / b[i]; }
+}
+"#;
+
+// ── Transpose ───────────────────────────────────────────────────
+// 2D transpose: [M, N] → [N, M]
+
+const TRANSPOSE_2D_SRC: &str = r#"
+#define TILE 32
+extern "C" __global__ void warp_transpose_2d(
+    float *out, const float *in_data,
+    unsigned int M, unsigned int N
+) {
+    __shared__ float tile[TILE][TILE + 1]; // +1 avoids bank conflicts
+
+    unsigned int bx = blockIdx.x, by = blockIdx.y;
+    unsigned int tx = threadIdx.x, ty = threadIdx.y;
+
+    // Read from input [M, N]
+    unsigned int row = by * TILE + ty;
+    unsigned int col = bx * TILE + tx;
+    if (row < M && col < N) {
+        tile[ty][tx] = in_data[row * N + col];
+    }
+    __syncthreads();
+
+    // Write to output [N, M] — transposed indices
+    unsigned int out_row = bx * TILE + ty;
+    unsigned int out_col = by * TILE + tx;
+    if (out_row < N && out_col < M) {
+        out[out_row * M + out_col] = tile[tx][ty];
+    }
+}
+"#;
+
+// ── Reduce ──────────────────────────────────────────────────────
+// Reduce along last dimension: [rows, cols] → [rows]
+
+const REDUCE_SUM_SRC: &str = r#"
+extern "C" __global__ void warp_reduce_sum(
+    float *out, const float *input,
+    unsigned int rows, unsigned int cols
+) {
+    unsigned int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    float sum = 0.0f;
+    for (unsigned int c = 0; c < cols; c++) {
+        sum += input[row * cols + c];
+    }
+    out[row] = sum;
+}
+"#;
+
+const REDUCE_MEAN_SRC: &str = r#"
+extern "C" __global__ void warp_reduce_mean(
+    float *out, const float *input,
+    unsigned int rows, unsigned int cols
+) {
+    unsigned int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    float sum = 0.0f;
+    for (unsigned int c = 0; c < cols; c++) {
+        sum += input[row * cols + c];
+    }
+    out[row] = sum / (float)cols;
+}
+"#;
+
+const REDUCE_MAX_SRC: &str = r#"
+extern "C" __global__ void warp_reduce_max(
+    float *out, const float *input,
+    unsigned int rows, unsigned int cols
+) {
+    unsigned int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    float mx = -1e30f;
+    for (unsigned int c = 0; c < cols; c++) {
+        float v = input[row * cols + c];
+        if (v > mx) mx = v;
+    }
+    out[row] = mx;
+}
+"#;
+
+const RELU_SRC: &str = r#"
+extern "C" __global__ void warp_relu(float *out, const float *x, size_t n) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { out[i] = fmaxf(x[i], 0.0f); }
+}
+"#;
+
+const SIGMOID_SRC: &str = r#"
+extern "C" __global__ void warp_sigmoid(float *out, const float *x, size_t n) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { out[i] = 1.0f / (1.0f + expf(-x[i])); }
+}
+"#;
+
+const TANH_SRC: &str = r#"
+extern "C" __global__ void warp_tanh(float *out, const float *x, size_t n) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { out[i] = tanhf(x[i]); }
+}
+"#;
+
+const LEAKY_RELU_SRC: &str = r#"
+extern "C" __global__ void warp_leaky_relu(
+    float *out, const float *x, float alpha, size_t n
+) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = x[i];
+        out[i] = v > 0.0f ? v : alpha * v;
+    }
+}
+"#;
+
+const CLIP_SRC: &str = r#"
+extern "C" __global__ void warp_clip(
+    float *out, const float *x, float lo, float hi, size_t n
+) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { out[i] = fminf(fmaxf(x[i], lo), hi); }
+}
+"#;
+
+// ── GroupNorm ────────────────────────────────────────────────────
+// Used heavily by Stable Diffusion, ViT variants.
+// y = ((x - mean) / sqrt(var + eps)) * scale + bias
+// Mean/var computed per group across spatial dims.
+
+const GROUPNORM_SRC: &str = r#"
+extern "C" __global__ void warp_groupnorm(
+    float *out,
+    const float *x,         // [C, spatial]
+    const float *scale,     // [C]
+    const float *bias,      // [C]
+    unsigned int C,
+    unsigned int spatial,    // H * W
+    unsigned int num_groups,
+    float eps
+) {
+    unsigned int group = blockIdx.x;
+    if (group >= num_groups) return;
+
+    unsigned int channels_per_group = C / num_groups;
+    unsigned int group_start = group * channels_per_group;
+    unsigned int group_size = channels_per_group * spatial;
+
+    // Compute mean and variance for this group
+    float sum = 0.0f;
+    for (unsigned int i = threadIdx.x; i < group_size; i += blockDim.x) {
+        unsigned int c = group_start + i / spatial;
+        unsigned int s = i % spatial;
+        sum += x[c * spatial + s];
+    }
+
+    // Warp reduction for sum
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+    sum = __shfl_sync(0xffffffff, sum, 0);
+    float mean = sum / (float)group_size;
+
+    // Variance
+    float var_sum = 0.0f;
+    for (unsigned int i = threadIdx.x; i < group_size; i += blockDim.x) {
+        unsigned int c = group_start + i / spatial;
+        unsigned int s = i % spatial;
+        float diff = x[c * spatial + s] - mean;
+        var_sum += diff * diff;
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        var_sum += __shfl_down_sync(0xffffffff, var_sum, offset);
+    var_sum = __shfl_sync(0xffffffff, var_sum, 0);
+    float inv_std = rsqrtf(var_sum / (float)group_size + eps);
+
+    // Normalize
+    for (unsigned int i = threadIdx.x; i < group_size; i += blockDim.x) {
+        unsigned int c = group_start + i / spatial;
+        unsigned int s = i % spatial;
+        unsigned int idx = c * spatial + s;
+        out[idx] = (x[idx] - mean) * inv_std * scale[c] + bias[c];
+    }
+}
+"#;
+
+// ── Concat ──────────────────────────────────────────────────────
+// Concatenate tensors along the channel dimension (axis=1 for NCHW).
+
+const CONCAT_SRC: &str = r#"
+extern "C" __global__ void warp_concat_channels(
+    float *out,             // [total_C, spatial]
+    const float *a,         // [C_a, spatial]
+    const float *b,         // [C_b, spatial]
+    unsigned int C_a,
+    unsigned int C_b,
+    unsigned int spatial
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = (C_a + C_b) * spatial;
+    if (idx >= total) return;
+
+    unsigned int c = idx / spatial;
+    unsigned int s = idx % spatial;
+
+    if (c < C_a) {
+        out[idx] = a[c * spatial + s];
+    } else {
+        out[idx] = b[(c - C_a) * spatial + s];
+    }
+}
+"#;
+
 const FUSED_ADD_GELU_SRC: &str = r#"
 extern "C" __global__ void warp_fused_add_gelu(float *out, const float *a, const float *b, size_t n) {
     size_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -147,6 +371,125 @@ pub fn mul(
     Ok(())
 }
 
+/// Cached elementwise sub.
+pub fn sub(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    a: &GpuTensor<f32>,
+    b: &GpuTensor<f32>,
+    out: &mut GpuTensor<f32>,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, SUB_SRC, "warp_sub")?;
+    let n = a.numel;
+    let cfg = LaunchConfig::for_num_elems(n as u32);
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut out.data).arg(&a.data).arg(&b.data).arg(&n)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+/// Cached elementwise div.
+pub fn div(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    a: &GpuTensor<f32>,
+    b: &GpuTensor<f32>,
+    out: &mut GpuTensor<f32>,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, DIV_SRC, "warp_div")?;
+    let n = a.numel;
+    let cfg = LaunchConfig::for_num_elems(n as u32);
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut out.data).arg(&a.data).arg(&b.data).arg(&n)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+/// 2D transpose: [M, N] → [N, M] with shared memory tiling.
+pub fn transpose_2d(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    x: &GpuTensor<f32>,
+    out: &mut GpuTensor<f32>,
+    m: u32,
+    n: u32,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, TRANSPOSE_2D_SRC, "warp_transpose_2d")?;
+    let tile = 32u32;
+    let cfg = LaunchConfig {
+        grid_dim: ((n + tile - 1) / tile, (m + tile - 1) / tile, 1),
+        block_dim: (tile, tile, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut out.data).arg(&x.data).arg(&m).arg(&n)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+/// Reduce sum along last dimension: [rows, cols] → [rows].
+pub fn reduce_sum(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    x: &GpuTensor<f32>,
+    out: &mut GpuTensor<f32>,
+    rows: u32,
+    cols: u32,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, REDUCE_SUM_SRC, "warp_reduce_sum")?;
+    let cfg = LaunchConfig::for_num_elems(rows);
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut out.data).arg(&x.data).arg(&rows).arg(&cols)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+/// Reduce mean along last dimension: [rows, cols] → [rows].
+pub fn reduce_mean(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    x: &GpuTensor<f32>,
+    out: &mut GpuTensor<f32>,
+    rows: u32,
+    cols: u32,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, REDUCE_MEAN_SRC, "warp_reduce_mean")?;
+    let cfg = LaunchConfig::for_num_elems(rows);
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut out.data).arg(&x.data).arg(&rows).arg(&cols)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+/// Reduce max along last dimension: [rows, cols] → [rows].
+pub fn reduce_max(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    x: &GpuTensor<f32>,
+    out: &mut GpuTensor<f32>,
+    rows: u32,
+    cols: u32,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, REDUCE_MAX_SRC, "warp_reduce_max")?;
+    let cfg = LaunchConfig::for_num_elems(rows);
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut out.data).arg(&x.data).arg(&rows).arg(&cols)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
 /// Cached GELU activation.
 pub fn gelu(
     cache: &KernelCache,
@@ -179,6 +522,170 @@ pub fn silu(
         launch_err!(device.stream.launch_builder(&f)
             .arg(&mut out.data).arg(&x.data).arg(&n)
             .launch(cfg))?;
+    }
+    Ok(())
+}
+
+/// Cached ReLU.
+pub fn relu(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    x: &GpuTensor<f32>,
+    out: &mut GpuTensor<f32>,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, RELU_SRC, "warp_relu")?;
+    let n = x.numel;
+    let cfg = LaunchConfig::for_num_elems(n as u32);
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut out.data).arg(&x.data).arg(&n)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+/// Cached sigmoid.
+pub fn sigmoid(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    x: &GpuTensor<f32>,
+    out: &mut GpuTensor<f32>,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, SIGMOID_SRC, "warp_sigmoid")?;
+    let n = x.numel;
+    let cfg = LaunchConfig::for_num_elems(n as u32);
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut out.data).arg(&x.data).arg(&n)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+/// Cached tanh.
+pub fn tanh_act(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    x: &GpuTensor<f32>,
+    out: &mut GpuTensor<f32>,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, TANH_SRC, "warp_tanh")?;
+    let n = x.numel;
+    let cfg = LaunchConfig::for_num_elems(n as u32);
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut out.data).arg(&x.data).arg(&n)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+/// Cached leaky ReLU.
+pub fn leaky_relu(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    x: &GpuTensor<f32>,
+    out: &mut GpuTensor<f32>,
+    alpha: f32,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, LEAKY_RELU_SRC, "warp_leaky_relu")?;
+    let n = x.numel;
+    let cfg = LaunchConfig::for_num_elems(n as u32);
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut out.data).arg(&x.data).arg(&alpha).arg(&n)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+/// Cached clip/clamp.
+pub fn clip(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    x: &GpuTensor<f32>,
+    out: &mut GpuTensor<f32>,
+    lo: f32,
+    hi: f32,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, CLIP_SRC, "warp_clip")?;
+    let n = x.numel;
+    let cfg = LaunchConfig::for_num_elems(n as u32);
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut out.data).arg(&x.data).arg(&lo).arg(&hi).arg(&n)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+/// Group normalization. Used by Stable Diffusion, modern ViTs.
+pub fn groupnorm(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    x: &GpuTensor<f32>,
+    scale: &GpuTensor<f32>,
+    bias: &GpuTensor<f32>,
+    out: &mut GpuTensor<f32>,
+    channels: u32,
+    spatial: u32,
+    num_groups: u32,
+    eps: f32,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, GROUPNORM_SRC, "warp_groupnorm")?;
+    let batch = x.numel as u32 / (channels * spatial);
+
+    for n in 0..batch {
+        let off = (n * channels) as usize * spatial as usize;
+        let cfg = LaunchConfig {
+            grid_dim: (num_groups, 1, 1),
+            block_dim: (32, 1, 1), // one warp per group
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            launch_err!(device.stream.launch_builder(&f)
+                .arg(&mut out.data.slice_mut(off..))
+                .arg(&x.data.slice(off..))
+                .arg(&scale.data)
+                .arg(&bias.data)
+                .arg(&channels)
+                .arg(&spatial)
+                .arg(&num_groups)
+                .arg(&eps)
+                .launch(cfg))?;
+        }
+    }
+    Ok(())
+}
+
+/// Concat two tensors along channel dimension.
+/// a: [C_a, spatial], b: [C_b, spatial] → out: [C_a + C_b, spatial]
+pub fn concat_channels(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    a: &GpuTensor<f32>,
+    b: &GpuTensor<f32>,
+    out: &mut GpuTensor<f32>,
+    c_a: u32,
+    c_b: u32,
+    spatial: u32,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, CONCAT_SRC, "warp_concat_channels")?;
+    let batch = a.numel as u32 / (c_a * spatial);
+    for n in 0..batch {
+        let a_off = (n * c_a) as usize * spatial as usize;
+        let b_off = (n * c_b) as usize * spatial as usize;
+        let out_off = (n * (c_a + c_b)) as usize * spatial as usize;
+        let total = (c_a + c_b) * spatial;
+        let cfg = LaunchConfig::for_num_elems(total);
+        unsafe {
+            launch_err!(device.stream.launch_builder(&f)
+                .arg(&mut out.data.slice_mut(out_off..))
+                .arg(&a.data.slice(a_off..))
+                .arg(&b.data.slice(b_off..))
+                .arg(&c_a).arg(&c_b).arg(&spatial)
+                .launch(cfg))?;
+        }
     }
     Ok(())
 }
@@ -216,6 +723,304 @@ pub fn fused_add_silu(
     unsafe {
         launch_err!(device.stream.launch_builder(&f)
             .arg(&mut out.data).arg(&a.data).arg(&b.data).arg(&n)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+// ── Fused residual + RMSNorm ──────────────────────────────────
+// out = rmsnorm(x + residual, gamma)
+// Saves one kernel launch + one global memory pass.
+
+// Fused residual + RMSNorm with DUAL output:
+// residual_out = x + residual (for later use)
+// norm_out = rmsnorm(x + residual, gamma)
+// One kernel, one memory pass, two outputs. Saves 1 launch vs separate add+rmsnorm.
+const FUSED_RESIDUAL_RMSNORM_SRC: &str = r#"
+extern "C" __global__ void warp_fused_residual_rmsnorm(
+    float *norm_out,        // rmsnorm result
+    float *residual_out,    // x + residual (un-normalized sum)
+    const float *x, const float *residual, const float *gamma,
+    unsigned int hidden_size, float eps, size_t n_rows
+) {
+    unsigned int row = blockIdx.x;
+    if (row >= n_rows) return;
+
+    const float *x_row = x + row * hidden_size;
+    const float *r_row = residual + row * hidden_size;
+    float *nout = norm_out + row * hidden_size;
+    float *rout = residual_out + row * hidden_size;
+
+    float sum_sq = 0.0f;
+    for (unsigned int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        float v = x_row[i] + r_row[i];
+        sum_sq += v * v;
+        rout[i] = v;     // store residual sum
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+    sum_sq = __shfl_sync(0xffffffff, sum_sq, 0);
+
+    float rms = rsqrtf(sum_sq / (float)hidden_size + eps);
+
+    for (unsigned int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        nout[i] = rout[i] * rms * gamma[i];
+    }
+}
+"#;
+
+// ── Fused SwiGLU gate: silu(gate) * up ──────────────────────
+// out = silu(gate) * up
+// Saves one kernel launch.
+
+const FUSED_SILU_MUL_SRC: &str = r#"
+extern "C" __global__ void warp_fused_silu_mul(
+    float *out, const float *gate, const float *up, size_t n
+) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float g = gate[i];
+        float silu_g = g / (1.0f + expf(-g));
+        out[i] = silu_g * up[i];
+    }
+}
+"#;
+
+/// Fused residual add + RMSNorm with dual output:
+/// - norm_out = rmsnorm(x + residual, gamma)
+/// - residual_out = x + residual (un-normalized, for downstream residual)
+///
+/// Replaces separate add + rmsnorm (2 launches + 2 memory passes → 1 launch + 1 pass).
+pub fn fused_residual_rmsnorm(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    x: &GpuTensor<f32>,
+    residual: &GpuTensor<f32>,
+    gamma: &GpuTensor<f32>,
+    norm_out: &mut GpuTensor<f32>,
+    residual_out: &mut GpuTensor<f32>,
+    hidden_size: u32,
+    eps: f32,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, FUSED_RESIDUAL_RMSNORM_SRC, "warp_fused_residual_rmsnorm")?;
+    let n_rows = (x.numel / hidden_size as usize) as usize;
+    let cfg = LaunchConfig {
+        grid_dim: (n_rows as u32, 1, 1),
+        block_dim: (32.min(hidden_size), 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut norm_out.data)
+            .arg(&mut residual_out.data)
+            .arg(&x.data)
+            .arg(&residual.data)
+            .arg(&gamma.data)
+            .arg(&hidden_size)
+            .arg(&eps)
+            .arg(&n_rows)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+/// Fused SwiGLU gate: out = silu(gate) * up.
+/// Replaces separate silu + mul (2 launches → 1).
+pub fn fused_silu_mul(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    gate: &GpuTensor<f32>,
+    up: &GpuTensor<f32>,
+    out: &mut GpuTensor<f32>,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, FUSED_SILU_MUL_SRC, "warp_fused_silu_mul")?;
+    let n = gate.numel;
+    let cfg = LaunchConfig::for_num_elems(n as u32);
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut out.data).arg(&gate.data).arg(&up.data).arg(&n)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+// ── Fused QKV projection ─────────────────────────────────────
+// Computes Q, K, V in a single GEMM by concatenating weight matrices:
+// [normed] × [Wq | Wk | Wv] → [Q | K | V]
+// 3 kernel launches → 1.
+
+const SPLIT3_SRC: &str = r#"
+extern "C" __global__ void warp_split3(
+    float *q, float *k, float *v,
+    const float *qkv,
+    unsigned int q_dim, unsigned int k_dim, unsigned int v_dim,
+    unsigned int total_dim, unsigned int rows
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = rows * total_dim;
+    if (idx >= total) return;
+
+    unsigned int row = idx / total_dim;
+    unsigned int col = idx % total_dim;
+
+    float val = qkv[idx];
+
+    if (col < q_dim) {
+        q[row * q_dim + col] = val;
+    } else if (col < q_dim + k_dim) {
+        k[row * k_dim + (col - q_dim)] = val;
+    } else {
+        v[row * v_dim + (col - q_dim - k_dim)] = val;
+    }
+}
+"#;
+
+/// Fused QKV projection: compute Q, K, V in one GEMM + split.
+/// input: [batch, hidden_size]
+/// wq: [hidden_size, q_dim], wk: [hidden_size, k_dim], wv: [hidden_size, v_dim]
+///
+/// Instead of 3 separate GEMMs, concatenates weights and does 1 wider GEMM,
+/// then splits the output. Saves 2 kernel launches per transformer block.
+pub fn fused_qkv_projection(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    input: &GpuTensor<f32>,
+    wq: &GpuTensor<f32>,
+    wk: &GpuTensor<f32>,
+    wv: &GpuTensor<f32>,
+    q_out: &mut GpuTensor<f32>,
+    k_out: &mut GpuTensor<f32>,
+    v_out: &mut GpuTensor<f32>,
+    m: u32,       // batch*seq (rows)
+    q_dim: u32,   // typically hidden_size
+    k_dim: u32,   // typically kv_dim
+    v_dim: u32,   // typically kv_dim
+    hidden: u32,  // input hidden size (K dimension)
+) -> Result<(), DeviceError> {
+    let total_out = q_dim + k_dim + v_dim;
+
+    // Concatenate weights on CPU (one-time cost, should be cached)
+    let wq_host = wq.to_host(device)?;
+    let wk_host = wk.to_host(device)?;
+    let wv_host = wv.to_host(device)?;
+
+    // Build concatenated weight [hidden, q_dim+k_dim+v_dim]
+    let mut concat_w = vec![0.0f32; (hidden * total_out) as usize];
+    for row in 0..hidden as usize {
+        // Q columns
+        for c in 0..q_dim as usize {
+            concat_w[row * total_out as usize + c] = wq_host[row * q_dim as usize + c];
+        }
+        // K columns
+        for c in 0..k_dim as usize {
+            concat_w[row * total_out as usize + q_dim as usize + c] = wk_host[row * k_dim as usize + c];
+        }
+        // V columns
+        for c in 0..v_dim as usize {
+            concat_w[row * total_out as usize + q_dim as usize + k_dim as usize + c] = wv_host[row * v_dim as usize + c];
+        }
+    }
+
+    let w_concat = GpuTensor::from_host(device, &concat_w,
+        warp_ir::Shape::from_static(&[hidden as usize, total_out as usize]), warp_ir::DType::F32)?;
+
+    // Single wide GEMM: [m, hidden] × [hidden, total_out] → [m, total_out]
+    let mut qkv = GpuTensor::<f32>::zeros(device,
+        warp_ir::Shape::from_static(&[m as usize, total_out as usize]), warp_ir::DType::F32)?;
+    gemm(cache, device, input, &w_concat, &mut qkv, m, total_out, hidden)?;
+
+    // Split into Q, K, V
+    let f = cache.get_or_compile(device, SPLIT3_SRC, "warp_split3")?;
+    let total = m * total_out;
+    let cfg = LaunchConfig::for_num_elems(total);
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut q_out.data)
+            .arg(&mut k_out.data)
+            .arg(&mut v_out.data)
+            .arg(&qkv.data)
+            .arg(&q_dim)
+            .arg(&k_dim)
+            .arg(&v_dim)
+            .arg(&total_out)
+            .arg(&m)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+// ── Fused Gate+Up projection ─────────────────────────────────
+// For SwiGLU FFN: compute gate and up projections in one GEMM.
+// [input] × [W_gate | W_up] → [gate | up], then split.
+
+const SPLIT2_SRC: &str = r#"
+extern "C" __global__ void warp_split2(
+    float *a_out, float *b_out,
+    const float *ab,
+    unsigned int a_dim, unsigned int b_dim,
+    unsigned int total_dim, unsigned int rows
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = rows * total_dim;
+    if (idx >= total) return;
+    unsigned int row = idx / total_dim;
+    unsigned int col = idx % total_dim;
+    float val = ab[idx];
+    if (col < a_dim) a_out[row * a_dim + col] = val;
+    else b_out[row * b_dim + (col - a_dim)] = val;
+}
+"#;
+
+/// Fused Gate+Up projection: compute both in one GEMM + split.
+/// Saves 1 kernel launch per transformer block FFN.
+pub fn fused_gate_up_proj(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    input: &GpuTensor<f32>,
+    w_gate: &GpuTensor<f32>,
+    w_up: &GpuTensor<f32>,
+    gate_out: &mut GpuTensor<f32>,
+    up_out: &mut GpuTensor<f32>,
+    m: u32,
+    ffn_dim: u32,
+    hidden: u32,
+) -> Result<(), DeviceError> {
+    let total_out = ffn_dim * 2;
+
+    // Concatenate gate + up weights [hidden, 2*ffn_dim]
+    let wg_host = w_gate.to_host(device)?;
+    let wu_host = w_up.to_host(device)?;
+
+    let mut concat_w = vec![0.0f32; (hidden * total_out) as usize];
+    for row in 0..hidden as usize {
+        for c in 0..ffn_dim as usize {
+            concat_w[row * total_out as usize + c] = wg_host[row * ffn_dim as usize + c];
+            concat_w[row * total_out as usize + ffn_dim as usize + c] = wu_host[row * ffn_dim as usize + c];
+        }
+    }
+
+    let w_concat = GpuTensor::from_host(device, &concat_w,
+        warp_ir::Shape::from_static(&[hidden as usize, total_out as usize]), warp_ir::DType::F32)?;
+
+    // Single GEMM
+    let mut gate_up = GpuTensor::<f32>::zeros(device,
+        warp_ir::Shape::from_static(&[m as usize, total_out as usize]), warp_ir::DType::F32)?;
+    gemm(cache, device, input, &w_concat, &mut gate_up, m, total_out, hidden)?;
+
+    // Split
+    let f = cache.get_or_compile(device, SPLIT2_SRC, "warp_split2")?;
+    let total = m * total_out;
+    let cfg = LaunchConfig::for_num_elems(total);
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut gate_out.data)
+            .arg(&mut up_out.data)
+            .arg(&gate_up.data)
+            .arg(&ffn_dim)
+            .arg(&ffn_dim)
+            .arg(&total_out)
+            .arg(&m)
             .launch(cfg))?;
     }
     Ok(())

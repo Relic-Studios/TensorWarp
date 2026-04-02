@@ -7,8 +7,10 @@
 //! Passes are composable and ordered — fusion runs after constant folding,
 //! layout optimization runs after fusion, etc.
 
+pub mod autofuse;
 pub mod fusion;
 pub mod pass;
 pub mod pattern;
 
 pub use pass::{OptimizationLevel, PassPipeline};
+pub use autofuse::{discover_fusion_chains, fusion_report, FusionChain};
