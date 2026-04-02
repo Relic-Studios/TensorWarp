@@ -98,13 +98,11 @@ pub fn transformer_block_forward_f16(
     let mut attn_projected = GpuTensor::<half::f16>::zeros(device, shape_bnh.clone(), DType::F16)?;
     fp16::f16_gemm(cache, device, &attn_out, &weights.wo, &mut attn_projected, bn, h, h)?;
 
-    // 6. Residual add (FP16)
+    // 6+7. Fused residual + RMSNorm (FP16, 2 launches → 1)
     let mut residual = GpuTensor::<half::f16>::zeros(device, shape_bnh.clone(), DType::F16)?;
-    fp16::f16_add(cache, device, x, &attn_projected, &mut residual)?;
-
-    // 7. FFN RMSNorm
     let mut ffn_normed = GpuTensor::<half::f16>::zeros(device, shape_bnh.clone(), DType::F16)?;
-    fp16::f16_rmsnorm(cache, device, &residual, &weights.ffn_norm, &mut ffn_normed, h, config.norm_eps)?;
+    fp16::f16_fused_residual_rmsnorm(cache, device, &attn_projected, x, &weights.ffn_norm,
+        &mut ffn_normed, &mut residual, h, config.norm_eps)?;
 
     // 8. Gate + Up — tensor core
     let mut gate = GpuTensor::<half::f16>::zeros(device, shape_bnf.clone(), DType::F16)?;
@@ -112,11 +110,9 @@ pub fn transformer_block_forward_f16(
     fp16::f16_gemm(cache, device, &ffn_normed, &weights.w_gate, &mut gate, bn, ffn, h)?;
     fp16::f16_gemm(cache, device, &ffn_normed, &weights.w_up, &mut up, bn, ffn, h)?;
 
-    // 9. Fused SwiGLU (FP16 silu + mul)
-    let mut silu_gate = GpuTensor::<half::f16>::zeros(device, shape_bnf.clone(), DType::F16)?;
-    fp16::f16_silu(cache, device, &gate, &mut silu_gate)?;
+    // 9. Fused SwiGLU (FP16, 2 launches → 1)
     let mut swiglu = GpuTensor::<half::f16>::zeros(device, shape_bnf, DType::F16)?;
-    fp16::f16_mul(cache, device, &silu_gate, &up, &mut swiglu)?;
+    fp16::f16_fused_silu_mul(cache, device, &gate, &up, &mut swiglu)?;
 
     // 10. Down projection — tensor core
     let mut ffn_out = GpuTensor::<half::f16>::zeros(device, shape_bnh.clone(), DType::F16)?;

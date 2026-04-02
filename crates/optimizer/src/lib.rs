@@ -8,6 +8,7 @@
 //! layout optimization runs after fusion, etc.
 
 pub mod autofuse;
+pub mod constfold;
 pub mod fusion;
 pub mod pass;
 pub mod pattern;

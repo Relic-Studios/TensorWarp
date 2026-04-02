@@ -269,6 +269,110 @@ pub fn f16_rmsnorm(
     Ok(())
 }
 
+// ── FP16 fused ops ──────────────────────────────────────────────
+
+const F16_FUSED_SILU_MUL_SRC: &str = r#"
+#include <cuda_fp16.h>
+extern "C" __global__ void warp_f16_fused_silu_mul(
+    half *out, const half *gate, const half *up, size_t n
+) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float g = __half2float(gate[i]);
+        float silu_g = g / (1.0f + expf(-g));
+        out[i] = __float2half(silu_g * __half2float(up[i]));
+    }
+}
+"#;
+
+const F16_FUSED_RESIDUAL_RMSNORM_SRC: &str = r#"
+#include <cuda_fp16.h>
+extern "C" __global__ void warp_f16_fused_residual_rmsnorm(
+    half *norm_out, half *residual_out,
+    const half *x, const half *residual, const half *gamma,
+    unsigned int hidden_size, float eps, size_t n_rows
+) {
+    unsigned int row = blockIdx.x;
+    if (row >= n_rows) return;
+
+    const half *x_row = x + row * hidden_size;
+    const half *r_row = residual + row * hidden_size;
+    half *nout = norm_out + row * hidden_size;
+    half *rout = residual_out + row * hidden_size;
+
+    float sum_sq = 0.0f;
+    for (unsigned int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        float v = __half2float(x_row[i]) + __half2float(r_row[i]);
+        sum_sq += v * v;
+        rout[i] = __float2half(v);
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+    sum_sq = __shfl_sync(0xffffffff, sum_sq, 0);
+
+    float rms = rsqrtf(sum_sq / (float)hidden_size + eps);
+
+    for (unsigned int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        float v = __half2float(rout[i]);
+        nout[i] = __float2half(v * rms * __half2float(gamma[i]));
+    }
+}
+"#;
+
+/// FP16 fused SiLU+Mul (SwiGLU gate).
+pub fn f16_fused_silu_mul(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    gate: &GpuTensor<half::f16>,
+    up: &GpuTensor<half::f16>,
+    out: &mut GpuTensor<half::f16>,
+) -> Result<(), DeviceError> {
+    let f = compile_fp16(cache, device, F16_FUSED_SILU_MUL_SRC, "warp_f16_fused_silu_mul")?;
+    let n = gate.numel;
+    let cfg = LaunchConfig::for_num_elems(n as u32);
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut out.data).arg(&gate.data).arg(&up.data).arg(&n)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+/// FP16 fused residual+RMSNorm with dual output.
+pub fn f16_fused_residual_rmsnorm(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    x: &GpuTensor<half::f16>,
+    residual: &GpuTensor<half::f16>,
+    gamma: &GpuTensor<half::f16>,
+    norm_out: &mut GpuTensor<half::f16>,
+    residual_out: &mut GpuTensor<half::f16>,
+    hidden_size: u32,
+    eps: f32,
+) -> Result<(), DeviceError> {
+    let f = compile_fp16(cache, device, F16_FUSED_RESIDUAL_RMSNORM_SRC, "warp_f16_fused_residual_rmsnorm")?;
+    let n_rows = (x.numel / hidden_size as usize) as usize;
+    let cfg = LaunchConfig {
+        grid_dim: (n_rows as u32, 1, 1),
+        block_dim: (32.min(hidden_size), 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut norm_out.data)
+            .arg(&mut residual_out.data)
+            .arg(&x.data)
+            .arg(&residual.data)
+            .arg(&gamma.data)
+            .arg(&hidden_size)
+            .arg(&eps)
+            .arg(&n_rows)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
 /// FP16 GEMM using tensor cores (from gemm_tc.rs).
 /// Re-exported here for the mixed-precision pipeline.
 pub fn f16_gemm(

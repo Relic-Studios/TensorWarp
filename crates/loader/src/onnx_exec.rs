@@ -124,17 +124,24 @@ impl OnnxExecutor {
             tensors.insert(name, tensor);
         }
 
-        // Execute nodes in order
-        for node in &self.nodes {
-            self.execute_node(device, node, &tensors, &mut owned)?;
+        // Execute nodes in order, skipping fused nodes
+        let mut executed_fusions: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
-            // Add new outputs to tensors map
-            for out_name in &node.outputs {
-                if let Some(t) = owned.get(out_name.as_str()) {
-                    // We can't insert a reference to owned into tensors easily,
-                    // so we'll look up owned separately during input resolution
+        for (node_idx, node) in self.nodes.iter().enumerate() {
+            // Check if this node is part of a fused chain
+            if self.fused_nodes.contains(&node_idx) {
+                // Find and execute the fusion that starts at or before this node
+                for (fi, fusion) in self.fusions.iter().enumerate() {
+                    if fusion.node_indices[0] == node_idx && !executed_fusions.contains(&fi) {
+                        // Execute fused kernel
+                        self.execute_fusion(device, fusion, &tensors, &mut owned)?;
+                        executed_fusions.insert(fi);
+                    }
                 }
+                continue; // skip individual node execution
             }
+
+            self.execute_node(device, node, &tensors, &mut owned)?;
         }
 
         // Collect outputs
@@ -675,6 +682,87 @@ impl OnnxExecutor {
             }
         }
 
+        Ok(())
+    }
+
+    /// Execute a fused elementwise chain.
+    fn execute_fusion(
+        &self,
+        device: &WarpDevice,
+        fusion: &CompiledFusion,
+        inputs: &HashMap<&str, &GpuTensor<f32>>,
+        owned: &mut HashMap<String, GpuTensor<f32>>,
+    ) -> Result<(), ExecError> {
+        // Compile the fused kernel
+        let f = self.cache.get_or_compile(device, &fusion.kernel_src, &fusion.kernel_name)
+            .map_err(|e| ExecError::Device(e))?;
+
+        // Gather inputs: the first input of the first node in the chain,
+        // plus additional inputs for binary ops within the chain
+        let mut input_tensors: Vec<&GpuTensor<f32>> = Vec::new();
+
+        // First input: main data flowing through the chain
+        let first_node = &self.nodes[fusion.node_indices[0]];
+        let first_input_name = &first_node.inputs[0];
+        let first_input = Self::resolve(first_input_name, inputs, owned, &self.weights)?;
+        input_tensors.push(first_input);
+
+        // Additional inputs: second operands of binary ops in the chain
+        for &ni in &fusion.node_indices {
+            let node = &self.nodes[ni];
+            if node.inputs.len() >= 2 {
+                // Binary op — need the second input
+                let second_name = &node.inputs[1];
+                let second = Self::resolve(second_name, inputs, owned, &self.weights)?;
+                input_tensors.push(second);
+            }
+        }
+
+        // Allocate output
+        let n = first_input.numel;
+        let mut output = GpuTensor::<f32>::zeros(device,
+            first_input.shape.clone(), warp_ir::DType::F32)?;
+
+        // Launch fused kernel — build arg list based on number of inputs
+        let cfg = cudarc::driver::LaunchConfig::for_num_elems(n as u32);
+        match input_tensors.len() {
+            1 => unsafe {
+                use cudarc::driver::PushKernelArg;
+                device.stream.launch_builder(&f)
+                    .arg(&mut output.data).arg(&input_tensors[0].data).arg(&n)
+                    .launch(cfg).map_err(|e: cudarc::driver::result::DriverError|
+                        ExecError::Device(DeviceError::Launch(e.to_string())))?;
+            },
+            2 => unsafe {
+                use cudarc::driver::PushKernelArg;
+                device.stream.launch_builder(&f)
+                    .arg(&mut output.data).arg(&input_tensors[0].data)
+                    .arg(&input_tensors[1].data).arg(&n)
+                    .launch(cfg).map_err(|e: cudarc::driver::result::DriverError|
+                        ExecError::Device(DeviceError::Launch(e.to_string())))?;
+            },
+            3 => unsafe {
+                use cudarc::driver::PushKernelArg;
+                device.stream.launch_builder(&f)
+                    .arg(&mut output.data).arg(&input_tensors[0].data)
+                    .arg(&input_tensors[1].data).arg(&input_tensors[2].data).arg(&n)
+                    .launch(cfg).map_err(|e: cudarc::driver::result::DriverError|
+                        ExecError::Device(DeviceError::Launch(e.to_string())))?;
+            },
+            4 => unsafe {
+                use cudarc::driver::PushKernelArg;
+                device.stream.launch_builder(&f)
+                    .arg(&mut output.data).arg(&input_tensors[0].data)
+                    .arg(&input_tensors[1].data).arg(&input_tensors[2].data)
+                    .arg(&input_tensors[3].data).arg(&n)
+                    .launch(cfg).map_err(|e: cudarc::driver::result::DriverError|
+                        ExecError::Device(DeviceError::Launch(e.to_string())))?;
+            },
+            _ => return Err(ExecError::UnsupportedOp(
+                format!("Fused kernel with {} inputs not supported (max 4)", input_tensors.len()))),
+        }
+
+        owned.insert(fusion.output_name.clone(), output);
         Ok(())
     }
 
