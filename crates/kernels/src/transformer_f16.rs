@@ -90,9 +90,20 @@ pub fn transformer_block_forward_f16(
     fp16::f16_gemm(cache, device, &normed, &weights.wk, &mut k, bn, kv_dim, h)?;
     fp16::f16_gemm(cache, device, &normed, &weights.wv, &mut v, bn, kv_dim, h)?;
 
-    // 3-4. Skip RoPE + attention for now (would need FP16 variants)
-    // Use Q as the "attention output" for benchmarking purposes
-    let attn_out = q;
+    // 3. RoPE on Q and K (FP16)
+    let mut q_rope = GpuTensor::<half::f16>::zeros(device, shape_bnh.clone(), DType::F16)?;
+    let mut k_rope = GpuTensor::<half::f16>::zeros(device, shape_bnk.clone(), DType::F16)?;
+    fp16::f16_rope(cache, device, &q, &mut q_rope,
+        batch * config.num_heads, seq_len, d, config.rope_base, _pos_offset)?;
+    fp16::f16_rope(cache, device, &k, &mut k_rope,
+        batch * config.num_kv_heads, seq_len, d, config.rope_base, _pos_offset)?;
+
+    // 4. Attention (FP16)
+    let attn_batch = batch * config.num_heads;
+    let shape_attn = Shape::from_static(&[attn_batch as usize, seq_len as usize, d as usize]);
+    let mut attn_out = GpuTensor::<half::f16>::zeros(device, shape_attn, DType::F16)?;
+    fp16::f16_attention(cache, device, &q_rope, &k_rope, &v,
+        &mut attn_out, attn_batch, seq_len, d, true)?;
 
     // 5. Output projection — tensor core
     let mut attn_projected = GpuTensor::<half::f16>::zeros(device, shape_bnh.clone(), DType::F16)?;

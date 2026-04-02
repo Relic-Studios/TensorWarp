@@ -373,6 +373,144 @@ pub fn f16_fused_residual_rmsnorm(
     Ok(())
 }
 
+// ── FP16 RoPE ───────────────────────────────────────────────────
+
+const F16_ROPE_SRC: &str = r#"
+#include <cuda_fp16.h>
+extern "C" __global__ void warp_f16_rope(
+    half *out, const half *input,
+    unsigned int B, unsigned int N, unsigned int D,
+    float base, unsigned int offset
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = B * N * (D / 2);
+    if (idx >= total) return;
+
+    unsigned int pair = idx % (D / 2);
+    unsigned int pos_in_seq = (idx / (D / 2)) % N;
+    unsigned int b = idx / (N * (D / 2));
+    unsigned int pos = pos_in_seq + offset;
+
+    float freq = 1.0f / powf(base, 2.0f * (float)pair / (float)D);
+    float theta = (float)pos * freq;
+    float cos_t = cosf(theta);
+    float sin_t = sinf(theta);
+
+    unsigned int base_idx = b * N * D + pos_in_seq * D + 2 * pair;
+    float x0 = __half2float(input[base_idx]);
+    float x1 = __half2float(input[base_idx + 1]);
+
+    out[base_idx]     = __float2half(x0 * cos_t - x1 * sin_t);
+    out[base_idx + 1] = __float2half(x0 * sin_t + x1 * cos_t);
+}
+"#;
+
+/// FP16 RoPE.
+pub fn f16_rope(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    input: &GpuTensor<half::f16>,
+    out: &mut GpuTensor<half::f16>,
+    batch: u32,
+    seq_len: u32,
+    head_dim: u32,
+    base: f32,
+    offset: u32,
+) -> Result<(), DeviceError> {
+    let f = compile_fp16(cache, device, F16_ROPE_SRC, "warp_f16_rope")?;
+    let total = batch * seq_len * (head_dim / 2);
+    let cfg = LaunchConfig::for_num_elems(total);
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut out.data).arg(&input.data)
+            .arg(&batch).arg(&seq_len).arg(&head_dim)
+            .arg(&base).arg(&offset)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+// ── FP16 Scaled Dot-Product Attention ───────────────────────────
+
+const F16_ATTENTION_SRC: &str = r#"
+#include <cuda_fp16.h>
+extern "C" __global__ void warp_f16_attention(
+    half *out,            // [B, N, D]
+    const half *Q,        // [B, N, D]
+    const half *K,        // [B, N, D]
+    const half *V,        // [B, N, D]
+    unsigned int B, unsigned int N, unsigned int D,
+    float scale, unsigned int causal
+) {
+    // Simple attention: each thread block handles one (batch, query_pos)
+    unsigned int b = blockIdx.y;
+    unsigned int q_pos = blockIdx.x;
+    unsigned int d = threadIdx.x;
+    if (b >= B || q_pos >= N || d >= D) return;
+
+    const half *q_row = Q + b * N * D + q_pos * D;
+    float q_val = __half2float(q_row[d]);
+
+    // Compute attention scores and weighted sum
+    float max_score = -1e30f;
+    float sum_exp = 0.0f;
+    float out_val = 0.0f;
+
+    for (unsigned int k_pos = 0; k_pos < N; k_pos++) {
+        if (causal && k_pos > q_pos) break;
+
+        // Dot product Q[q_pos] · K[k_pos]
+        float score = 0.0f;
+        for (unsigned int dd = 0; dd < D; dd++) {
+            score += __half2float(Q[b*N*D + q_pos*D + dd]) *
+                     __half2float(K[b*N*D + k_pos*D + dd]);
+        }
+        score *= scale;
+
+        // Online softmax
+        float new_max = fmaxf(max_score, score);
+        float correction = expf(max_score - new_max);
+        float weight = expf(score - new_max);
+        sum_exp = sum_exp * correction + weight;
+        out_val = out_val * correction + weight * __half2float(V[b*N*D + k_pos*D + d]);
+        max_score = new_max;
+    }
+
+    out[b * N * D + q_pos * D + d] = __float2half(out_val / sum_exp);
+}
+"#;
+
+/// FP16 scaled dot-product attention with online softmax.
+pub fn f16_attention(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    q: &GpuTensor<half::f16>,
+    k: &GpuTensor<half::f16>,
+    v: &GpuTensor<half::f16>,
+    out: &mut GpuTensor<half::f16>,
+    batch: u32,
+    seq_len: u32,
+    head_dim: u32,
+    causal: bool,
+) -> Result<(), DeviceError> {
+    let f = compile_fp16(cache, device, F16_ATTENTION_SRC, "warp_f16_attention")?;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let causal_u32 = if causal { 1u32 } else { 0u32 };
+    let cfg = LaunchConfig {
+        grid_dim: (seq_len, batch, 1),
+        block_dim: (head_dim.min(1024), 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut out.data).arg(&q.data).arg(&k.data).arg(&v.data)
+            .arg(&batch).arg(&seq_len).arg(&head_dim)
+            .arg(&scale).arg(&causal_u32)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
 /// FP16 GEMM using tensor cores (from gemm_tc.rs).
 /// Re-exported here for the mixed-precision pipeline.
 pub fn f16_gemm(
