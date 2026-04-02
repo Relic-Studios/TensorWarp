@@ -58,7 +58,7 @@ pub struct TransformerConfig {
 }
 
 impl TransformerConfig {
-    /// LLaMA-7B-style config (scaled down for testing).
+    /// Tiny config for correctness testing.
     pub fn tiny() -> Self {
         Self {
             hidden_size: 64,
@@ -66,6 +66,32 @@ impl TransformerConfig {
             num_kv_heads: 4,
             head_dim: 16,
             ffn_dim: 128,
+            rope_base: 10000.0,
+            norm_eps: 1e-6,
+        }
+    }
+
+    /// Small config — realistic ratios, fits in VRAM for benchmarking.
+    pub fn small() -> Self {
+        Self {
+            hidden_size: 256,
+            num_heads: 8,
+            num_kv_heads: 8,
+            head_dim: 32,
+            ffn_dim: 512,
+            rope_base: 10000.0,
+            norm_eps: 1e-6,
+        }
+    }
+
+    /// Medium config — approaching real model dimensions.
+    pub fn medium() -> Self {
+        Self {
+            hidden_size: 1024,
+            num_heads: 16,
+            num_kv_heads: 16,
+            head_dim: 32, // Keep <=32 for flash attention
+            ffn_dim: 2048,
             rope_base: 10000.0,
             norm_eps: 1e-6,
         }
@@ -283,6 +309,62 @@ mod tests {
         println!("\nTransformer block perf (B={b} N={n} H={h} FFN={}):", config.ffn_dim);
         println!("  {:.3}ms avg ({iters} iters)", elapsed.as_secs_f64() * 1000.0 / iters as f64);
         println!("  {:.0} blocks/sec", iters as f64 / elapsed.as_secs_f64());
+        println!("{}", cache.stats());
+    }
+
+    #[test]
+    fn transformer_scaling_benchmark() {
+        let (dev, cache) = match setup() {
+            Some(s) => s,
+            None => { println!("No CUDA, skipping"); return; }
+        };
+
+        println!("\n=== Transformer Block Scaling Benchmark ===");
+        let configs = vec![
+            ("tiny",   TransformerConfig::tiny(),   32u32),
+            ("small",  TransformerConfig::small(),  64),
+            ("medium", TransformerConfig::medium(), 128),
+        ];
+
+        for (name, config, seq_len) in configs {
+            let weights = random_weights(&dev, &config).unwrap();
+            let (b, n) = (1u32, seq_len);
+            let h = config.hidden_size;
+            let total = (b * n * h) as usize;
+            let shape = Shape::from_static(&[b as usize, n as usize, h as usize]);
+
+            let x_data: Vec<f32> = (0..total).map(|i| ((i % 23) as f32 - 11.0) * 0.01).collect();
+            let x = GpuTensor::from_host(&dev, &x_data, shape, DType::F32).unwrap();
+
+            // Warmup
+            let out = transformer_block_forward(&cache, &dev, &x, &weights, &config, b, n, 0).unwrap();
+            dev.synchronize().unwrap();
+
+            // Verify
+            let result = out.to_host(&dev).unwrap();
+            assert!(result.iter().all(|v| v.is_finite()), "{name}: NaN/Inf in output!");
+
+            // Bench
+            let iters = 30;
+            let start = std::time::Instant::now();
+            for _ in 0..iters {
+                let _ = transformer_block_forward(&cache, &dev, &x, &weights, &config, b, n, 0).unwrap();
+            }
+            dev.synchronize().unwrap();
+            let elapsed = start.elapsed();
+
+            let ms = elapsed.as_secs_f64() * 1000.0 / iters as f64;
+            let blocks_per_sec = iters as f64 / elapsed.as_secs_f64();
+
+            // Estimate FLOPS: ~12 * seq * hidden² for one block (rough)
+            let approx_flops = 12.0 * n as f64 * (h as f64).powi(2);
+            let approx_tflops = approx_flops * iters as f64 / elapsed.as_secs_f64() / 1e12;
+
+            println!(
+                "  {name:6} (H={h:4} FFN={:4} N={n:3}): {ms:.3}ms | {blocks_per_sec:.0} blocks/s | ~{approx_tflops:.3} TFLOPS",
+                config.ffn_dim,
+            );
+        }
         println!("{}", cache.stats());
     }
 }
