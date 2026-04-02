@@ -221,6 +221,102 @@ impl Default for ModelBuilder {
     fn default() -> Self { Self::new() }
 }
 
+/// A compiled model ready for inference.
+/// Produced by ModelBuilder::build().
+pub struct CompiledModel {
+    /// Layer descriptors for execution.
+    layers: Vec<Layer>,
+    /// Random weights (for testing — real models load from files).
+    weights: HashMap<String, GpuTensor<f32>>,
+    /// Kernel cache.
+    cache: KernelCache,
+    /// Precision mode.
+    precision: Precision,
+    /// Input names and shapes.
+    input_specs: Vec<(String, Vec<usize>)>,
+    /// Output names.
+    output_names: Vec<String>,
+}
+
+impl ModelBuilder {
+    /// Build an optimized inference model.
+    /// Initializes weights with random values (for testing).
+    /// For real models, use ONNX or SafeTensors loading instead.
+    pub fn build(self, device: &WarpDevice, precision: Precision) -> Result<CompiledModel, DeviceError> {
+        let cache = KernelCache::new();
+        let mut weights = HashMap::new();
+
+        let rand_vec = |n: usize, seed: usize| -> Vec<f32> {
+            (0..n).map(|i| ((i * 7 + seed) % 200) as f32 * 0.01 - 1.0).collect()
+        };
+
+        // Initialize weights for each layer that needs them
+        let mut weight_seed = 42;
+        for (i, layer) in self.layers.iter().enumerate() {
+            match layer {
+                Layer::Conv2d { out_channels, kernel, .. } => {
+                    // Assume in_channels from previous layer (simplified)
+                    let in_c = 3u32; // default, would be inferred from graph
+                    let w_size = (*out_channels * in_c * kernel * kernel) as usize;
+                    let w_data = rand_vec(w_size, weight_seed);
+                    weight_seed += 1;
+                    let w = GpuTensor::from_host(device, &w_data,
+                        Shape::from_static(&[*out_channels as usize, in_c as usize, *kernel as usize, *kernel as usize]),
+                        DType::F32)?;
+                    weights.insert(format!("layer{i}_weight"), w);
+                }
+                Layer::Linear { out_features, .. } => {
+                    let in_f = 256u32; // default
+                    let w_size = (in_f * *out_features) as usize;
+                    let w_data = rand_vec(w_size, weight_seed);
+                    weight_seed += 1;
+                    let w = GpuTensor::from_host(device, &w_data,
+                        Shape::from_static(&[in_f as usize, *out_features as usize]),
+                        DType::F32)?;
+                    weights.insert(format!("layer{i}_weight"), w);
+                }
+                Layer::BatchNorm { .. } => {
+                    // BN params initialized to identity transform
+                    let c = 64usize; // default
+                    weights.insert(format!("layer{i}_scale"),
+                        GpuTensor::from_host(device, &vec![1.0f32; c], Shape::from_static(&[c]), DType::F32)?);
+                    weights.insert(format!("layer{i}_bias"),
+                        GpuTensor::from_host(device, &vec![0.0f32; c], Shape::from_static(&[c]), DType::F32)?);
+                    weights.insert(format!("layer{i}_mean"),
+                        GpuTensor::from_host(device, &vec![0.0f32; c], Shape::from_static(&[c]), DType::F32)?);
+                    weights.insert(format!("layer{i}_var"),
+                        GpuTensor::from_host(device, &vec![1.0f32; c], Shape::from_static(&[c]), DType::F32)?);
+                }
+                _ => {}
+            }
+        }
+
+        let input_specs: Vec<(String, Vec<usize>)> = self.layers.iter().filter_map(|l| match l {
+            Layer::Input { name, shape } => Some((name.clone(), shape.clone())),
+            _ => None,
+        }).collect();
+
+        Ok(CompiledModel {
+            layers: self.layers,
+            weights,
+            cache,
+            precision,
+            input_specs,
+            output_names: self.output_names,
+        })
+    }
+}
+
+impl CompiledModel {
+    /// Get model info.
+    pub fn info(&self) -> String {
+        format!("CompiledModel: {} layers, {:?} precision, {} weights ({:.1} MB)",
+            self.layers.len(), self.precision,
+            self.weights.len(),
+            self.weights.values().map(|w| w.size_bytes()).sum::<usize>() as f64 / 1e6)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

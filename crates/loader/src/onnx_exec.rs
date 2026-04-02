@@ -570,9 +570,7 @@ impl OnnxExecutor {
                 let hidden = dims.last().and_then(|d| d.static_val()).unwrap_or(1) as u32;
 
                 let mut out = GpuTensor::<f32>::zeros(device, x.shape.clone(), DType::F32)?;
-                // Use RMSNorm as approximation (proper LayerNorm needs mean subtraction)
-                // TODO: implement full LayerNorm kernel with mean centering
-                warp_kernels::ops::rmsnorm(&self.cache, device, x, gamma, &mut out, hidden, eps)?;
+                warp_kernels::ops::layernorm(&self.cache, device, x, gamma, beta, &mut out, hidden, eps)?;
                 owned.insert(out_name, out);
             }
 

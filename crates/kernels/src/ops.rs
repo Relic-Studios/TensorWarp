@@ -1026,6 +1026,81 @@ pub fn fused_gate_up_proj(
     Ok(())
 }
 
+// ── LayerNorm (proper, with mean subtraction) ────────────────
+
+const LAYERNORM_SRC: &str = r#"
+extern "C" __global__ void warp_layernorm(
+    float *out, const float *x, const float *gamma, const float *beta,
+    unsigned int hidden_size, float eps, size_t n_rows
+) {
+    unsigned int row = blockIdx.x;
+    if (row >= n_rows) return;
+
+    const float *x_row = x + row * hidden_size;
+    float *out_row = out + row * hidden_size;
+
+    // Compute mean
+    float sum = 0.0f;
+    for (unsigned int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        sum += x_row[i];
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+    sum = __shfl_sync(0xffffffff, sum, 0);
+    float mean = sum / (float)hidden_size;
+
+    // Compute variance
+    float var_sum = 0.0f;
+    for (unsigned int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        float diff = x_row[i] - mean;
+        var_sum += diff * diff;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        var_sum += __shfl_down_sync(0xffffffff, var_sum, offset);
+    var_sum = __shfl_sync(0xffffffff, var_sum, 0);
+
+    float inv_std = rsqrtf(var_sum / (float)hidden_size + eps);
+
+    // Normalize: (x - mean) * inv_std * gamma + beta
+    for (unsigned int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        out_row[i] = (x_row[i] - mean) * inv_std * gamma[i] + beta[i];
+    }
+}
+"#;
+
+/// Proper LayerNorm with mean subtraction (for BERT, GPT-2, ViT).
+/// Unlike RMSNorm, this subtracts the mean and adds learnable bias.
+pub fn layernorm(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    x: &GpuTensor<f32>,
+    gamma: &GpuTensor<f32>,
+    beta: &GpuTensor<f32>,
+    out: &mut GpuTensor<f32>,
+    hidden_size: u32,
+    eps: f32,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, LAYERNORM_SRC, "warp_layernorm")?;
+    let n_rows = (x.numel / hidden_size as usize) as usize;
+    let cfg = LaunchConfig {
+        grid_dim: (n_rows as u32, 1, 1),
+        block_dim: (32.min(hidden_size), 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut out.data)
+            .arg(&x.data)
+            .arg(&gamma.data)
+            .arg(&beta.data)
+            .arg(&hidden_size)
+            .arg(&eps)
+            .arg(&n_rows)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
 /// Cached RMSNorm.
 pub fn rmsnorm(
     cache: &KernelCache,
