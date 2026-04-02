@@ -300,9 +300,14 @@ pub fn gemm(
     n: u32,
     k: u32,
 ) -> Result<(), DeviceError> {
-    // Use fast register-tiled kernel for sizes that benefit from it
+    // Smart dispatch: best kernel per size range
     if m >= 128 && n >= 128 {
+        // Large: register-tiled v1 (beats double-buffered v2 at these sizes)
         return crate::gemm_fast::gemm_fast(cache, device, a, b, c, m, n, k);
+    }
+    if m >= 64 && n >= 64 {
+        // Medium: v2 medium-block variant
+        return crate::gemm_v2::gemm_v2_med(cache, device, a, b, c, m, n, k);
     }
 
     // Fall back to simple tiled for small sizes
