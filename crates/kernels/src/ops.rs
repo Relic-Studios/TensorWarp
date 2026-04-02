@@ -286,7 +286,10 @@ extern "C" __global__ void warp_gemm_tiled(
 }
 "#;
 
-/// Cached tiled GEMM: C = A × B
+/// Cached GEMM: C = A × B
+/// Automatically selects the best kernel:
+///   - Fast register-tiled (128×128 blocks) for sizes >= 128
+///   - Simple tiled (32×32) for small sizes
 pub fn gemm(
     cache: &KernelCache,
     device: &WarpDevice,
@@ -297,6 +300,12 @@ pub fn gemm(
     n: u32,
     k: u32,
 ) -> Result<(), DeviceError> {
+    // Use fast register-tiled kernel for sizes that benefit from it
+    if m >= 128 && n >= 128 {
+        return crate::gemm_fast::gemm_fast(cache, device, a, b, c, m, n, k);
+    }
+
+    // Fall back to simple tiled for small sizes
     let tile = 32u32;
     let f = cache.get_or_compile(device, GEMM_TILED_SRC, "warp_gemm_tiled")?;
 
@@ -317,6 +326,65 @@ pub fn gemm(
             .launch(cfg))?;
     }
     Ok(())
+}
+
+/// Simple tiled GEMM (32×32 tiles). Used by autotuner for comparison.
+pub fn gemm_tiled32(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    a: &GpuTensor<f32>,
+    b: &GpuTensor<f32>,
+    c: &mut GpuTensor<f32>,
+    m: u32,
+    n: u32,
+    k: u32,
+) -> Result<(), DeviceError> {
+    let tile = 32u32;
+    let f = cache.get_or_compile(device, GEMM_TILED_SRC, "warp_gemm_tiled")?;
+    let cfg = LaunchConfig {
+        grid_dim: ((n + tile - 1) / tile, (m + tile - 1) / tile, 1),
+        block_dim: (tile, tile, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut c.data).arg(&a.data).arg(&b.data)
+            .arg(&m).arg(&n).arg(&k)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+/// Fused GEMM + Bias + GELU: out = GELU(A @ B + bias)
+/// Single kernel — cuBLAS cannot do this.
+pub fn fused_gemm_bias_gelu(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    a: &GpuTensor<f32>,
+    b: &GpuTensor<f32>,
+    bias: &GpuTensor<f32>,
+    out: &mut GpuTensor<f32>,
+    m: u32,
+    n: u32,
+    k: u32,
+) -> Result<(), DeviceError> {
+    crate::gemm_tc::fused_gemm_bias_gelu(cache, device, a, b, bias, out, m, n, k)
+}
+
+/// Fused GEMM + Bias + SiLU: out = SiLU(A @ B + bias)
+/// For SwiGLU gate projection.
+pub fn fused_gemm_bias_silu(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    a: &GpuTensor<f32>,
+    b: &GpuTensor<f32>,
+    bias: &GpuTensor<f32>,
+    out: &mut GpuTensor<f32>,
+    m: u32,
+    n: u32,
+    k: u32,
+) -> Result<(), DeviceError> {
+    crate::gemm_tc::fused_gemm_bias_silu(cache, device, a, b, bias, out, m, n, k)
 }
 
 #[cfg(test)]
