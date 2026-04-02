@@ -10,6 +10,7 @@
 //! - Kernel launch with proper parameter binding
 //! - GEMM, attention, and elementwise kernel templates
 
+pub mod attention;
 pub mod cache;
 pub mod cublas_bench;
 pub mod device;
