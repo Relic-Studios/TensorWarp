@@ -11,6 +11,7 @@ warp-codegen.workspace = true
 cudarc.workspace = true
 thiserror.workspace = true
 half.workspace = true
+rustc-hash.workspace = true
 log.workspace = true
 
 [dev-dependencies]

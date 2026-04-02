@@ -400,6 +400,7 @@ dependencies = [
  "half",
  "log",
  "pretty_assertions",
+ "rustc-hash",
  "thiserror",
  "warp-codegen",
  "warp-ir",

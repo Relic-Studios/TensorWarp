@@ -10,10 +10,13 @@
 //! - Kernel launch with proper parameter binding
 //! - GEMM, attention, and elementwise kernel templates
 
+pub mod cache;
 pub mod device;
-pub mod tensor;
 pub mod elementwise;
 pub mod gemm;
+pub mod ops;
+pub mod tensor;
 
+pub use cache::KernelCache;
 pub use device::WarpDevice;
 pub use tensor::GpuTensor;
