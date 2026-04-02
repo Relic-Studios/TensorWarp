@@ -1,0 +1,21 @@
+[package]
+name = "warp-loader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Model weight loading for TensorWarp (SafeTensors, GGUF)"
+
+[dependencies]
+warp-ir.workspace = true
+warp-kernels.workspace = true
+cudarc.workspace = true
+safetensors.workspace = true
+memmap2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+half.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true

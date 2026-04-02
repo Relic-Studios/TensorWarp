@@ -22,6 +22,7 @@ pub mod gemm_tc;
 pub mod gemm_v2;
 pub mod ops;
 pub mod rope;
+pub mod sampling;
 pub mod swiglu;
 pub mod tensor;
 pub mod transformer;

@@ -6,6 +6,7 @@ members = [
     "crates/codegen",
     "crates/runtime",
     "crates/kernels",
+    "crates/loader",
 ]
 
 [workspace.package]
@@ -20,6 +21,7 @@ warp-optimizer = { path = "crates/optimizer" }
 warp-codegen = { path = "crates/codegen" }
 warp-runtime = { path = "crates/runtime" }
 warp-kernels = { path = "crates/kernels" }
+warp-loader = { path = "crates/loader" }
 
 # Core
 thiserror = "2"
@@ -32,8 +34,13 @@ env_logger = "0.11"
 # GPU
 cudarc = { version = "0.16", features = ["cuda-12080", "cublas", "f16"] }
 
+# Model loading
+safetensors = "0.7"
+memmap2 = "0.9"
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # Testing / Benchmarking
 pretty_assertions = "1"
