@@ -1,0 +1,16 @@
+[package]
+name = "warp-optimizer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Graph optimization and fusion passes for Warp"
+
+[dependencies]
+warp-ir.workspace = true
+thiserror.workspace = true
+smallvec.workspace = true
+rustc-hash.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true

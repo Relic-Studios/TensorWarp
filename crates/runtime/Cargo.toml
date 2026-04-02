@@ -1,0 +1,17 @@
+[package]
+name = "warp-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Execution runtime and memory management for Warp"
+
+[dependencies]
+warp-ir.workspace = true
+warp-codegen.workspace = true
+warp-optimizer.workspace = true
+thiserror.workspace = true
+rustc-hash.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
