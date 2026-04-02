@@ -5,6 +5,7 @@ members = [
     "crates/optimizer",
     "crates/codegen",
     "crates/runtime",
+    "crates/kernels",
 ]
 
 [workspace.package]
@@ -18,6 +19,7 @@ warp-ir = { path = "crates/ir" }
 warp-optimizer = { path = "crates/optimizer" }
 warp-codegen = { path = "crates/codegen" }
 warp-runtime = { path = "crates/runtime" }
+warp-kernels = { path = "crates/kernels" }
 
 # Core
 thiserror = "2"
@@ -25,9 +27,14 @@ smallvec = { version = "1.13", features = ["serde"] }
 rustc-hash = "2"
 half = { version = "2.4", features = ["num-traits"] }
 log = "0.4"
+env_logger = "0.11"
+
+# GPU
+cudarc = { version = "0.16", features = ["cuda-12080"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
 
-# Testing
+# Testing / Benchmarking
 pretty_assertions = "1"
+criterion = { version = "0.5", features = ["html_reports"] }

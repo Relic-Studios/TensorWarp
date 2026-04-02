@@ -1,0 +1,18 @@
+[package]
+name = "warp-kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GPU kernel implementations for Warp (GEMM, attention, elementwise)"
+
+[dependencies]
+warp-ir.workspace = true
+warp-codegen.workspace = true
+cudarc.workspace = true
+thiserror.workspace = true
+half.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+env_logger.workspace = true
