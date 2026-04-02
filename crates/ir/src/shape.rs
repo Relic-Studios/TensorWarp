@@ -92,7 +92,35 @@ impl Shape {
 
     /// Total number of elements, panics if shape is dynamic.
     pub fn numel_static(&self) -> usize {
-        self.numel().expect("shape has dynamic dimensions")
+        self.numel().expect("shape has dynamic dimensions — use numel_or() for dynamic shapes")
+    }
+
+    /// Total number of elements, treating dynamic dims as the given default.
+    /// Use this when you need a concrete size for a shape with dynamic batch dim.
+    pub fn numel_or(&self, dynamic_default: usize) -> usize {
+        self.dims.iter()
+            .map(|d| d.static_val().unwrap_or(dynamic_default))
+            .product()
+    }
+
+    /// Resolve dynamic dimensions to concrete values.
+    /// Returns a fully-static shape.
+    pub fn resolve_dynamic(&self, dynamic_values: &std::collections::HashMap<u32, usize>) -> Shape {
+        Shape {
+            dims: self.dims.iter().map(|d| match d {
+                Dim::Static(v) => Dim::Static(*v),
+                Dim::Dynamic(id) => Dim::Static(*dynamic_values.get(id).unwrap_or(&1)),
+            }).collect(),
+        }
+    }
+
+    /// Make a copy with the first dimension replaced (for dynamic batch).
+    pub fn with_batch(&self, batch_size: usize) -> Shape {
+        let mut dims = self.dims.clone();
+        if !dims.is_empty() {
+            dims[0] = Dim::Static(batch_size);
+        }
+        Shape { dims }
     }
 
     /// Get a specific dimension.

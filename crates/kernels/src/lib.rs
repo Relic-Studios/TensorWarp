@@ -37,6 +37,7 @@ pub mod sampling;
 pub mod swiglu;
 pub mod tensor;
 pub mod transformer;
+pub mod transformer_f16;
 
 pub use cache::KernelCache;
 pub use device::WarpDevice;

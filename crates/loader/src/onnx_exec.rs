@@ -19,6 +19,20 @@ use warp_kernels::tensor::GpuTensor;
 
 use crate::onnx::{OnnxModel, OnnxNode, OnnxDType};
 
+/// A fused elementwise chain compiled at load time.
+struct CompiledFusion {
+    /// ONNX node indices that are part of this chain.
+    node_indices: Vec<usize>,
+    /// Compiled CUDA kernel name.
+    kernel_name: String,
+    /// CUDA source for the fused kernel.
+    kernel_src: String,
+    /// Number of external inputs.
+    num_inputs: usize,
+    /// Output ONNX tensor name.
+    output_name: String,
+}
+
 /// A running ONNX model on GPU.
 pub struct OnnxExecutor {
     /// Kernel compilation cache.
@@ -29,6 +43,10 @@ pub struct OnnxExecutor {
     nodes: Vec<OnnxNode>,
     /// Output tensor names.
     output_names: Vec<String>,
+    /// Fused elementwise chains (compiled at load time).
+    fusions: Vec<CompiledFusion>,
+    /// Set of node indices that are handled by fusions (skip during normal exec).
+    fused_nodes: std::collections::HashSet<usize>,
 }
 
 /// Errors during execution.
@@ -66,11 +84,22 @@ impl OnnxExecutor {
 
         let output_names = model.outputs.iter().map(|o| o.name.clone()).collect();
 
+        // Analyze for fusible elementwise chains
+        let (fusions, fused_nodes) = Self::analyze_fusions(&model.nodes);
+        if !fusions.is_empty() {
+            log::info!("ONNX AutoFuse: discovered {} fusible chains ({} ops → {} kernels)",
+                fusions.len(),
+                fused_nodes.len(),
+                fusions.len());
+        }
+
         Ok(Self {
             cache,
             weights,
             nodes: model.nodes.clone(),
             output_names,
+            fusions,
+            fused_nodes,
         })
     }
 
@@ -647,6 +676,135 @@ impl OnnxExecutor {
         }
 
         Ok(())
+    }
+
+    /// Analyze ONNX nodes for fusible elementwise chains.
+    fn analyze_fusions(nodes: &[OnnxNode]) -> (Vec<CompiledFusion>, std::collections::HashSet<usize>) {
+        let mut fusions = Vec::new();
+        let mut fused_set = std::collections::HashSet::new();
+
+        // Map: output tensor name -> node index (for following chains)
+        let mut producer: HashMap<String, usize> = HashMap::new();
+        for (i, node) in nodes.iter().enumerate() {
+            for out in &node.outputs {
+                producer.insert(out.clone(), i);
+            }
+        }
+
+        // Map: tensor name -> count of consumer nodes
+        let mut consumer_count: HashMap<String, usize> = HashMap::new();
+        for node in nodes {
+            for inp in &node.inputs {
+                *consumer_count.entry(inp.clone()).or_insert(0) += 1;
+            }
+        }
+
+        // Check if an ONNX op is elementwise-fusible
+        let is_fusible = |op: &str| -> bool {
+            matches!(op, "Add" | "Sub" | "Mul" | "Div" | "Relu" | "Sigmoid" | "Tanh"
+                | "Gelu" | "Silu" | "Swish" | "LeakyRelu")
+        };
+
+        // CUDA expression for each fusible op
+        let op_expr = |op: &str, inputs: &[String]| -> String {
+            match op {
+                "Add" => format!("({} + {})", inputs[0], inputs[1]),
+                "Sub" => format!("({} - {})", inputs[0], inputs[1]),
+                "Mul" => format!("({} * {})", inputs[0], inputs[1]),
+                "Div" => format!("({} / {})", inputs[0], inputs[1]),
+                "Relu" => format!("fmaxf({}, 0.0f)", inputs[0]),
+                "Sigmoid" => format!("(1.0f / (1.0f + expf(-{})))", inputs[0]),
+                "Tanh" => format!("tanhf({})", inputs[0]),
+                "Silu" | "Swish" => { let x = &inputs[0]; format!("({x} / (1.0f + expf(-{x})))") }
+                "Gelu" => { let x = &inputs[0]; format!("(0.5f*{x}*(1.0f+tanhf(0.7978845608f*({x}+0.044715f*{x}*{x}*{x}))))") }
+                _ => inputs[0].clone(),
+            }
+        };
+
+        let is_binary = |op: &str| -> bool {
+            matches!(op, "Add" | "Sub" | "Mul" | "Div")
+        };
+
+        // Find chains
+        for start_i in 0..nodes.len() {
+            if fused_set.contains(&start_i) { continue; }
+            if !is_fusible(&nodes[start_i].op_type) { continue; }
+
+            let mut chain = vec![start_i];
+            let mut current = start_i;
+
+            // Follow forward through single-consumer fusible ops
+            loop {
+                let out_name = match nodes[current].outputs.first() {
+                    Some(n) => n.clone(),
+                    None => break,
+                };
+                let consumers = consumer_count.get(&out_name).copied().unwrap_or(0);
+                if consumers != 1 { break; }
+
+                // Find the consumer
+                let next = nodes.iter().enumerate().position(|(i, n)| {
+                    !fused_set.contains(&i) && i > current && n.inputs.contains(&out_name)
+                });
+                match next {
+                    Some(ni) if is_fusible(&nodes[ni].op_type) && !fused_set.contains(&ni) => {
+                        chain.push(ni);
+                        current = ni;
+                    }
+                    _ => break,
+                }
+            }
+
+            if chain.len() >= 2 {
+                // Build the fused kernel
+                let mut expr = "in0[i]".to_string();
+                let mut next_input = 1;
+                let mut kernel_inputs = 1;
+
+                for &ci in &chain {
+                    let op = &nodes[ci].op_type;
+                    if is_binary(op) {
+                        let b = format!("in{next_input}[i]");
+                        next_input += 1;
+                        kernel_inputs += 1;
+                        expr = op_expr(op, &[expr, b]);
+                    } else {
+                        expr = op_expr(op, &[expr]);
+                    }
+                }
+
+                // Build parameter list
+                let mut params = vec!["float *out".to_string()];
+                for j in 0..kernel_inputs {
+                    params.push(format!("const float *in{j}"));
+                }
+                params.push("size_t n".to_string());
+
+                let name = format!("warp_onnx_fused_{}", fusions.len());
+                let src = format!(
+                    r#"extern "C" __global__ void {name}({params}) {{
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {{ out[i] = {expr}; }}
+}}"#,
+                    name = name, params = params.join(", "), expr = expr);
+
+                let output_name = nodes[*chain.last().unwrap()].outputs[0].clone();
+
+                fusions.push(CompiledFusion {
+                    node_indices: chain.clone(),
+                    kernel_name: name,
+                    kernel_src: src,
+                    num_inputs: kernel_inputs,
+                    output_name,
+                });
+
+                for ci in chain {
+                    fused_set.insert(ci);
+                }
+            }
+        }
+
+        (fusions, fused_set)
     }
 
     /// Get kernel cache stats.
