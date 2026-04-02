@@ -60,6 +60,45 @@ impl WarpDevice {
         Ok((module, func))
     }
 
+    /// Compile CUDA C source with include paths and arch flags.
+    /// Needed for Tensor Core wmma kernels that require mma.h.
+    pub fn load_cuda_source_with_opts(
+        &self,
+        cuda_src: &str,
+        func_name: &str,
+        include_paths: &[String],
+        arch: Option<&'static str>,
+    ) -> Result<(Arc<CudaModule>, CudaFunction), DeviceError> {
+        let opts = nvrtc::CompileOptions {
+            include_paths: include_paths.to_vec(),
+            arch,
+            ..Default::default()
+        };
+        let ptx = nvrtc::compile_ptx_with_opts(cuda_src, opts)
+            .map_err(|e| DeviceError::PtxLoad(e.to_string()))?;
+        let module = self.ctx.load_module(ptx)
+            .map_err(|e| DeviceError::PtxLoad(e.to_string()))?;
+        let func = module.load_function(func_name)
+            .map_err(|e| DeviceError::FuncNotFound(e.to_string()))?;
+        Ok((module, func))
+    }
+
+    /// CUDA toolkit include path (for mma.h, cuda_fp16.h, etc.)
+    pub fn cuda_include_path() -> String {
+        // Check common locations
+        for version in &["v12.8", "v12.6", "v12.4", "v12.2", "v12.0", "v11.8"] {
+            let path = format!("C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/{version}/include");
+            if std::path::Path::new(&path).exists() {
+                return path;
+            }
+        }
+        // Fallback: try environment variable
+        if let Ok(cuda_path) = std::env::var("CUDA_PATH") {
+            return format!("{cuda_path}/include");
+        }
+        "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8/include".to_string()
+    }
+
     /// Allocate device memory and copy host data to it.
     pub fn htod<T: cudarc::driver::DeviceRepr + Clone>(
         &self,

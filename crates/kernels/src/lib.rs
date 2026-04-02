@@ -17,6 +17,7 @@ pub mod device;
 pub mod elementwise;
 pub mod gemm;
 pub mod gemm_fast;
+pub mod gemm_tc;
 pub mod ops;
 pub mod rope;
 pub mod tensor;

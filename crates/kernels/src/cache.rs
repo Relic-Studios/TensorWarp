@@ -65,6 +65,40 @@ impl KernelCache {
         Ok(function)
     }
 
+    /// Get or compile with custom include paths and arch.
+    pub fn get_or_compile_with_opts(
+        &self,
+        device: &WarpDevice,
+        cuda_src: &str,
+        func_name: &str,
+        include_paths: &[String],
+        arch: Option<&'static str>,
+    ) -> Result<CudaFunction, DeviceError> {
+        let key = hash_source(cuda_src, func_name);
+
+        {
+            let cache = self.cache.lock().unwrap();
+            if let Some((func, _)) = cache.get(&key) {
+                *self.hits.lock().unwrap() += 1;
+                return Ok(func.clone());
+            }
+        }
+
+        let start = Instant::now();
+        let (_module, function) = device.load_cuda_source_with_opts(cuda_src, func_name, include_paths, arch)?;
+        let compile_time = start.elapsed();
+
+        {
+            let mut cache = self.cache.lock().unwrap();
+            cache.insert(key, (function.clone(), compile_time));
+        }
+
+        *self.misses.lock().unwrap() += 1;
+        *self.total_compile_time.lock().unwrap() += compile_time;
+
+        Ok(function)
+    }
+
     pub fn len(&self) -> usize {
         self.cache.lock().unwrap().len()
     }
