@@ -11,6 +11,7 @@
 //! - GEMM, attention, and elementwise kernel templates
 
 pub mod attention;
+pub mod attention_ext;
 pub mod autotune;
 pub mod cache;
 pub mod cublas_bench;
@@ -19,6 +20,7 @@ pub mod elementwise;
 pub mod gemm;
 pub mod generate;
 pub mod gemm_fast;
+pub mod kv_cache;
 pub mod gemm_tc;
 pub mod gemm_v2;
 pub mod ops;
