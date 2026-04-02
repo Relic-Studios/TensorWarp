@@ -201,7 +201,11 @@ pub fn attention_flash(
     head_dim: u32,
     causal: bool,
 ) -> Result<(), DeviceError> {
-    assert!(head_dim <= 32, "Flash attention currently supports head_dim <= 32 (one warp)");
+    // For head_dim > 32, delegate to attention_ext which handles larger dims
+    if head_dim > 32 {
+        return crate::attention_ext::attention_best(
+            cache, device, q, k, v, out, batch, seq_len, head_dim, causal);
+    }
 
     let scale = 1.0f32 / (head_dim as f32).sqrt();
     let causal_u32 = if causal { 1u32 } else { 0u32 };
