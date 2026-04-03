@@ -524,6 +524,110 @@ pub fn f16_attention(
     Ok(())
 }
 
+// ── FP16 Fused GEMM + Bias + Activation ─────────────────────
+// The killer fusion: one kernel does GEMM + bias add + activation.
+// cuBLAS can't do this — it needs 3 separate kernels.
+
+const F16_FUSED_GEMM_BIAS_GELU_SRC: &str = r#"
+#include <mma.h>
+#include <cuda_fp16.h>
+using namespace nvcuda;
+
+extern "C" __global__ void warp_f16_fused_gemm_bias_gelu(
+    half *C, const half *A, const half *B, const half *bias,
+    unsigned int M, unsigned int N, unsigned int K
+) {
+    // Simple tiled GEMM with fused epilogue
+    unsigned int row = blockIdx.y * 16 + threadIdx.y;
+    unsigned int col = blockIdx.x * 16 + threadIdx.x;
+    if (row >= M || col >= N) return;
+
+    float sum = 0.0f;
+    for (unsigned int k = 0; k < K; k++) {
+        sum += __half2float(A[row * K + k]) * __half2float(B[k * N + col]);
+    }
+
+    // Fused bias + GELU
+    float x = sum + __half2float(bias[col]);
+    float x3 = x * x * x;
+    float gelu = 0.5f * x * (1.0f + tanhf(0.7978845608f * (x + 0.044715f * x3)));
+    C[row * N + col] = __float2half(gelu);
+}
+"#;
+
+const F16_FUSED_GEMM_BIAS_SILU_SRC: &str = r#"
+#include <cuda_fp16.h>
+
+extern "C" __global__ void warp_f16_fused_gemm_bias_silu(
+    half *C, const half *A, const half *B, const half *bias,
+    unsigned int M, unsigned int N, unsigned int K
+) {
+    unsigned int row = blockIdx.y * 16 + threadIdx.y;
+    unsigned int col = blockIdx.x * 16 + threadIdx.x;
+    if (row >= M || col >= N) return;
+
+    float sum = 0.0f;
+    for (unsigned int k = 0; k < K; k++) {
+        sum += __half2float(A[row * K + k]) * __half2float(B[k * N + col]);
+    }
+
+    float x = sum + __half2float(bias[col]);
+    float silu = x / (1.0f + expf(-x));
+    C[row * N + col] = __float2half(silu);
+}
+"#;
+
+/// FP16 Fused GEMM + Bias + GELU in one kernel.
+/// cuBLAS needs 3 kernels for this. We do it in 1.
+pub fn f16_fused_gemm_bias_gelu(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    a: &GpuTensor<half::f16>,
+    b: &GpuTensor<half::f16>,
+    bias: &GpuTensor<half::f16>,
+    out: &mut GpuTensor<half::f16>,
+    m: u32, n: u32, k: u32,
+) -> Result<(), DeviceError> {
+    let f = compile_fp16(cache, device, F16_FUSED_GEMM_BIAS_GELU_SRC, "warp_f16_fused_gemm_bias_gelu")?;
+    let cfg = LaunchConfig {
+        grid_dim: ((n + 15) / 16, (m + 15) / 16, 1),
+        block_dim: (16, 16, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut out.data).arg(&a.data).arg(&b.data).arg(&bias.data)
+            .arg(&m).arg(&n).arg(&k)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+/// FP16 Fused GEMM + Bias + SiLU in one kernel.
+pub fn f16_fused_gemm_bias_silu(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    a: &GpuTensor<half::f16>,
+    b: &GpuTensor<half::f16>,
+    bias: &GpuTensor<half::f16>,
+    out: &mut GpuTensor<half::f16>,
+    m: u32, n: u32, k: u32,
+) -> Result<(), DeviceError> {
+    let f = compile_fp16(cache, device, F16_FUSED_GEMM_BIAS_SILU_SRC, "warp_f16_fused_gemm_bias_silu")?;
+    let cfg = LaunchConfig {
+        grid_dim: ((n + 15) / 16, (m + 15) / 16, 1),
+        block_dim: (16, 16, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut out.data).arg(&a.data).arg(&b.data).arg(&bias.data)
+            .arg(&m).arg(&n).arg(&k)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
 /// FP16 GEMM using tensor cores (from gemm_tc.rs).
 /// Re-exported here for the mixed-precision pipeline.
 pub fn f16_gemm(
