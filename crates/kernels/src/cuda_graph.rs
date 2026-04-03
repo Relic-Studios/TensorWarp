@@ -34,15 +34,23 @@ pub struct GraphCapture {
 impl GraphCapture {
     /// Capture a CUDA graph by recording all kernel launches in `f`.
     ///
-    /// The closure `f` should launch kernels on the same stream.
-    /// All launches are recorded into a graph instead of executing.
-    /// The graph is then instantiated for efficient replay.
-    pub fn record<F>(stream: &Arc<CudaStream>, f: F) -> Result<Self, DeviceError>
+    /// IMPORTANT: All kernels must be pre-compiled before capture.
+    /// The closure `f` should use `device.with_stream(capture_stream)`
+    /// to launch kernels on the capture stream.
+    ///
+    /// The context is pre-bound before capture to avoid bind_to_thread()
+    /// invalidating the capture during kernel launches.
+    pub fn record_with_device<F>(device: &crate::device::WarpDevice, stream: &Arc<CudaStream>, f: F) -> Result<Self, DeviceError>
     where
         F: FnOnce() -> Result<(), DeviceError>,
     {
-        // Begin capture — all subsequent launches on this stream are recorded
-        stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+        // Pre-bind context BEFORE starting capture.
+        // This makes launch_builder's bind_to_thread() a no-op during capture.
+        device.ctx.bind_to_thread()
+            .map_err(|e| DeviceError::Launch(format!("pre-bind context: {e}")))?;
+
+        // Begin capture
+        stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
             .map_err(|e| DeviceError::Launch(format!("graph begin_capture: {e}")))?;
 
         // Execute the closure — kernels are captured, not executed
@@ -53,7 +61,6 @@ impl GraphCapture {
             .map_err(|e| DeviceError::Launch(format!("graph end_capture: {e}")))?
             .ok_or_else(|| DeviceError::Launch("graph capture produced null graph".into()))?;
 
-        // If the closure failed, the graph might be invalid
         result?;
 
         Ok(Self { graph })
@@ -84,17 +91,15 @@ impl DecodeGraphCache {
     /// IMPORTANT: The graph captures the exact kernel sequence. If the model
     /// shape changes (different seq_len, different batch), the graph must be
     /// re-captured. This is fine for decode (always batch=1, seq=1).
-    pub fn run<F>(&mut self, stream: &Arc<CudaStream>, f: F) -> Result<(), DeviceError>
+    pub fn run<F>(&mut self, device: &crate::device::WarpDevice, stream: &Arc<CudaStream>, f: F) -> Result<(), DeviceError>
     where
         F: FnOnce() -> Result<(), DeviceError>,
     {
         if let Some(ref graph) = self.graph {
-            // Replay cached graph
             graph.replay()?;
             self.replays += 1;
         } else {
-            // First call: capture
-            let graph = GraphCapture::record(stream, f)?;
+            let graph = GraphCapture::record_with_device(device, stream, f)?;
             self.graph = Some(graph);
             self.captures += 1;
         }
@@ -171,8 +176,8 @@ mod tests {
             "warp_relu").unwrap();
         dev.synchronize().unwrap();
 
-        // Try capture with single kernel, minimal overhead
-        let graph = GraphCapture::record(&capture_stream, || {
+        // Capture with pre-bound context to avoid bind_to_thread invalidation
+        let graph = GraphCapture::record_with_device(&dev, &capture_stream, || {
             use cudarc::driver::{LaunchConfig, PushKernelArg};
             let cfg = LaunchConfig::for_num_elems(n as u32);
             unsafe {

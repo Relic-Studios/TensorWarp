@@ -141,6 +141,26 @@ impl WarpDevice {
             .map_err(|e| DeviceError::Sync(e.to_string()))
     }
 
+    /// Get number of available CUDA devices.
+    pub fn device_count() -> Result<usize, DeviceError> {
+        // cudarc initializes CUDA on first CudaContext::new() call
+        // Try to create contexts for ordinals 0, 1, 2, ... until one fails
+        let mut count = 0;
+        for i in 0..16 {
+            match CudaContext::new(i) {
+                Ok(_) => count += 1,
+                Err(_) => break,
+            }
+        }
+        Ok(count)
+    }
+
+    /// Get info for all available devices.
+    pub fn enumerate_devices() -> Vec<Result<WarpDevice, DeviceError>> {
+        let count = Self::device_count().unwrap_or(0);
+        (0..count).map(|i| WarpDevice::new(i)).collect()
+    }
+
     /// NVRTC arch string for this device (e.g., "compute_89").
     pub fn arch_flag(&self) -> String {
         format!("compute_{}", self.sm_version)

@@ -664,31 +664,88 @@ impl OnnxExecutor {
             // ── Slice ────────────────────────────────────────
             "Slice" => {
                 let x = get(0)?;
-                // Simple slice: pass through for now with correct data
-                // Full slice needs starts/ends/axes/steps parsing from inputs 1-4
-                let data = device.dtoh(&x.data)?;
-                let out = GpuTensor::from_host(device, &data, x.shape.clone(), DType::F32)?;
-                owned.insert(out_name, out);
+                // Parse starts/ends from ONNX inputs (inputs 1 and 2)
+                if node.inputs.len() >= 3 {
+                    if let (Ok(starts_t), Ok(ends_t)) = (get(1), get(2)) {
+                        let starts = starts_t.to_host(device)?;
+                        let ends = ends_t.to_host(device)?;
+                        if !starts.is_empty() && !ends.is_empty() {
+                            let dims = x.shape.dims();
+                            let cols = dims.last().and_then(|d| d.static_val()).unwrap_or(x.numel) as u32;
+                            let rows = (x.numel / cols as usize) as u32;
+                            let start = starts[0].max(0.0) as u32;
+                            let end = (ends[0] as u32).min(cols);
+                            let out_cols = end - start;
+
+                            let mut out = GpuTensor::<f32>::zeros(device,
+                                Shape::from_static(&[rows as usize, out_cols as usize]), DType::F32)?;
+                            warp_kernels::gather::slice_last(&self.cache, device, x, &mut out,
+                                rows, cols, start, out_cols)?;
+                            owned.insert(out_name, out);
+                        } else {
+                            // Empty slice params — pass through
+                            let data = device.dtoh(&x.data)?;
+                            owned.insert(out_name, GpuTensor::from_host(device, &data, x.shape.clone(), DType::F32)?);
+                        }
+                    } else {
+                        let data = device.dtoh(&x.data)?;
+                        owned.insert(out_name, GpuTensor::from_host(device, &data, x.shape.clone(), DType::F32)?);
+                    }
+                } else {
+                    let data = device.dtoh(&x.data)?;
+                    owned.insert(out_name, GpuTensor::from_host(device, &data, x.shape.clone(), DType::F32)?);
+                }
             }
 
             // ── Split ────────────────────────────────────────
             "Split" => {
                 let x = get(0)?;
-                // For single-output split, pass through
+                let axis = node.get_int("axis", 0);
+                // For single-output split or first output, pass through
                 let data = device.dtoh(&x.data)?;
                 let out = GpuTensor::from_host(device, &data, x.shape.clone(), DType::F32)?;
                 owned.insert(out_name, out);
-                // Additional outputs handled by subsequent nodes
             }
 
             // ── Pad ──────────────────────────────────────────
             "Pad" => {
                 let x = get(0)?;
-                // Simple pad: pass through for constant pad mode
-                // Full implementation needs pads tensor from input 1
-                let data = device.dtoh(&x.data)?;
-                let out = GpuTensor::from_host(device, &data, x.shape.clone(), DType::F32)?;
-                owned.insert(out_name, out);
+                // Try to get pads from input 1
+                if node.inputs.len() >= 2 {
+                    if let Ok(pads_t) = get(1) {
+                        let pads = pads_t.to_host(device)?;
+                        if pads.len() >= 4 {
+                            let dims = x.shape.dims();
+                            let in_rows = dims.get(0).and_then(|d| d.static_val()).unwrap_or(1) as u32;
+                            let in_cols = dims.get(1).and_then(|d| d.static_val()).unwrap_or(x.numel) as u32;
+                            let pad_top = pads[0] as u32;
+                            let pad_left = pads[1] as u32;
+                            let pad_bottom = pads[2] as u32;
+                            let pad_right = pads[3] as u32;
+                            let out_rows = in_rows + pad_top + pad_bottom;
+                            let out_cols = in_cols + pad_left + pad_right;
+                            let pad_val = if node.inputs.len() >= 3 {
+                                get(2).ok().and_then(|t| t.to_host(device).ok())
+                                    .and_then(|v| v.first().copied()).unwrap_or(0.0)
+                            } else { 0.0 };
+
+                            let mut out = GpuTensor::<f32>::zeros(device,
+                                Shape::from_static(&[out_rows as usize, out_cols as usize]), DType::F32)?;
+                            warp_kernels::gather::pad_2d(&self.cache, device, x, &mut out,
+                                in_rows, in_cols, out_rows, out_cols, pad_top, pad_left, pad_val)?;
+                            owned.insert(out_name, out);
+                        } else {
+                            let data = device.dtoh(&x.data)?;
+                            owned.insert(out_name, GpuTensor::from_host(device, &data, x.shape.clone(), DType::F32)?);
+                        }
+                    } else {
+                        let data = device.dtoh(&x.data)?;
+                        owned.insert(out_name, GpuTensor::from_host(device, &data, x.shape.clone(), DType::F32)?);
+                    }
+                } else {
+                    let data = device.dtoh(&x.data)?;
+                    owned.insert(out_name, GpuTensor::from_host(device, &data, x.shape.clone(), DType::F32)?);
+                }
             }
 
             // ── Constant / Shape / Cast ───────────────────────
