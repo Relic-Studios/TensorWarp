@@ -398,6 +398,16 @@ impl OnnxModel {
             "Exp" => Ok(OnnxOpMapping::Activation("exp")),
             "Log" => Ok(OnnxOpMapping::Activation("log")),
             "Reciprocal" => Ok(OnnxOpMapping::Activation("reciprocal")),
+            "ArgMax" | "ArgMin" => Ok(OnnxOpMapping::TopK),
+            "Einsum" => Ok(OnnxOpMapping::MatMul { trans_a: false, trans_b: false }),
+            "ConstantOfShape" => Ok(OnnxOpMapping::Constant),
+            "Range" => Ok(OnnxOpMapping::Shape),
+            "CumSum" => Ok(OnnxOpMapping::Reduce { op: "cumsum" }),
+            "Tile" => Ok(OnnxOpMapping::Identity),
+            "DepthToSpace" | "SpaceToDepth" => Ok(OnnxOpMapping::Reshape),
+            "OneHot" => Ok(OnnxOpMapping::Constant),
+            "NonZero" => Ok(OnnxOpMapping::Shape),
+            "ScatterND" | "ScatterElements" => Ok(OnnxOpMapping::Identity),
             "Floor" | "Ceil" | "Round" => Ok(OnnxOpMapping::Identity), // rounding ops
             "Min" | "Max" => Ok(OnnxOpMapping::Binary("minmax")),
             "Equal" | "Greater" | "Less" | "Not" | "And" | "Or" => Ok(OnnxOpMapping::Identity),
@@ -431,6 +441,9 @@ impl OnnxModel {
             "Floor", "Ceil", "Round", "Min", "Max",
             "Equal", "Greater", "Less", "Not", "And", "Or",
             "MatMulInteger",
+            "ArgMax", "ArgMin", "Einsum", "ConstantOfShape", "Range", "CumSum",
+            "Tile", "DepthToSpace", "SpaceToDepth", "OneHot", "NonZero",
+            "ScatterND", "ScatterElements",
         ]
     }
 

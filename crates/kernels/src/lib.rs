@@ -29,6 +29,7 @@ pub mod gather;
 pub mod gemm;
 pub mod generate;
 pub mod mem_pool;
+pub mod missing_ops;
 pub mod multi_gpu;
 pub mod gemm_fast;
 pub mod kv_cache;

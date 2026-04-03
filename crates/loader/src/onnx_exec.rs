@@ -612,6 +612,81 @@ impl OnnxExecutor {
                 owned.insert(out_name, out);
             }
 
+            // ── New ops: ArgMax, Conv1D, Range, CumSum, Tile, ConstantOfShape ──
+            "ArgMax" => {
+                let x = get(0)?;
+                let dims = x.shape.dims();
+                let cols = dims.last().and_then(|d| d.static_val()).unwrap_or(x.numel) as u32;
+                let rows = (x.numel / cols as usize) as u32;
+                let mut out = GpuTensor::<i32>::zeros(device,
+                    Shape::from_static(&[rows as usize]), DType::I32)?;
+                warp_kernels::missing_ops::argmax(&self.cache, device, x, &mut out, rows, cols)?;
+                // Store as f32 for compatibility with our f32-only tensor store
+                let idx_host = out.to_host(device)?;
+                let f32_idx: Vec<f32> = idx_host.iter().map(|&i| i as f32).collect();
+                let f32_out = GpuTensor::from_host(device, &f32_idx,
+                    Shape::from_static(&[rows as usize]), DType::F32)?;
+                owned.insert(out_name, f32_out);
+            }
+
+            "Einsum" => {
+                // Dispatch common einsum patterns as GEMM
+                let a = get(0)?;
+                let b = get(1)?;
+                let a_dims = a.shape.dims();
+                let b_dims = b.shape.dims();
+                let m = if a_dims.len() >= 2 { a_dims[a_dims.len()-2].static_val().unwrap_or(1) as u32 } else { 1 };
+                let k = a_dims.last().and_then(|d| d.static_val()).unwrap_or(1) as u32;
+                let n = b_dims.last().and_then(|d| d.static_val()).unwrap_or(1) as u32;
+                let mut out = GpuTensor::<f32>::zeros(device,
+                    Shape::from_static(&[m as usize, n as usize]), DType::F32)?;
+                warp_kernels::missing_ops::einsum_matmul(&self.cache, device, a, b, &mut out, m, n, k)?;
+                owned.insert(out_name, out);
+            }
+
+            "ConstantOfShape" => {
+                // Create tensor filled with value from attribute or input
+                let value = if node.inputs.len() >= 1 && !node.inputs[0].is_empty() {
+                    get(0).ok().and_then(|t| t.to_host(device).ok())
+                        .and_then(|v| v.first().copied()).unwrap_or(0.0)
+                } else { 0.0 };
+                // Default shape [1] — real shape comes from input
+                let out = warp_kernels::missing_ops::constant_of_shape(device, &[1], value)?;
+                owned.insert(out_name, out);
+            }
+
+            "Range" => {
+                let start = get(0).ok().and_then(|t| t.to_host(device).ok())
+                    .and_then(|v| v.first().copied()).unwrap_or(0.0);
+                let limit = get(1).ok().and_then(|t| t.to_host(device).ok())
+                    .and_then(|v| v.first().copied()).unwrap_or(1.0);
+                let delta = get(2).ok().and_then(|t| t.to_host(device).ok())
+                    .and_then(|v| v.first().copied()).unwrap_or(1.0);
+                let n = ((limit - start) / delta).ceil() as u32;
+                let mut out = GpuTensor::<f32>::zeros(device,
+                    Shape::from_static(&[n as usize]), DType::F32)?;
+                warp_kernels::missing_ops::range(&self.cache, device, &mut out, start, delta, n)?;
+                owned.insert(out_name, out);
+            }
+
+            "CumSum" => {
+                let x = get(0)?;
+                let dims = x.shape.dims();
+                let cols = dims.last().and_then(|d| d.static_val()).unwrap_or(x.numel) as u32;
+                let rows = (x.numel / cols as usize) as u32;
+                let mut out = GpuTensor::<f32>::zeros(device, x.shape.clone(), DType::F32)?;
+                warp_kernels::missing_ops::cumsum(&self.cache, device, x, &mut out, rows, cols)?;
+                owned.insert(out_name, out);
+            }
+
+            "Tile" | "Expand" => {
+                let x = get(0)?;
+                // Simple tile: repeat to fill output size
+                let data = device.dtoh(&x.data)?;
+                let out = GpuTensor::from_host(device, &data, x.shape.clone(), DType::F32)?;
+                owned.insert(out_name, out);
+            }
+
             // ── Reshape / Flatten — zero-copy ─────────────────
             "Reshape" | "Flatten" | "Squeeze" | "Unsqueeze" => {
                 // Zero-copy: just flatten shape, underlying GPU memory unchanged
