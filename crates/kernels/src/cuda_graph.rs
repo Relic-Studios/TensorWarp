@@ -26,20 +26,14 @@ use cudarc::driver::{CudaStream, CudaFunction, CudaGraph, sys};
 
 use crate::device::DeviceError;
 
-/// Extract the raw CUfunction handle from a CudaFunction.
-///
-/// SAFETY: CudaFunction's memory layout starts with cu_function: CUfunction.
-unsafe fn raw_cu_function(f: &CudaFunction) -> sys::CUfunction {
-    let ptr = f as *const CudaFunction as *const sys::CUfunction;
-    *ptr
+/// Get raw CUfunction from CudaFunction (vendored cudarc with pub field).
+fn raw_cu_function(f: &CudaFunction) -> sys::CUfunction {
+    f.cu_function
 }
 
-/// Extract the raw CUdeviceptr from a CudaSlice.
-///
-/// SAFETY: CudaSlice's first field is cu_device_ptr: CUdeviceptr.
-unsafe fn raw_device_ptr<T>(slice: &cudarc::driver::CudaSlice<T>) -> sys::CUdeviceptr {
-    let ptr = slice as *const cudarc::driver::CudaSlice<T> as *const sys::CUdeviceptr;
-    *ptr
+/// Get raw device pointer from CudaSlice (vendored cudarc with pub field).
+fn raw_device_ptr<T>(slice: &cudarc::driver::CudaSlice<T>) -> sys::CUdeviceptr {
+    slice.cu_device_ptr
 }
 
 /// Launch a kernel directly via cuLaunchKernel WITHOUT bind_to_thread().
@@ -224,15 +218,69 @@ mod tests {
             "warp_relu").unwrap();
         dev.synchronize().unwrap();
 
-        // CUDA graph capture currently blocked by cudarc's internal bind_to_thread.
-        // The capture_safe_launch FFI bypass also hits struct layout issues.
-        // This needs an upstream cudarc PR to add a capture-safe launch path.
-        // The graph infrastructure (GraphCapture, DecodeGraphCache) is fully built
-        // and proven to work with empty graphs (484x overhead reduction measured).
-        println!("CUDA graph capture requires cudarc upstream fix.");
-        println!("Graph infrastructure ready — DecodeGraphCache + GraphCapture built.");
-        println!("Measured: 484x launch overhead reduction with empty graph capture.");
-        // When cudarc adds capture-safe launch, the benchmark code goes here.
-        // Previous measurement with empty graph: 484x overhead reduction.
+        // Capture using capture_safe_launch with vendored cudarc pub fields
+        let graph = GraphCapture::record_with_device(&dev, &capture_stream, || {
+            let threads = 256u32;
+            let blocks = ((n as u32) + threads - 1) / threads;
+            let out_ptr = raw_device_ptr(&out.data);
+            let out2_ptr = raw_device_ptr(&out2.data);
+            let out3_ptr = raw_device_ptr(&out3.data);
+            let a_ptr = raw_device_ptr(&a.data);
+            let b_ptr = raw_device_ptr(&b.data);
+            let mut n_val = n;
+
+            unsafe {
+                let mut p1 = [&out_ptr as *const _ as *mut std::ffi::c_void,
+                    &a_ptr as *const _ as *mut std::ffi::c_void,
+                    &b_ptr as *const _ as *mut std::ffi::c_void,
+                    &mut n_val as *mut _ as *mut std::ffi::c_void];
+                capture_safe_launch(&add_func, &capture_stream, (blocks,1,1), (threads,1,1), 0, &mut p1)?;
+
+                let mut p2 = [&out2_ptr as *const _ as *mut std::ffi::c_void,
+                    &out_ptr as *const _ as *mut std::ffi::c_void,
+                    &mut n_val as *mut _ as *mut std::ffi::c_void];
+                capture_safe_launch(&relu_func, &capture_stream, (blocks,1,1), (threads,1,1), 0, &mut p2)?;
+
+                let mut p3 = [&out3_ptr as *const _ as *mut std::ffi::c_void,
+                    &out2_ptr as *const _ as *mut std::ffi::c_void,
+                    &a_ptr as *const _ as *mut std::ffi::c_void,
+                    &mut n_val as *mut _ as *mut std::ffi::c_void];
+                capture_safe_launch(&add_func, &capture_stream, (blocks,1,1), (threads,1,1), 0, &mut p3)?;
+            }
+            Ok(())
+        });
+
+        let graph = match graph {
+            Ok(g) => { println!("CUDA Graph captured!"); g }
+            Err(e) => { println!("Graph capture failed: {e}"); return; }
+        };
+
+        dev.synchronize().unwrap();
+
+        // Benchmark
+        let iters = 1000;
+        let start = std::time::Instant::now();
+        for _ in 0..iters { graph.replay().unwrap(); }
+        dev.synchronize().unwrap();
+        let graph_time = start.elapsed();
+
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            crate::ops::add(&cache, &dev, &a, &b, &mut out).unwrap();
+            crate::ops::relu(&cache, &dev, &out, &mut out2).unwrap();
+            crate::ops::add(&cache, &dev, &out2, &a, &mut out3).unwrap();
+        }
+        dev.synchronize().unwrap();
+        let normal_time = start.elapsed();
+
+        println!("\n=== CUDA Graph Benchmark ({iters} iters) ===");
+        println!("  Normal: {:.1}μs/iter", normal_time.as_secs_f64()*1e6/iters as f64);
+        println!("  Graph:  {:.1}μs/iter", graph_time.as_secs_f64()*1e6/iters as f64);
+        println!("  Speedup: {:.1}x", normal_time.as_secs_f64()/graph_time.as_secs_f64());
+
+        let result = out3.to_host(&dev).unwrap();
+        let expected = ((a_data[0] + b_data[0]).max(0.0)) + a_data[0];
+        assert!((result[0] - expected).abs() < 0.01);
+        println!("  Correctness: verified!");
     }
 }

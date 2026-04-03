@@ -32,8 +32,8 @@ half = { version = "2.4", features = ["num-traits"] }
 log = "0.4"
 env_logger = "0.11"
 
-# GPU
-cudarc = { version = "0.16", features = ["cuda-12080", "cublas", "f16"] }
+# GPU — vendored with patched pub fields for CUDA graph support
+cudarc = { path = "vendor/cudarc", features = ["cuda-12080", "cublas", "f16"] }
 
 # Model loading
 safetensors = "0.7"
