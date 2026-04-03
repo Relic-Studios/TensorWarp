@@ -124,6 +124,105 @@ kernel void warp_activate_{n}(
             description: format!("Metal {:?} activation on {n} elements", activation),
         })
     }
+
+    fn gen_gemm(
+        &self,
+        m: usize, n: usize, k: usize,
+        dtype: DType,
+    ) -> Result<CompiledKernel, CodegenError> {
+        let ty = metal_type(dtype);
+        let tile = 16;
+
+        let shader = format!(
+            r#"#include <metal_stdlib>
+using namespace metal;
+
+#define M {m}
+#define N {n}
+#define K {k}
+#define TILE {tile}
+
+kernel void warp_gemm_{m}x{n}x{k}(
+    device {ty}* C [[buffer(0)]],
+    device const {ty}* A [[buffer(1)]],
+    device const {ty}* B [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]]
+) {{
+    if (gid.y >= M || gid.x >= N) return;
+
+    float sum = 0.0f;
+    for (uint kk = 0; kk < K; kk++) {{
+        sum += float(A[gid.y * K + kk]) * float(B[kk * N + gid.x]);
+    }}
+    C[gid.y * N + gid.x] = ({ty})sum;
+}}
+"#);
+
+        Ok(CompiledKernel {
+            code: shader.into_bytes(),
+            entry_point: format!("warp_gemm_{m}x{n}x{k}"),
+            grid: [n as u32, m as u32, 1],
+            block: [tile as u32, tile as u32, 1],
+            shared_mem_bytes: 0,
+            description: format!("Metal GEMM {m}x{n}x{k} ({dtype})"),
+        })
+    }
+
+    fn gen_rmsnorm(
+        &self,
+        hidden: usize,
+        dtype: DType,
+    ) -> Result<CompiledKernel, CodegenError> {
+        let ty = metal_type(dtype);
+
+        let shader = format!(
+            r#"#include <metal_stdlib>
+using namespace metal;
+
+kernel void warp_rmsnorm_{hidden}(
+    device {ty}* out [[buffer(0)]],
+    device const {ty}* x [[buffer(1)]],
+    device const {ty}* gamma [[buffer(2)]],
+    constant float& eps [[buffer(3)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
+) {{
+    threadgroup float shared_sum[32];
+    uint H = {hidden};
+    device const {ty}* x_row = x + row * H;
+    device {ty}* out_row = out + row * H;
+
+    float sum_sq = 0.0f;
+    for (uint i = tid; i < H; i += 32) {{
+        float v = float(x_row[i]);
+        sum_sq += v * v;
+    }}
+    shared_sum[tid] = sum_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {{
+        float total = 0.0f;
+        for (uint i = 0; i < 32; i++) total += shared_sum[i];
+        shared_sum[0] = rsqrt(total / float(H) + eps);
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rms = shared_sum[0];
+
+    for (uint i = tid; i < H; i += 32) {{
+        out_row[i] = ({ty})(float(x_row[i]) * rms * float(gamma[i]));
+    }}
+}}
+"#);
+
+        Ok(CompiledKernel {
+            code: shader.into_bytes(),
+            entry_point: format!("warp_rmsnorm_{hidden}"),
+            grid: [1, 1, 1], // set per-row at dispatch
+            block: [32, 1, 1],
+            shared_mem_bytes: 128,
+            description: format!("Metal RMSNorm H={hidden} ({dtype})"),
+        })
+    }
 }
 
 impl Backend for MetalBackend {
