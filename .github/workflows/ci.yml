@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check compilation
+        run: cargo check --workspace --exclude cudarc --exclude warp-kernels
+      - name: Run IR + optimizer tests
+        run: cargo test -p warp-ir -p warp-optimizer
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+        continue-on-error: true
+
+  gpu-test:
+    name: GPU Tests
+    runs-on: [self-hosted, gpu]
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run GPU tests
+        run: cargo test --workspace --exclude cudarc
+        env:
+          CUDA_VISIBLE_DEVICES: "0"

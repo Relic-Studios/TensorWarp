@@ -48,6 +48,7 @@ pub mod quantize;
 pub mod rope;
 pub mod sampling;
 pub mod serialize;
+mod stress_tests;
 pub mod swiglu;
 pub mod tensor;
 pub mod transformer;
