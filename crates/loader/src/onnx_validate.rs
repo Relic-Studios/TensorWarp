@@ -186,4 +186,118 @@ mod tests {
         assert!(result.iter().any(|v| *v != 0.0), "Output is all zeros!");
         println!("  PASSED: Conv→ReLU→Pool pipeline produces valid output!");
     }
+
+    #[test]
+    fn validate_elementwise_chain() {
+        let dev = match WarpDevice::new(0) {
+            Ok(d) => d,
+            Err(_) => { println!("No CUDA, skipping"); return; }
+        };
+
+        // Test: Add → Relu → Mul (should be auto-fusible)
+        let model = OnnxModel {
+            inputs: vec![
+                OnnxIO { name: "a".into(), dtype: Some(OnnxDType::Float), shape: vec![4] },
+                OnnxIO { name: "b".into(), dtype: Some(OnnxDType::Float), shape: vec![4] },
+                OnnxIO { name: "c".into(), dtype: Some(OnnxDType::Float), shape: vec![4] },
+            ],
+            outputs: vec![OnnxIO { name: "out".into(), dtype: Some(OnnxDType::Float), shape: vec![4] }],
+            nodes: vec![
+                OnnxNode { name: "add".into(), op_type: "Add".into(),
+                    inputs: vec!["a".into(), "b".into()],
+                    outputs: vec!["sum".into()], attrs: HashMap::new() },
+                OnnxNode { name: "relu".into(), op_type: "Relu".into(),
+                    inputs: vec!["sum".into()],
+                    outputs: vec!["relu_out".into()], attrs: HashMap::new() },
+                OnnxNode { name: "mul".into(), op_type: "Mul".into(),
+                    inputs: vec!["relu_out".into(), "c".into()],
+                    outputs: vec!["out".into()], attrs: HashMap::new() },
+            ],
+            initializers: HashMap::new(),
+            ir_version: 8, opset_version: 17, producer: "test".into(),
+        };
+
+        let exec = OnnxExecutor::new(&dev, &model).unwrap();
+
+        let a_data = vec![1.0f32, -2.0, 3.0, -4.0];
+        let b_data = vec![0.5, 0.5, 0.5, 0.5];
+        let c_data = vec![2.0, 2.0, 2.0, 2.0];
+
+        let a = GpuTensor::from_host(&dev, &a_data, Shape::from_static(&[4]), DType::F32).unwrap();
+        let b = GpuTensor::from_host(&dev, &b_data, Shape::from_static(&[4]), DType::F32).unwrap();
+        let c = GpuTensor::from_host(&dev, &c_data, Shape::from_static(&[4]), DType::F32).unwrap();
+
+        let outputs = exec.run(&dev, &[("a", &a), ("b", &b), ("c", &c)]).unwrap();
+        dev.synchronize().unwrap();
+
+        let result = outputs["out"].to_host(&dev).unwrap();
+
+        // CPU reference: relu(a + b) * c
+        let expected: Vec<f32> = a_data.iter().zip(b_data.iter()).zip(c_data.iter())
+            .map(|((&a, &b), &c)| (a + b).max(0.0) * c)
+            .collect();
+
+        println!("\n=== Elementwise Chain Validation ===");
+        println!("  GPU:      {:?}", result);
+        println!("  Expected: {:?}", expected);
+
+        let max_err: f32 = result.iter().zip(expected.iter())
+            .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        println!("  Max error: {max_err:.6}");
+        assert!(max_err < 0.001, "Elementwise chain mismatch: {max_err}");
+        println!("  PASSED!");
+    }
+
+    #[test]
+    fn validate_gather_embedding() {
+        let dev = match WarpDevice::new(0) {
+            Ok(d) => d,
+            Err(_) => { println!("No CUDA, skipping"); return; }
+        };
+
+        // Test: Gather op for embedding lookup (critical for LLMs)
+        let mut inits = HashMap::new();
+        let embed_table: Vec<f32> = (0..20).map(|i| i as f32 * 0.1).collect();
+        inits.insert("embed".into(), OnnxTensor {
+            name: "embed".into(), dtype: OnnxDType::Float,
+            shape: vec![5, 4], // 5 tokens, dim 4
+            raw_data: embed_table.iter().flat_map(|f| f.to_le_bytes()).collect(),
+        });
+
+        let model = OnnxModel {
+            inputs: vec![OnnxIO { name: "indices".into(), dtype: Some(OnnxDType::Float), shape: vec![3] }],
+            outputs: vec![OnnxIO { name: "embeddings".into(), dtype: Some(OnnxDType::Float), shape: vec![3, 4] }],
+            nodes: vec![
+                OnnxNode { name: "gather".into(), op_type: "Gather".into(),
+                    inputs: vec!["embed".into(), "indices".into()],
+                    outputs: vec!["embeddings".into()], attrs: HashMap::new() },
+            ],
+            initializers: inits,
+            ir_version: 8, opset_version: 17, producer: "test".into(),
+        };
+
+        let exec = OnnxExecutor::new(&dev, &model).unwrap();
+
+        // Look up tokens 0, 2, 4
+        let idx_data = vec![0.0f32, 2.0, 4.0];
+        let indices = GpuTensor::from_host(&dev, &idx_data, Shape::from_static(&[3]), DType::F32).unwrap();
+
+        let outputs = exec.run(&dev, &[("indices", &indices)]).unwrap();
+        dev.synchronize().unwrap();
+
+        let result = outputs["embeddings"].to_host(&dev).unwrap();
+
+        println!("\n=== Gather (Embedding) Validation ===");
+        println!("  Indices: [0, 2, 4]");
+        println!("  Result: {:?}", result);
+
+        // Token 0: [0.0, 0.1, 0.2, 0.3]
+        assert!((result[0] - 0.0).abs() < 1e-5);
+        assert!((result[1] - 0.1).abs() < 1e-5);
+        // Token 2: [0.8, 0.9, 1.0, 1.1]
+        assert!((result[4] - 0.8).abs() < 1e-5);
+        // Token 4: [1.6, 1.7, 1.8, 1.9]
+        assert!((result[8] - 1.6).abs() < 1e-5);
+        println!("  PASSED: Embedding lookup correct!");
+    }
 }

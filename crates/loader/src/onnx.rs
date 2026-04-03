@@ -388,8 +388,23 @@ impl OnnxModel {
             "NonMaxSuppression" => Ok(OnnxOpMapping::NMS),
             "TopK" => Ok(OnnxOpMapping::TopK),
 
+            // Broadcast / conditional
+            "Expand" => Ok(OnnxOpMapping::Identity), // broadcast shape — handled by kernel
+            "Where" => Ok(OnnxOpMapping::Identity),   // conditional selection
+            "Pow" => Ok(OnnxOpMapping::Binary("pow")),
+            "Sqrt" => Ok(OnnxOpMapping::Activation("sqrt")),
+            "Neg" => Ok(OnnxOpMapping::Activation("neg")),
+            "Abs" => Ok(OnnxOpMapping::Activation("abs")),
+            "Exp" => Ok(OnnxOpMapping::Activation("exp")),
+            "Log" => Ok(OnnxOpMapping::Activation("log")),
+            "Reciprocal" => Ok(OnnxOpMapping::Activation("reciprocal")),
+            "Floor" | "Ceil" | "Round" => Ok(OnnxOpMapping::Identity), // rounding ops
+            "Min" | "Max" => Ok(OnnxOpMapping::Binary("minmax")),
+            "Equal" | "Greater" | "Less" | "Not" | "And" | "Or" => Ok(OnnxOpMapping::Identity),
+            "MatMulInteger" => Ok(OnnxOpMapping::MatMul { trans_a: false, trans_b: false }),
+
             // Identity / no-op
-            "Identity" | "Dropout" => Ok(OnnxOpMapping::Identity),
+            "Identity" | "Dropout" | "Flatten" => Ok(OnnxOpMapping::Identity),
 
             other => Err(OnnxError::UnsupportedOp(other.to_string())),
         }
@@ -411,7 +426,11 @@ impl OnnxModel {
             "Softmax",
             "Constant", "Shape", "Cast", "Pad",
             "NonMaxSuppression", "TopK",
-            "Identity", "Dropout",
+            "Identity", "Dropout", "Flatten",
+            "Expand", "Where", "Pow", "Sqrt", "Neg", "Abs", "Exp", "Log", "Reciprocal",
+            "Floor", "Ceil", "Round", "Min", "Max",
+            "Equal", "Greater", "Less", "Not", "And", "Or",
+            "MatMulInteger",
         ]
     }
 

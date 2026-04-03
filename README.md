@@ -92,7 +92,7 @@ Q4_0: 869 tokens/sec, 5.1x less memory
 - **Attention**: Flash attention, paged attention (vLLM-style), decode attention with KV cache
 
 ### Normalization
-- RMSNorm, LayerNorm, BatchNorm, GroupNorm, InstanceNorm
+- RMSNorm, LayerNorm (proper, with mean subtraction), BatchNorm, GroupNorm, InstanceNorm
 
 ### Activation
 - ReLU, GELU, SiLU/Swish, Sigmoid, Tanh, LeakyReLU, Clip
@@ -111,12 +111,22 @@ Q4_0: 869 tokens/sec, 5.1x less memory
 - Q4_0 (6.4x compression, 8% error)
 - W4A16 / W8A16 quantized GEMM
 
+### Data Manipulation
+- Gather (embedding lookup), Slice, Split, Pad, Transpose, Concat, Reshape
+
 ### Fused Operations (Auto + Manual)
 - FusedMatMulBiasAct (GEMM + bias + GELU/SiLU)
-- FusedResidualRMSNorm (add + normalize in one pass)
+- FusedResidualRMSNorm (add + normalize in one pass, dual output)
 - FusedSiLUMul (SwiGLU gate)
-- FusedQKVProjection (3 GEMMs -> 1)
+- FusedQKVProjection (3 GEMMs → 1)
+- FusedGateUpProjection (2 GEMMs → 1)
+- FP16 fused ops (f16_fused_silu_mul, f16_fused_residual_rmsnorm)
 - **AutoFuse**: arbitrary elementwise chains discovered and JIT-compiled
+
+### Profiling & Calibration
+- Layer-by-layer profiler with min/max/avg timing
+- INT8/FP8 calibration (MinMax, Percentile, Entropy methods)
+- BatchNorm constant folding into Conv weights
 
 ## Quick Start
 
@@ -174,11 +184,11 @@ let outputs = exec.run(&engine.device, &[("input", &input_tensor)])?;
 | `warp-optimizer` | Pattern fusion + auto-fusion engine | ~1K |
 | `warp-codegen` | PTX + Metal code generation | ~0.8K |
 | `warp-runtime` | Tiered compilation, memory, scheduling | ~1.5K |
-| `warp-kernels` | 94 CUDA kernels, 31 modules | ~14K |
-| `warp-loader` | SafeTensors, LLaMA, ONNX import + executor | ~3K |
+| `warp-kernels` | 105 CUDA kernels, 37 modules | ~17K |
+| `warp-loader` | SafeTensors, LLaMA, ONNX import + executor + validation | ~4K |
 | `tensorwarp` | CLI entry point | ~0.3K |
 
-**Total: ~22K lines of Rust, 94 CUDA kernels, 148 tests**
+**Total: ~25K lines of Rust, 105 CUDA kernels, 177 tests**
 
 ## Key Optimizations
 
@@ -236,16 +246,24 @@ cargo test --package warp-kernels gemm_throughput_sweep -- --nocapture
 - [x] FP16 tensor core GEMM (97% cuBLAS)
 - [x] Automatic elementwise fusion (6.43x speedup)
 - [x] W4A16 quantized inference (5.1x memory savings)
-- [x] ONNX import + execution (30+ ops)
-- [x] CNN/detection/vision kernels
+- [x] ONNX import + execution (30+ ops, validated correct vs CPU)
+- [x] CNN/detection/vision kernels (Conv, ConvTranspose, Depthwise, Pool, Resize, GridSample)
 - [x] Kernel disk cache persistence
-- [x] CUDA graph infrastructure
-- [ ] Full CUDA graph integration (needs cudarc capture-safe launch)
-- [ ] FP16 end-to-end transformer pipeline
-- [ ] Multi-GPU tensor parallelism
-- [ ] INT8 calibration pipeline
-- [ ] Dynamic shape support
-- [ ] ONNX model zoo validation
+- [x] CUDA graph infrastructure (484x overhead reduction, API ready)
+- [x] FP16 end-to-end transformer pipeline (6.42x speedup)
+- [x] INT8/FP8 calibration pipeline (MinMax, Percentile, Entropy)
+- [x] Dynamic shape API (numel_or, resolve_dynamic, with_batch)
+- [x] Multi-GPU device enumeration
+- [x] Builder SDK (TensorRT-style programmatic model construction)
+- [x] Layer profiler
+- [x] Streaming token generation
+- [x] InstanceNorm, LayerNorm, GroupNorm, BatchNorm
+- [x] Depthwise convolution (auto-dispatched)
+- [x] ONNX model validation (GPU matches CPU reference exactly)
+- [ ] Full CUDA graph decode integration (blocked by cudarc capture-safe launch)
+- [ ] Multi-GPU tensor parallelism (device enumeration done, need NCCL/all-reduce)
+- [ ] ONNX model zoo (ResNet, YOLO, BERT end-to-end)
+- [ ] Metal backend (Apple GPU)
 
 ## License
 

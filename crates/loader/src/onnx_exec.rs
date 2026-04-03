@@ -574,6 +574,24 @@ impl OnnxExecutor {
                 owned.insert(out_name, out);
             }
 
+            // ── InstanceNorm ──────────────────────────────────
+            "InstanceNormalization" => {
+                let x = get(0)?;
+                let scale = get(1)?;
+                let bias = get(2)?;
+                let eps = node.get_float("epsilon", 1e-5);
+                let dims = x.shape.dims();
+                let c = dims.get(1).and_then(|d| d.static_val()).unwrap_or(1) as u32;
+                let spatial: u32 = dims[2..].iter()
+                    .map(|d| d.static_val().unwrap_or(1) as u32).product();
+                let spatial = if spatial == 0 { 1 } else { spatial };
+
+                let mut out = GpuTensor::<f32>::zeros(device, x.shape.clone(), DType::F32)?;
+                warp_kernels::ops::instancenorm(&self.cache, device, x, scale, bias, &mut out,
+                    c, spatial, eps)?;
+                owned.insert(out_name, out);
+            }
+
             // ── GroupNorm ─────────────────────────────────────
             "GroupNormalization" => {
                 let x = get(0)?;
@@ -781,7 +799,7 @@ impl OnnxExecutor {
                 return Err(ExecError::UnsupportedOp(format!(
                     "ONNX op '{}' (node '{}') is not implemented. \
                      TensorWarp supports: Add, Sub, Mul, Div, MatMul, Gemm, Conv, ConvTranspose, \
-                     BatchNorm, LayerNorm, GroupNorm, MaxPool, AvgPool, GlobalAvgPool, \
+                     BatchNorm, InstanceNorm, LayerNorm, GroupNorm, MaxPool, AvgPool, GlobalAvgPool, \
                      Relu, Sigmoid, Tanh, Gelu, Silu, LeakyRelu, Clip, Softmax, \
                      Reshape, Flatten, Transpose, Concat, Reduce*, Resize, Identity, Dropout",
                     other, node.name
