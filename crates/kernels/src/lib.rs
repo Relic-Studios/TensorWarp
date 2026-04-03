@@ -16,6 +16,7 @@ pub mod autotune;
 pub mod bench;
 pub mod builder;
 pub mod cache;
+pub mod calibrate;
 pub mod conv;
 pub mod cublas_bench;
 pub mod cuda_graph;

@@ -141,7 +141,7 @@ impl GenerationEngine {
                 // Argmax on CPU (simple and correct)
                 scaled.iter()
                     .enumerate()
-                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                     .map(|(idx, _)| idx as i32)
                     .unwrap_or(0)
             } else {
@@ -311,7 +311,7 @@ impl GenerationEngine {
             // Greedy selection
             let next_token = scaled.iter()
                 .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(idx, _)| idx as i32)
                 .unwrap_or(0);
 
@@ -390,7 +390,7 @@ impl GenerationEngine {
 
             let next_token = scaled.iter()
                 .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(idx, _)| idx as i32)
                 .unwrap_or(0);
 
@@ -651,7 +651,7 @@ impl QuantizedGenerationEngine {
 
             let next_token = scaled.iter()
                 .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(idx, _)| idx as i32)
                 .unwrap_or(0);
 

@@ -183,6 +183,20 @@ fn cmd_bench() {
     println!("  Fused (add_gelu):     {:.2}ms", fused.as_secs_f64() * 1000.0 / iters as f64);
     println!("  Speedup:              {:.2}x", unfused.as_secs_f64() / fused.as_secs_f64());
 
+    // GEMM sweep (F32 vs FP16 vs Q4_0)
+    println!("\n--- GEMM Throughput Sweep ---");
+    match warp_kernels::bench::bench_gemm_sweep(&dev) {
+        Ok(report) => println!("{report}"),
+        Err(e) => println!("  Error: {e}"),
+    }
+
+    // AutoFuse benchmark
+    println!();
+    match warp_kernels::bench::bench_autofuse(&dev) {
+        Ok(report) => println!("{report}"),
+        Err(e) => println!("  AutoFuse error: {e}"),
+    }
+
     println!("\n{}", cache.stats());
 }
 
