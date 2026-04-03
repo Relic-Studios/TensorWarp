@@ -739,8 +739,52 @@ impl OnnxExecutor {
                 owned.insert(out_name, out);
             }
 
+            // ── Unsqueeze with axes ───────────────────────────
+            "Unsqueeze" => {
+                let x = get(0)?;
+                // Unsqueeze just adds dimensions of size 1 — data doesn't change
+                let data = device.dtoh(&x.data)?;
+                let mut new_dims: Vec<usize> = x.shape.dims().iter()
+                    .map(|d| d.static_val().unwrap_or(1)).collect();
+
+                // Get axes from input 1 (ONNX opset 13+) or attribute
+                if node.inputs.len() >= 2 {
+                    if let Ok(axes_t) = get(1) {
+                        let axes = axes_t.to_host(device)?;
+                        for &ax in &axes {
+                            let ax = if ax < 0.0 { new_dims.len() as isize + ax as isize } else { ax as isize };
+                            if ax >= 0 { new_dims.insert(ax as usize, 1); }
+                        }
+                    }
+                } else {
+                    let axes = node.get_ints("axes");
+                    for &ax in &axes {
+                        let ax = if ax < 0 { new_dims.len() as i64 + ax } else { ax };
+                        if ax >= 0 { new_dims.insert(ax as usize, 1); }
+                    }
+                }
+
+                let out = GpuTensor::from_host(device, &data,
+                    Shape::from_static(&new_dims), DType::F32)?;
+                owned.insert(out_name, out);
+            }
+
+            // ── Squeeze with axes ────────────────────────────
+            "Squeeze" => {
+                let x = get(0)?;
+                let data = device.dtoh(&x.data)?;
+                let dims: Vec<usize> = x.shape.dims().iter()
+                    .map(|d| d.static_val().unwrap_or(1))
+                    .filter(|&d| d != 1)  // remove all size-1 dims
+                    .collect();
+                let new_dims = if dims.is_empty() { vec![1] } else { dims };
+                let out = GpuTensor::from_host(device, &data,
+                    Shape::from_static(&new_dims), DType::F32)?;
+                owned.insert(out_name, out);
+            }
+
             // ── Reshape / Flatten — zero-copy ─────────────────
-            "Reshape" | "Flatten" | "Squeeze" | "Unsqueeze" => {
+            "Reshape" | "Flatten" => {
                 // Zero-copy: just flatten shape, underlying GPU memory unchanged
                 let x = get(0)?;
                 let numel = x.numel;

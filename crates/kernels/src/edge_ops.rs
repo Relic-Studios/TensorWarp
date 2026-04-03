@@ -433,6 +433,80 @@ mod tests {
         Some((WarpDevice::new(0).ok()?, KernelCache::new()))
     }
 
+// ── Conv3D (video models) ───────────────────────────────────────
+
+const CONV3D_SRC: &str = r#"
+extern "C" __global__ void warp_conv3d(
+    float *out,
+    const float *input,     // [C_in, D, H, W]
+    const float *weight,    // [C_out, C_in, kD, kH, kW]
+    unsigned int C_in, unsigned int C_out,
+    unsigned int D, unsigned int H, unsigned int W,
+    unsigned int kD, unsigned int kH, unsigned int kW,
+    unsigned int sD, unsigned int sH, unsigned int sW,
+    unsigned int pD, unsigned int pH, unsigned int pW,
+    unsigned int D_out, unsigned int H_out, unsigned int W_out
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = C_out * D_out * H_out * W_out;
+    if (idx >= total) return;
+
+    unsigned int ow = idx % W_out;
+    unsigned int oh = (idx / W_out) % H_out;
+    unsigned int od = (idx / (W_out * H_out)) % D_out;
+    unsigned int co = idx / (D_out * H_out * W_out);
+
+    float sum = 0.0f;
+    for (unsigned int ci = 0; ci < C_in; ci++) {
+        for (unsigned int kd = 0; kd < kD; kd++) {
+            for (unsigned int kh = 0; kh < kH; kh++) {
+                for (unsigned int kw = 0; kw < kW; kw++) {
+                    int id = (int)(od * sD + kd) - (int)pD;
+                    int ih = (int)(oh * sH + kh) - (int)pH;
+                    int iw = (int)(ow * sW + kw) - (int)pW;
+                    if (id >= 0 && id < (int)D && ih >= 0 && ih < (int)H && iw >= 0 && iw < (int)W) {
+                        sum += input[ci*D*H*W + id*H*W + ih*W + iw] *
+                               weight[co*C_in*kD*kH*kW + ci*kD*kH*kW + kd*kH*kW + kh*kW + kw];
+                    }
+                }
+            }
+        }
+    }
+    out[idx] = sum;
+}
+"#;
+
+/// Conv3D for video models (VideoMAE, SlowFast, etc.)
+pub fn conv3d(
+    cache: &KernelCache, device: &WarpDevice,
+    input: &GpuTensor<f32>, weight: &GpuTensor<f32>,
+    output: &mut GpuTensor<f32>,
+    c_in: u32, c_out: u32,
+    d: u32, h: u32, w: u32,
+    kd: u32, kh: u32, kw: u32,
+    sd: u32, sh: u32, sw: u32,
+    pd: u32, ph: u32, pw: u32,
+) -> Result<(), DeviceError> {
+    let d_out = (d + 2*pd - kd) / sd + 1;
+    let h_out = (h + 2*ph - kh) / sh + 1;
+    let w_out = (w + 2*pw - kw) / sw + 1;
+    let f = cache.get_or_compile(device, CONV3D_SRC, "warp_conv3d")?;
+    let total = c_out * d_out * h_out * w_out;
+    let cfg = LaunchConfig::for_num_elems(total);
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut output.data).arg(&input.data).arg(&weight.data)
+            .arg(&c_in).arg(&c_out)
+            .arg(&d).arg(&h).arg(&w)
+            .arg(&kd).arg(&kh).arg(&kw)
+            .arg(&sd).arg(&sh).arg(&sw)
+            .arg(&pd).arg(&ph).arg(&pw)
+            .arg(&d_out).arg(&h_out).arg(&w_out)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
     #[test]
     fn scatter_nd_test() {
         let (dev, cache) = match setup() {
