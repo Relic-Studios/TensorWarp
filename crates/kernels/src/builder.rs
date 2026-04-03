@@ -315,6 +315,105 @@ impl CompiledModel {
             self.weights.len(),
             self.weights.values().map(|w| w.size_bytes()).sum::<usize>() as f64 / 1e6)
     }
+
+    /// Run inference on a single input.
+    /// Returns the output tensor.
+    pub fn infer(
+        &self,
+        device: &WarpDevice,
+        input: &GpuTensor<f32>,
+    ) -> Result<GpuTensor<f32>, DeviceError> {
+        let mut tensors: HashMap<TensorId, GpuTensor<f32>> = HashMap::new();
+        let mut last_output = None;
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            match layer {
+                Layer::Input { .. } => {
+                    // Clone the input (we need owned data for downstream ops)
+                    let data = input.to_host(device)?;
+                    let t = GpuTensor::from_host(device, &data, input.shape.clone(), DType::F32)?;
+                    tensors.insert(TensorId(i), t);
+                }
+                Layer::Relu { input: inp } => {
+                    let x = tensors.get(inp).ok_or(DeviceError::Memory("missing input".into()))?;
+                    let mut out = GpuTensor::<f32>::zeros(device, x.shape.clone(), DType::F32)?;
+                    crate::ops::relu(&self.cache, device, x, &mut out)?;
+                    tensors.insert(TensorId(i), out);
+                }
+                Layer::Sigmoid { input: inp } => {
+                    let x = tensors.get(inp).ok_or(DeviceError::Memory("missing input".into()))?;
+                    let mut out = GpuTensor::<f32>::zeros(device, x.shape.clone(), DType::F32)?;
+                    crate::ops::sigmoid(&self.cache, device, x, &mut out)?;
+                    tensors.insert(TensorId(i), out);
+                }
+                Layer::Gelu { input: inp } => {
+                    let x = tensors.get(inp).ok_or(DeviceError::Memory("missing input".into()))?;
+                    let mut out = GpuTensor::<f32>::zeros(device, x.shape.clone(), DType::F32)?;
+                    crate::ops::gelu(&self.cache, device, x, &mut out)?;
+                    tensors.insert(TensorId(i), out);
+                }
+                Layer::Silu { input: inp } => {
+                    let x = tensors.get(inp).ok_or(DeviceError::Memory("missing input".into()))?;
+                    let mut out = GpuTensor::<f32>::zeros(device, x.shape.clone(), DType::F32)?;
+                    crate::ops::silu(&self.cache, device, x, &mut out)?;
+                    tensors.insert(TensorId(i), out);
+                }
+                Layer::Add { a, b } => {
+                    let ta = tensors.get(a).ok_or(DeviceError::Memory("missing A".into()))?;
+                    let tb = tensors.get(b).ok_or(DeviceError::Memory("missing B".into()))?;
+                    let mut out = GpuTensor::<f32>::zeros(device, ta.shape.clone(), DType::F32)?;
+                    crate::ops::add(&self.cache, device, ta, tb, &mut out)?;
+                    tensors.insert(TensorId(i), out);
+                }
+                Layer::Linear { input: inp, out_features } => {
+                    let x = tensors.get(inp).ok_or(DeviceError::Memory("missing input".into()))?;
+                    let w_key = format!("layer{i}_weight");
+                    let w = self.weights.get(&w_key).ok_or(DeviceError::Memory(format!("missing {w_key}")))?;
+                    // x: [batch, in_features], w: [in_features, out_features]
+                    let x_dims = x.shape.dims();
+                    let k = x_dims.last().and_then(|d| d.static_val()).unwrap_or(x.numel) as u32;
+                    let m = (x.numel / k as usize) as u32;
+                    let n = *out_features;
+                    let mut out = GpuTensor::<f32>::zeros(device,
+                        Shape::from_static(&[m as usize, n as usize]), DType::F32)?;
+                    crate::ops::gemm(&self.cache, device, x, w, &mut out, m, n, k)?;
+                    tensors.insert(TensorId(i), out);
+                }
+                Layer::GlobalAvgPool { input: inp } => {
+                    let x = tensors.get(inp).ok_or(DeviceError::Memory("missing input".into()))?;
+                    let dims = x.shape.dims();
+                    let c = dims.get(1).and_then(|d| d.static_val()).unwrap_or(x.numel) as u32;
+                    let spatial = if dims.len() > 2 {
+                        dims[2..].iter().map(|d| d.static_val().unwrap_or(1) as u32).product()
+                    } else { 1u32 };
+                    let batch = x.numel / (c * spatial) as usize;
+                    let mut out = GpuTensor::<f32>::zeros(device,
+                        Shape::from_static(&[batch, c as usize]), DType::F32)?;
+                    crate::conv::global_avg_pool(&self.cache, device, x, &mut out, c, spatial)?;
+                    tensors.insert(TensorId(i), out);
+                }
+                Layer::Softmax { input: inp } => {
+                    let x = tensors.get(inp).ok_or(DeviceError::Memory("missing input".into()))?;
+                    let dims = x.shape.dims();
+                    let cols = dims.last().and_then(|d| d.static_val()).unwrap_or(x.numel) as u32;
+                    let rows = (x.numel / cols as usize) as u32;
+                    let mut out = GpuTensor::<f32>::zeros(device, x.shape.clone(), DType::F32)?;
+                    crate::sampling::softmax(&self.cache, device, x, &mut out, rows, cols)?;
+                    tensors.insert(TensorId(i), out);
+                }
+                Layer::Output { input: inp, .. } => {
+                    last_output = Some(*inp);
+                }
+                _ => {
+                    // Conv2D, BatchNorm, MaxPool etc need more shape tracking
+                    // For now, pass through from previous layer
+                }
+            }
+        }
+
+        let out_id = last_output.ok_or(DeviceError::Memory("no output defined".into()))?;
+        tensors.remove(&out_id).ok_or(DeviceError::Memory("output tensor not found".into()))
+    }
 }
 
 #[cfg(test)]
@@ -344,7 +443,6 @@ mod tests {
     fn builder_classifier() {
         let mut b = ModelBuilder::new();
 
-        // Simple classifier: Conv → ReLU → Pool → Linear → Softmax
         let input = b.input("image", &[1, 3, 32, 32]);
         let conv = b.conv2d(input, 32, 3, 1, 1);
         let relu = b.relu(conv);
@@ -354,5 +452,40 @@ mod tests {
         b.output("probs", probs);
 
         println!("{}", b.summary());
+    }
+
+    #[test]
+    fn builder_mlp_inference() {
+        let dev = match crate::device::WarpDevice::new(0) {
+            Ok(d) => d,
+            Err(_) => { println!("No CUDA, skipping"); return; }
+        };
+
+        // Build: Input(4) → ReLU → Linear(4→8) → Sigmoid → Output
+        let mut b = ModelBuilder::new();
+        let input = b.input("x", &[1, 4]);
+        let relu = b.relu(input);
+        let fc = b.linear(relu, 8);
+        let sig = b.sigmoid(fc);
+        b.output("y", sig);
+
+        println!("{}", b.summary());
+
+        let model = b.build(&dev, Precision::FP32).unwrap();
+        println!("{}", model.info());
+
+        // Run inference
+        let input_data = vec![1.0f32, -0.5, 2.0, -1.0];
+        let input_tensor = GpuTensor::from_host(&dev, &input_data,
+            Shape::from_static(&[1, 4]), DType::F32).unwrap();
+
+        let output = model.infer(&dev, &input_tensor).unwrap();
+        dev.synchronize().unwrap();
+
+        let result = output.to_host(&dev).unwrap();
+        println!("Builder MLP output: {:?}", result);
+        assert!(result.iter().all(|v| v.is_finite()), "Output has NaN!");
+        assert!(result.iter().all(|v| *v >= 0.0 && *v <= 1.0), "Sigmoid output should be in [0,1]!");
+        println!("PASSED: Builder model produces valid sigmoid output!");
     }
 }
