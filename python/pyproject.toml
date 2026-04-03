@@ -1,0 +1,17 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "tensorwarp"
+version = "0.1.0"
+description = "A self-optimizing GPU inference engine — faster than TensorRT"
+requires-python = ">=3.8"
+license = {text = "MIT OR Apache-2.0"}
+dependencies = ["numpy>=1.20"]
+
+[project.urls]
+Repository = "https://github.com/Relic-Studios/TensorWarp"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
