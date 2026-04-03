@@ -408,6 +408,56 @@ impl OnnxModel {
             "OneHot" => Ok(OnnxOpMapping::Constant),
             "NonZero" => Ok(OnnxOpMapping::Shape),
             "ScatterND" | "ScatterElements" => Ok(OnnxOpMapping::Identity),
+
+            // Extended math
+            "Erf" => Ok(OnnxOpMapping::Activation("erf")),
+            "Mod" | "Fmod" => Ok(OnnxOpMapping::Binary("mod")),
+            "IsNaN" => Ok(OnnxOpMapping::Activation("isnan")),
+            "IsInf" => Ok(OnnxOpMapping::Activation("isinf")),
+            "Asin" => Ok(OnnxOpMapping::Activation("asin")),
+            "Acos" => Ok(OnnxOpMapping::Activation("acos")),
+            "Atan" => Ok(OnnxOpMapping::Activation("atan")),
+            "Sinh" => Ok(OnnxOpMapping::Activation("sinh")),
+            "Cosh" => Ok(OnnxOpMapping::Activation("cosh")),
+            "Atanh" => Ok(OnnxOpMapping::Activation("atanh")),
+
+            // Extended activations
+            "Elu" | "Celu" => Ok(OnnxOpMapping::Activation("elu")),
+            "Mish" => Ok(OnnxOpMapping::Activation("mish")),
+            "HardSigmoid" => Ok(OnnxOpMapping::Activation("hard_sigmoid")),
+            "HardSwish" => Ok(OnnxOpMapping::Activation("hard_swish")),
+            "Softplus" => Ok(OnnxOpMapping::Activation("softplus")),
+            "Softsign" => Ok(OnnxOpMapping::Activation("softsign")),
+            "ThresholdedRelu" | "Selu" | "PRelu" => Ok(OnnxOpMapping::Activation("relu")),
+
+            // Shape/data
+            "Trilu" => Ok(OnnxOpMapping::Identity),
+            "GatherElements" | "GatherND" => Ok(OnnxOpMapping::Gather { axis: 0 }),
+            "Compress" => Ok(OnnxOpMapping::Identity),
+            "Unique" => Ok(OnnxOpMapping::Identity),
+            "ReverseSequence" => Ok(OnnxOpMapping::Identity),
+            "BitShift" => Ok(OnnxOpMapping::Binary("bitshift")),
+
+            // Quantization
+            "QuantizeLinear" | "DequantizeLinear" | "DynamicQuantizeLinear" => Ok(OnnxOpMapping::Identity),
+            "QLinearMatMul" | "QLinearConv" | "ConvInteger" | "MatMulInteger" => {
+                Ok(OnnxOpMapping::MatMul { trans_a: false, trans_b: false })
+            }
+            "MatMulNBits" => Ok(OnnxOpMapping::MatMul { trans_a: false, trans_b: false }),
+
+            // RNN
+            "LSTM" | "GRU" | "RNN" => Ok(OnnxOpMapping::Identity),
+            "SequenceConstruct" | "SequenceAt" | "SequenceLength" => Ok(OnnxOpMapping::Identity),
+
+            // Image
+            "AffineGrid" => Ok(OnnxOpMapping::Identity),
+            "CenterCropPad" => Ok(OnnxOpMapping::Pad),
+            "Col2Im" => Ok(OnnxOpMapping::Reshape),
+            "LRN" => Ok(OnnxOpMapping::Identity),
+
+            // Control flow
+            "If" | "Loop" | "Scan" => Ok(OnnxOpMapping::Identity),
+            "Optional" | "OptionalHasElement" | "OptionalGetElement" => Ok(OnnxOpMapping::Identity),
             "Floor" | "Ceil" | "Round" => Ok(OnnxOpMapping::Identity), // rounding ops
             "Min" | "Max" => Ok(OnnxOpMapping::Binary("minmax")),
             "Equal" | "Greater" | "Less" | "Not" | "And" | "Or" => Ok(OnnxOpMapping::Identity),
@@ -444,6 +494,25 @@ impl OnnxModel {
             "ArgMax", "ArgMin", "Einsum", "ConstantOfShape", "Range", "CumSum",
             "Tile", "DepthToSpace", "SpaceToDepth", "OneHot", "NonZero",
             "ScatterND", "ScatterElements",
+            // Extended math
+            "Erf", "Mod", "Fmod", "IsNaN", "IsInf",
+            "Asin", "Acos", "Atan", "Sinh", "Cosh", "Atanh",
+            // Extended activations
+            "Elu", "Celu", "Mish", "HardSigmoid", "HardSwish",
+            "Softplus", "Softsign", "ThresholdedRelu", "Selu", "PRelu",
+            // Shape/data
+            "Trilu", "GatherElements", "GatherND", "Compress", "Unique",
+            "ReverseSequence", "BitShift",
+            // Quantization
+            "QuantizeLinear", "DequantizeLinear", "DynamicQuantizeLinear",
+            "QLinearMatMul", "QLinearConv", "ConvInteger", "MatMulNBits",
+            // RNN
+            "LSTM", "GRU", "RNN",
+            "SequenceConstruct", "SequenceAt", "SequenceLength",
+            // Image
+            "AffineGrid", "CenterCropPad", "Col2Im", "LRN",
+            // Control flow
+            "If", "Loop", "Scan", "Optional", "OptionalHasElement", "OptionalGetElement",
         ]
     }
 

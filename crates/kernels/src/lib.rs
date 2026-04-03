@@ -25,6 +25,7 @@ pub mod device;
 pub mod edge_ops;
 pub mod elementwise;
 pub mod engine;
+pub mod extended_ops;
 pub mod fp16;
 pub mod gather;
 pub mod gemm;
