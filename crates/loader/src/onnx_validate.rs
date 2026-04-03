@@ -1,0 +1,189 @@
+//! ONNX model validation — verify TensorWarp produces correct results.
+//!
+//! Creates test models programmatically and verifies output against
+//! CPU reference implementations.
+
+use std::collections::HashMap;
+
+use warp_ir::{DType, Shape};
+use warp_kernels::device::WarpDevice;
+use warp_kernels::tensor::GpuTensor;
+
+use crate::onnx::*;
+use crate::onnx_exec::*;
+
+/// Build a simple MLP: Linear(4→8) → ReLU → Linear(8→3)
+pub fn build_mlp_model() -> OnnxModel {
+    let mut inits = HashMap::new();
+
+    // W1: [4, 8], B1: [8]
+    let w1: Vec<f32> = (0..32).map(|i| ((i * 7 + 3) % 20) as f32 * 0.1 - 1.0).collect();
+    let b1: Vec<f32> = (0..8).map(|i| i as f32 * 0.05 - 0.2).collect();
+    inits.insert("w1".into(), OnnxTensor {
+        name: "w1".into(), dtype: OnnxDType::Float,
+        shape: vec![4, 8], raw_data: w1.iter().flat_map(|f| f.to_le_bytes()).collect(),
+    });
+    inits.insert("b1".into(), OnnxTensor {
+        name: "b1".into(), dtype: OnnxDType::Float,
+        shape: vec![8], raw_data: b1.iter().flat_map(|f| f.to_le_bytes()).collect(),
+    });
+
+    // W2: [8, 3], B2: [3]
+    let w2: Vec<f32> = (0..24).map(|i| ((i * 11 + 5) % 20) as f32 * 0.1 - 1.0).collect();
+    let b2: Vec<f32> = vec![0.1, -0.1, 0.0];
+    inits.insert("w2".into(), OnnxTensor {
+        name: "w2".into(), dtype: OnnxDType::Float,
+        shape: vec![8, 3], raw_data: w2.iter().flat_map(|f| f.to_le_bytes()).collect(),
+    });
+    inits.insert("b2".into(), OnnxTensor {
+        name: "b2".into(), dtype: OnnxDType::Float,
+        shape: vec![3], raw_data: b2.iter().flat_map(|f| f.to_le_bytes()).collect(),
+    });
+
+    OnnxModel {
+        inputs: vec![OnnxIO { name: "input".into(), dtype: Some(OnnxDType::Float), shape: vec![1, 4] }],
+        outputs: vec![OnnxIO { name: "output".into(), dtype: Some(OnnxDType::Float), shape: vec![1, 3] }],
+        nodes: vec![
+            OnnxNode { name: "gemm1".into(), op_type: "Gemm".into(),
+                inputs: vec!["input".into(), "w1".into(), "b1".into()],
+                outputs: vec!["hidden".into()], attrs: HashMap::new() },
+            OnnxNode { name: "relu".into(), op_type: "Relu".into(),
+                inputs: vec!["hidden".into()],
+                outputs: vec!["relu_out".into()], attrs: HashMap::new() },
+            OnnxNode { name: "gemm2".into(), op_type: "Gemm".into(),
+                inputs: vec!["relu_out".into(), "w2".into(), "b2".into()],
+                outputs: vec!["output".into()], attrs: HashMap::new() },
+        ],
+        initializers: inits,
+        ir_version: 8, opset_version: 17, producer: "test".into(),
+    }
+}
+
+/// CPU reference: MLP forward pass.
+fn cpu_mlp(input: &[f32], w1: &[f32], b1: &[f32], w2: &[f32], b2: &[f32]) -> Vec<f32> {
+    // hidden = input @ w1 + b1
+    let mut hidden = vec![0.0f32; 8];
+    for j in 0..8 {
+        hidden[j] = b1[j];
+        for i in 0..4 {
+            hidden[j] += input[i] * w1[i * 8 + j];
+        }
+    }
+    // relu
+    for v in &mut hidden {
+        *v = v.max(0.0);
+    }
+    // output = hidden @ w2 + b2
+    let mut output = vec![0.0f32; 3];
+    for j in 0..3 {
+        output[j] = b2[j];
+        for i in 0..8 {
+            output[j] += hidden[i] * w2[i * 3 + j];
+        }
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_mlp_model() {
+        let dev = match WarpDevice::new(0) {
+            Ok(d) => d,
+            Err(_) => { println!("No CUDA, skipping"); return; }
+        };
+
+        let model = build_mlp_model();
+        println!("{}", model.summary());
+
+        let exec = OnnxExecutor::new(&dev, &model).unwrap();
+
+        // Test input
+        let input_data = vec![0.5f32, -0.3, 0.8, -0.1];
+        let input = GpuTensor::from_host(&dev, &input_data,
+            Shape::from_static(&[1, 4]), DType::F32).unwrap();
+
+        let outputs = exec.run(&dev, &[("input", &input)]).unwrap();
+        dev.synchronize().unwrap();
+
+        let gpu_result = outputs["output"].to_host(&dev).unwrap();
+
+        // CPU reference
+        let w1 = model.initializers["w1"].to_f32();
+        let b1 = model.initializers["b1"].to_f32();
+        let w2 = model.initializers["w2"].to_f32();
+        let b2 = model.initializers["b2"].to_f32();
+        let cpu_result = cpu_mlp(&input_data, &w1, &b1, &w2, &b2);
+
+        println!("\n=== MLP Validation ===");
+        println!("  Input: {:?}", input_data);
+        println!("  GPU output:  {:?}", gpu_result);
+        println!("  CPU output:  {:?}", cpu_result);
+
+        let max_err: f32 = gpu_result.iter().zip(cpu_result.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        println!("  Max error: {max_err:.6}");
+
+        assert!(max_err < 0.01, "GPU vs CPU mismatch: {max_err}");
+        println!("  PASSED: GPU matches CPU reference!");
+    }
+
+    #[test]
+    fn validate_conv_relu_pool() {
+        let dev = match WarpDevice::new(0) {
+            Ok(d) => d,
+            Err(_) => { println!("No CUDA, skipping"); return; }
+        };
+
+        // Build Conv → ReLU → GlobalAvgPool → FC model
+        let mut inits = HashMap::new();
+
+        // Conv weight: [2, 1, 3, 3] (2 output channels, 1 input, 3x3 kernel)
+        let conv_w: Vec<f32> = (0..18).map(|i| ((i * 7 + 3) % 20) as f32 * 0.1 - 1.0).collect();
+        inits.insert("conv_w".into(), OnnxTensor {
+            name: "conv_w".into(), dtype: OnnxDType::Float,
+            shape: vec![2, 1, 3, 3], raw_data: conv_w.iter().flat_map(|f| f.to_le_bytes()).collect(),
+        });
+
+        let model = OnnxModel {
+            inputs: vec![OnnxIO { name: "input".into(), dtype: Some(OnnxDType::Float), shape: vec![1, 1, 8, 8] }],
+            outputs: vec![OnnxIO { name: "pool_out".into(), dtype: Some(OnnxDType::Float), shape: vec![1, 2, 1, 1] }],
+            nodes: vec![
+                OnnxNode { name: "conv".into(), op_type: "Conv".into(),
+                    inputs: vec!["input".into(), "conv_w".into()],
+                    outputs: vec!["conv_out".into()],
+                    attrs: [("kernel_shape".into(), OnnxAttr::Ints(vec![3, 3])),
+                            ("pads".into(), OnnxAttr::Ints(vec![1, 1, 1, 1]))].into_iter().collect() },
+                OnnxNode { name: "relu".into(), op_type: "Relu".into(),
+                    inputs: vec!["conv_out".into()],
+                    outputs: vec!["relu_out".into()], attrs: HashMap::new() },
+                OnnxNode { name: "pool".into(), op_type: "GlobalAveragePool".into(),
+                    inputs: vec!["relu_out".into()],
+                    outputs: vec!["pool_out".into()], attrs: HashMap::new() },
+            ],
+            initializers: inits,
+            ir_version: 8, opset_version: 17, producer: "test".into(),
+        };
+
+        let exec = OnnxExecutor::new(&dev, &model).unwrap();
+
+        let input_data: Vec<f32> = (0..64).map(|i| ((i * 13 + 7) % 100) as f32 * 0.01).collect();
+        let input = GpuTensor::from_host(&dev, &input_data,
+            Shape::from_static(&[1, 1, 8, 8]), DType::F32).unwrap();
+
+        let outputs = exec.run(&dev, &[("input", &input)]).unwrap();
+        dev.synchronize().unwrap();
+
+        let result = outputs["pool_out"].to_host(&dev).unwrap();
+
+        println!("\n=== Conv→ReLU→Pool Validation ===");
+        println!("  Input:  [1, 1, 8, 8]");
+        println!("  Output: {:?}", result);
+        assert!(result.iter().all(|v| v.is_finite()), "Output has NaN/Inf!");
+        assert!(result.iter().any(|v| *v != 0.0), "Output is all zeros!");
+        println!("  PASSED: Conv→ReLU→Pool pipeline produces valid output!");
+    }
+}
