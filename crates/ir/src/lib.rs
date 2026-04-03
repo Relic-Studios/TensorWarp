@@ -15,7 +15,8 @@ mod shape;
 pub use dtype::DType;
 pub use graph::{Graph, Layout, Node, NodeId, ValueId, ValueInfo};
 pub use op::{
-    Activation, AttentionMask, BinaryOp, ConstantData, Op, ReduceOp, UnaryOp,
+    Activation, AttentionMask, BinaryOp, ConstantData, GridPaddingMode,
+    InterpolationMode, Op, PadMode, PoolMode, ReduceOp, ResizeMode, UnaryOp,
 };
 pub use shape::{Dim, Shape};
 

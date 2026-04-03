@@ -8,6 +8,7 @@ description = "Model weight loading for TensorWarp (SafeTensors, GGUF)"
 [dependencies]
 warp-ir.workspace = true
 warp-kernels.workspace = true
+warp-optimizer.workspace = true
 cudarc.workspace = true
 safetensors.workspace = true
 memmap2.workspace = true

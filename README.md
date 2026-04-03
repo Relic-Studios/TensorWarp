@@ -184,11 +184,11 @@ let outputs = exec.run(&engine.device, &[("input", &input_tensor)])?;
 | `warp-optimizer` | Pattern fusion + auto-fusion engine | ~1K |
 | `warp-codegen` | PTX + Metal code generation | ~0.8K |
 | `warp-runtime` | Tiered compilation, memory, scheduling | ~1.5K |
-| `warp-kernels` | 105 CUDA kernels, 37 modules | ~17K |
-| `warp-loader` | SafeTensors, LLaMA, ONNX import + executor + validation | ~4K |
+| `warp-kernels` | 139 CUDA kernels, 43 modules | ~20K |
+| `warp-loader` | SafeTensors, LLaMA, ONNX import + executor + compiler + validation | ~5K |
 | `tensorwarp` | CLI entry point | ~0.3K |
 
-**Total: ~25K lines of Rust, 105 CUDA kernels, 177 tests**
+**Total: ~30K lines of Rust + Python, 139 CUDA kernels, 200+ tests**
 
 ## Key Optimizations
 

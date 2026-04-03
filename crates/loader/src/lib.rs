@@ -12,6 +12,7 @@
 pub mod safetensors_loader;
 pub mod llama;
 pub mod onnx;
+pub mod onnx_compile;
 pub mod onnx_exec;
 pub mod onnx_validate;
 

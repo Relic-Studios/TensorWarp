@@ -593,6 +593,7 @@ dependencies = [
  "thiserror",
  "warp-ir",
  "warp-kernels",
+ "warp-optimizer",
 ]
 
 [[package]]
