@@ -432,26 +432,24 @@ pub fn f16_rope(
 
 // ── FP16 Scaled Dot-Product Attention ───────────────────────────
 
+// FP16 attention with shared memory reduction — handles any head_dim.
+// Same online softmax approach as attention_ext.rs but with FP16 I/O.
 const F16_ATTENTION_SRC: &str = r#"
 #include <cuda_fp16.h>
 extern "C" __global__ void warp_f16_attention(
-    half *out,            // [B, N, D]
-    const half *Q,        // [B, N, D]
-    const half *K,        // [B, N, D]
-    const half *V,        // [B, N, D]
+    half *out,
+    const half *Q, const half *K, const half *V,
     unsigned int B, unsigned int N, unsigned int D,
     float scale, unsigned int causal
 ) {
-    // Simple attention: each thread block handles one (batch, query_pos)
+    extern __shared__ float smem[];
+    float *dot_buf = smem;
+
     unsigned int b = blockIdx.y;
     unsigned int q_pos = blockIdx.x;
     unsigned int d = threadIdx.x;
-    if (b >= B || q_pos >= N || d >= D) return;
+    if (b >= B || q_pos >= N) return;
 
-    const half *q_row = Q + b * N * D + q_pos * D;
-    float q_val = __half2float(q_row[d]);
-
-    // Compute attention scores and weighted sum
     float max_score = -1e30f;
     float sum_exp = 0.0f;
     float out_val = 0.0f;
@@ -459,24 +457,38 @@ extern "C" __global__ void warp_f16_attention(
     for (unsigned int k_pos = 0; k_pos < N; k_pos++) {
         if (causal && k_pos > q_pos) break;
 
-        // Dot product Q[q_pos] · K[k_pos]
-        float score = 0.0f;
-        for (unsigned int dd = 0; dd < D; dd++) {
-            score += __half2float(Q[b*N*D + q_pos*D + dd]) *
-                     __half2float(K[b*N*D + k_pos*D + dd]);
+        // Parallel dot product with shared memory reduction
+        float partial = 0.0f;
+        if (d < D) {
+            partial = __half2float(Q[b*N*D + q_pos*D + d]) *
+                      __half2float(K[b*N*D + k_pos*D + d]);
         }
-        score *= scale;
+        dot_buf[d] = partial;
+        __syncthreads();
 
-        // Online softmax
+        // Reduce in shared memory
+        for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (d < stride) dot_buf[d] += dot_buf[d + stride];
+            __syncthreads();
+        }
+
+        float score = dot_buf[0] * scale;
+        __syncthreads();
+
+        // Online softmax + weighted V accumulation
         float new_max = fmaxf(max_score, score);
         float correction = expf(max_score - new_max);
         float weight = expf(score - new_max);
         sum_exp = sum_exp * correction + weight;
-        out_val = out_val * correction + weight * __half2float(V[b*N*D + k_pos*D + d]);
+        if (d < D) {
+            out_val = out_val * correction + weight * __half2float(V[b*N*D + k_pos*D + d]);
+        }
         max_score = new_max;
     }
 
-    out[b * N * D + q_pos * D + d] = __float2half(out_val / sum_exp);
+    if (d < D) {
+        out[b * N * D + q_pos * D + d] = __float2half(out_val / sum_exp);
+    }
 }
 "#;
 
@@ -496,10 +508,11 @@ pub fn f16_attention(
     let f = compile_fp16(cache, device, F16_ATTENTION_SRC, "warp_f16_attention")?;
     let scale = 1.0f32 / (head_dim as f32).sqrt();
     let causal_u32 = if causal { 1u32 } else { 0u32 };
+    let block_size = head_dim.next_power_of_two().min(1024);
     let cfg = LaunchConfig {
         grid_dim: (seq_len, batch, 1),
-        block_dim: (head_dim.min(1024), 1, 1),
-        shared_mem_bytes: 0,
+        block_dim: (block_size, 1, 1),
+        shared_mem_bytes: block_size * 4, // float dot_buf[block_size]
     };
     unsafe {
         launch_err!(device.stream.launch_builder(&f)

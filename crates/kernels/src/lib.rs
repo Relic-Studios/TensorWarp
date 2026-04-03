@@ -35,6 +35,7 @@ pub mod kv_cache;
 pub mod gemm_tc;
 pub mod gemm_v2;
 pub mod ops;
+pub mod profiler;
 pub mod quantize;
 pub mod rope;
 pub mod sampling;

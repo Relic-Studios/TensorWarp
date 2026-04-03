@@ -628,16 +628,26 @@ impl OnnxExecutor {
             }
 
             // ── Clip ──────────────────────────────────────────
+            // ONNX Clip(input, min, max): clamp values to [min, max].
+            // min/max are optional scalar inputs (inputs[1], inputs[2]).
+            // Missing or empty inputs default to -inf / +inf respectively.
             "Clip" => {
                 let x = get(0)?;
-                let lo = if node.inputs.len() >= 2 && !node.inputs[1].is_empty() {
-                    get(1).ok().and_then(|t| t.to_host(device).ok())
-                        .and_then(|v| v.first().copied()).unwrap_or(f32::NEG_INFINITY)
-                } else { f32::NEG_INFINITY };
-                let hi = if node.inputs.len() >= 3 && !node.inputs[2].is_empty() {
-                    get(2).ok().and_then(|t| t.to_host(device).ok())
-                        .and_then(|v| v.first().copied()).unwrap_or(f32::INFINITY)
-                } else { f32::INFINITY };
+
+                let read_scalar = |idx: usize, default: f32| -> f32 {
+                    if node.inputs.len() <= idx || node.inputs[idx].is_empty() {
+                        return default;
+                    }
+                    get(idx)
+                        .ok()
+                        .and_then(|t| t.to_host(device).ok())
+                        .and_then(|v| v.first().copied())
+                        .unwrap_or(default)
+                };
+
+                let lo = read_scalar(1, f32::NEG_INFINITY);
+                let hi = read_scalar(2, f32::INFINITY);
+
                 let mut out = GpuTensor::<f32>::zeros(device, x.shape.clone(), DType::F32)?;
                 warp_kernels::ops::clip(&self.cache, device, x, &mut out, lo, hi)?;
                 owned.insert(out_name, out);

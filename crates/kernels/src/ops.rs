@@ -1272,6 +1272,98 @@ pub fn fused_gemm_bias_silu(
     crate::gemm_tc::fused_gemm_bias_silu(cache, device, a, b, bias, out, m, n, k)
 }
 
+// ── InstanceNorm ────────────────────────────────────────────────
+// Like GroupNorm with num_groups = C (each channel normalized independently).
+// y = ((x - mean) / sqrt(var + eps)) * scale + bias
+// Mean/var computed per channel across spatial dims.
+
+const INSTANCENORM_SRC: &str = r#"
+extern "C" __global__ void warp_instancenorm(
+    float *out,
+    const float *x,         // [C, spatial]
+    const float *scale,     // [C]
+    const float *bias,      // [C]
+    unsigned int C,
+    unsigned int spatial,    // H * W
+    float eps
+) {
+    unsigned int c = blockIdx.x;
+    if (c >= C) return;
+
+    const float *x_ch = x + c * spatial;
+    float *out_ch = out + c * spatial;
+
+    // Compute mean for this channel
+    float sum = 0.0f;
+    for (unsigned int i = threadIdx.x; i < spatial; i += blockDim.x) {
+        sum += x_ch[i];
+    }
+
+    // Warp reduction for sum
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+    sum = __shfl_sync(0xffffffff, sum, 0);
+    float mean = sum / (float)spatial;
+
+    // Variance
+    float var_sum = 0.0f;
+    for (unsigned int i = threadIdx.x; i < spatial; i += blockDim.x) {
+        float diff = x_ch[i] - mean;
+        var_sum += diff * diff;
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        var_sum += __shfl_down_sync(0xffffffff, var_sum, offset);
+    var_sum = __shfl_sync(0xffffffff, var_sum, 0);
+    float inv_std = rsqrtf(var_sum / (float)spatial + eps);
+
+    // Normalize
+    float s = scale[c];
+    float b = bias[c];
+    for (unsigned int i = threadIdx.x; i < spatial; i += blockDim.x) {
+        out_ch[i] = (x_ch[i] - mean) * inv_std * s + b;
+    }
+}
+"#;
+
+/// Instance normalization. Each channel normalized independently (like GroupNorm with groups=C).
+/// Used by style transfer networks, pix2pix, CycleGAN.
+pub fn instancenorm(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    x: &GpuTensor<f32>,
+    scale: &GpuTensor<f32>,
+    bias: &GpuTensor<f32>,
+    out: &mut GpuTensor<f32>,
+    channels: u32,
+    spatial: u32,
+    eps: f32,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, INSTANCENORM_SRC, "warp_instancenorm")?;
+    let batch = x.numel as u32 / (channels * spatial);
+
+    for n in 0..batch {
+        let off = (n * channels) as usize * spatial as usize;
+        let cfg = LaunchConfig {
+            grid_dim: (channels, 1, 1),
+            block_dim: (32, 1, 1), // one warp per channel
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            launch_err!(device.stream.launch_builder(&f)
+                .arg(&mut out.data.slice_mut(off..))
+                .arg(&x.data.slice(off..))
+                .arg(&scale.data)
+                .arg(&bias.data)
+                .arg(&channels)
+                .arg(&spatial)
+                .arg(&eps)
+                .launch(cfg))?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

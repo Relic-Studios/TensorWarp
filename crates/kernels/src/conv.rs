@@ -271,6 +271,8 @@ impl Conv2dParams {
 /// weight: [C_out, C_in/groups, kH, kW]
 /// bias: optional [C_out]
 /// output: [N, C_out, out_H, out_W]
+///
+/// Automatically dispatches to the faster depthwise kernel when groups == in_channels.
 pub fn conv2d(
     cache: &KernelCache,
     device: &WarpDevice,
@@ -282,6 +284,11 @@ pub fn conv2d(
     h: u32,
     w: u32,
 ) -> Result<(), DeviceError> {
+    // Fast path: depthwise conv (groups == in_channels) avoids im2col+GEMM overhead
+    if params.groups == params.in_channels && params.in_channels == params.out_channels {
+        return depthwise_conv2d(cache, device, input, weight, bias, output, params, h, w);
+    }
+
     let batch = input.numel as u32 / (params.in_channels * h * w);
     let out_h = params.output_h(h);
     let out_w = params.output_w(w);
@@ -988,6 +995,118 @@ pub fn grid_sample(
                 .launch(cfg))?;
         }
     }
+    Ok(())
+}
+
+// ── Depthwise Conv2D ───────────────────────────────────────────
+// Specialized kernel for groups == in_channels (depthwise separable conv).
+// Each channel is convolved independently with its own filter.
+// Much faster than im2col+GEMM for the depthwise case since there is no
+// cross-channel work — just a small spatial convolution per channel.
+
+const DEPTHWISE_CONV2D_SRC: &str = r#"
+extern "C" __global__ void warp_depthwise_conv2d(
+    float *output,          // [C, out_H, out_W]
+    const float *input,     // [C, H, W]
+    const float *weight,    // [C, 1, kH, kW]
+    unsigned int C,
+    unsigned int H, unsigned int W,
+    unsigned int out_H, unsigned int out_W,
+    unsigned int kH, unsigned int kW,
+    unsigned int stride_h, unsigned int stride_w,
+    unsigned int pad_h, unsigned int pad_w,
+    unsigned int dil_h, unsigned int dil_w
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = C * out_H * out_W;
+    if (idx >= total) return;
+
+    unsigned int ow = idx % out_W;
+    unsigned int oh = (idx / out_W) % out_H;
+    unsigned int c = idx / (out_H * out_W);
+
+    const float *w_ch = weight + c * kH * kW;
+    const float *in_ch = input + c * H * W;
+
+    float sum = 0.0f;
+    for (unsigned int kh = 0; kh < kH; kh++) {
+        for (unsigned int kw = 0; kw < kW; kw++) {
+            int ih = (int)(oh * stride_h + kh * dil_h) - (int)pad_h;
+            int iw = (int)(ow * stride_w + kw * dil_w) - (int)pad_w;
+            if (ih >= 0 && ih < (int)H && iw >= 0 && iw < (int)W) {
+                sum += in_ch[(unsigned int)ih * W + (unsigned int)iw] * w_ch[kh * kW + kw];
+            }
+        }
+    }
+    output[idx] = sum;
+}
+"#;
+
+/// Depthwise Conv2D — specialized fast path for groups == in_channels.
+///
+/// input: [N, C, H, W]
+/// weight: [C, 1, kH, kW]
+/// bias: optional [C]
+/// output: [N, C, out_H, out_W]
+pub fn depthwise_conv2d(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    input: &GpuTensor<f32>,
+    weight: &GpuTensor<f32>,
+    bias: Option<&GpuTensor<f32>>,
+    output: &mut GpuTensor<f32>,
+    params: &Conv2dParams,
+    h: u32,
+    w: u32,
+) -> Result<(), DeviceError> {
+    let batch = input.numel as u32 / (params.in_channels * h * w);
+    let out_h = params.output_h(h);
+    let out_w = params.output_w(w);
+    let channels = params.in_channels; // == out_channels for depthwise
+
+    let f = cache.get_or_compile(device, DEPTHWISE_CONV2D_SRC, "warp_depthwise_conv2d")?;
+
+    for n in 0..batch {
+        let in_off = (n * channels) as usize * (h * w) as usize;
+        let out_off = (n * channels) as usize * (out_h * out_w) as usize;
+        let total = channels * out_h * out_w;
+        let cfg = LaunchConfig::for_num_elems(total);
+
+        unsafe {
+            launch_err!(device.stream.launch_builder(&f)
+                .arg(&mut output.data.slice_mut(out_off..))
+                .arg(&input.data.slice(in_off..))
+                .arg(&weight.data)
+                .arg(&channels)
+                .arg(&h).arg(&w)
+                .arg(&out_h).arg(&out_w)
+                .arg(&params.kernel_h).arg(&params.kernel_w)
+                .arg(&params.stride_h).arg(&params.stride_w)
+                .arg(&params.padding_h).arg(&params.padding_w)
+                .arg(&params.dilation_h).arg(&params.dilation_w)
+                .launch(cfg))?;
+        }
+    }
+
+    // Add bias if present
+    if let Some(bias) = bias {
+        let bias_f = cache.get_or_compile(device, BIAS_ADD_SRC, "warp_bias_add_spatial")?;
+        for n in 0..batch {
+            let spatial = out_h * out_w;
+            let offset = (n * channels) as usize * spatial as usize;
+            let total = channels * spatial;
+            let cfg = LaunchConfig::for_num_elems(total);
+            unsafe {
+                launch_err!(device.stream.launch_builder(&bias_f)
+                    .arg(&mut output.data.slice_mut(offset..))
+                    .arg(&bias.data)
+                    .arg(&channels)
+                    .arg(&spatial)
+                    .launch(cfg))?;
+            }
+        }
+    }
+
     Ok(())
 }
 
