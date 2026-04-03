@@ -320,6 +320,79 @@ pub fn resize_cubic(
 // Computes: h[t] = A * h[t-1] + B * x[t], y[t] = C * h[t]
 // This is a sequential scan but can be parallelized with associative scan.
 
+// ── GPU Parallel Scan (Blelloch) ────────────────────────────────
+// Parallel prefix sum for Mamba's associative scan.
+// Uses the Blelloch algorithm: O(N) work, O(log N) depth.
+
+const PARALLEL_SCAN_SRC: &str = r#"
+extern "C" __global__ void warp_parallel_scan(
+    float *out, const float *input, unsigned int n
+) {
+    extern __shared__ float temp[];
+    unsigned int tid = threadIdx.x;
+    unsigned int offset = 1;
+
+    // Load into shared memory
+    if (2*tid < n) temp[2*tid] = input[2*tid]; else temp[2*tid] = 0;
+    if (2*tid+1 < n) temp[2*tid+1] = input[2*tid+1]; else temp[2*tid+1] = 0;
+
+    // Up-sweep (reduce)
+    for (unsigned int d = n >> 1; d > 0; d >>= 1) {
+        __syncthreads();
+        if (tid < d) {
+            unsigned int ai = offset*(2*tid+1)-1;
+            unsigned int bi = offset*(2*tid+2)-1;
+            if (bi < n) temp[bi] += temp[ai];
+        }
+        offset *= 2;
+    }
+
+    // Clear last element
+    if (tid == 0) temp[n-1] = 0;
+
+    // Down-sweep
+    for (unsigned int d = 1; d < n; d *= 2) {
+        offset >>= 1;
+        __syncthreads();
+        if (tid < d) {
+            unsigned int ai = offset*(2*tid+1)-1;
+            unsigned int bi = offset*(2*tid+2)-1;
+            if (bi < n) {
+                float t = temp[ai];
+                temp[ai] = temp[bi];
+                temp[bi] += t;
+            }
+        }
+    }
+    __syncthreads();
+
+    // Write back (inclusive scan = exclusive + input)
+    if (2*tid < n) out[2*tid] = temp[2*tid] + input[2*tid];
+    if (2*tid+1 < n) out[2*tid+1] = temp[2*tid+1] + input[2*tid+1];
+}
+"#;
+
+/// GPU parallel prefix sum (inclusive scan).
+pub fn parallel_scan(
+    cache: &KernelCache, device: &WarpDevice,
+    input: &GpuTensor<f32>, output: &mut GpuTensor<f32>,
+    n: u32,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, PARALLEL_SCAN_SRC, "warp_parallel_scan")?;
+    let threads = (n / 2).next_power_of_two().min(512);
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: n * 4,
+    };
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut output.data).arg(&input.data).arg(&n)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
 /// Simple sequential selective scan for Mamba inference.
 /// For now, CPU-side (scan is inherently sequential at batch=1).
 pub fn selective_scan(

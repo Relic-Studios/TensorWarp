@@ -10,6 +10,21 @@ members = [
     "crates/cli",
 ]
 
+[package]
+name = "tensorwarp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TensorWarp GPU inference engine"
+
+[dependencies]
+warp-ir.workspace = true
+warp-kernels.workspace = true
+warp-loader.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
 [workspace.package]
 version = "0.1.0"
 edition = "2021"

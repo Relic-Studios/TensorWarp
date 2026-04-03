@@ -42,6 +42,7 @@ pub mod profiler;
 pub mod quantize;
 pub mod rope;
 pub mod sampling;
+pub mod serialize;
 pub mod swiglu;
 pub mod tensor;
 pub mod transformer;
