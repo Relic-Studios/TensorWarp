@@ -632,22 +632,28 @@ impl OnnxExecutor {
             // min/max are optional scalar inputs (inputs[1], inputs[2]).
             // Missing or empty inputs default to -inf / +inf respectively.
             "Clip" => {
-                let x = get(0)?;
+                // Read optional min/max scalars before borrowing input
+                let has_min = node.inputs.len() >= 2 && !node.inputs[1].is_empty();
+                let has_max = node.inputs.len() >= 3 && !node.inputs[2].is_empty();
 
-                let read_scalar = |idx: usize, default: f32| -> f32 {
-                    if node.inputs.len() <= idx || node.inputs[idx].is_empty() {
-                        return default;
-                    }
-                    get(idx)
-                        .ok()
+                let lo = if has_min {
+                    get(1).ok()
                         .and_then(|t| t.to_host(device).ok())
                         .and_then(|v| v.first().copied())
-                        .unwrap_or(default)
+                        .unwrap_or(f32::NEG_INFINITY)
+                } else {
+                    f32::NEG_INFINITY
+                };
+                let hi = if has_max {
+                    get(2).ok()
+                        .and_then(|t| t.to_host(device).ok())
+                        .and_then(|v| v.first().copied())
+                        .unwrap_or(f32::INFINITY)
+                } else {
+                    f32::INFINITY
                 };
 
-                let lo = read_scalar(1, f32::NEG_INFINITY);
-                let hi = read_scalar(2, f32::INFINITY);
-
+                let x = get(0)?;
                 let mut out = GpuTensor::<f32>::zeros(device, x.shape.clone(), DType::F32)?;
                 warp_kernels::ops::clip(&self.cache, device, x, &mut out, lo, hi)?;
                 owned.insert(out_name, out);
