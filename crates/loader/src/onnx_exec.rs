@@ -681,9 +681,61 @@ impl OnnxExecutor {
 
             "Tile" | "Expand" => {
                 let x = get(0)?;
-                // Simple tile: repeat to fill output size
-                let data = device.dtoh(&x.data)?;
-                let out = GpuTensor::from_host(device, &data, x.shape.clone(), DType::F32)?;
+                if node.inputs.len() >= 2 {
+                    if let Ok(shape_t) = get(1) {
+                        let shape_vals = shape_t.to_host(device)?;
+                        let out_numel: usize = shape_vals.iter().map(|&v| v.max(1.0) as usize).product();
+                        if out_numel > x.numel {
+                            let mut out = GpuTensor::<f32>::zeros(device,
+                                Shape::from_static(&[out_numel]), DType::F32)?;
+                            warp_kernels::edge_ops::expand(&self.cache, device, x, &mut out)?;
+                            owned.insert(out_name, out);
+                        } else {
+                            let data = device.dtoh(&x.data)?;
+                            owned.insert(out_name, GpuTensor::from_host(device, &data, x.shape.clone(), DType::F32)?);
+                        }
+                    } else {
+                        let data = device.dtoh(&x.data)?;
+                        owned.insert(out_name, GpuTensor::from_host(device, &data, x.shape.clone(), DType::F32)?);
+                    }
+                } else {
+                    let data = device.dtoh(&x.data)?;
+                    owned.insert(out_name, GpuTensor::from_host(device, &data, x.shape.clone(), DType::F32)?);
+                }
+            }
+
+            "Where" => {
+                let cond = get(0)?;
+                let x = get(1)?;
+                let y = get(2)?;
+                let mut out = GpuTensor::<f32>::zeros(device, x.shape.clone(), DType::F32)?;
+                warp_kernels::edge_ops::where_op(&self.cache, device, cond, x, y, &mut out)?;
+                owned.insert(out_name, out);
+            }
+
+            "ScatterND" | "ScatterElements" => {
+                let data_in = get(0)?;
+                let indices = get(1)?;
+                let updates = get(2)?;
+                let data_host = data_in.to_host(device)?;
+                let mut data = GpuTensor::from_host(device, &data_host, data_in.shape.clone(), DType::F32)?;
+                warp_kernels::edge_ops::scatter_nd(&self.cache, device, &mut data, updates, indices)?;
+                owned.insert(out_name, data);
+            }
+
+            "DepthToSpace" => {
+                let x = get(0)?;
+                let block_size = node.get_int("blocksize", 2) as u32;
+                let dims = x.shape.dims();
+                let c = dims.get(1).and_then(|d| d.static_val()).unwrap_or(1) as u32;
+                let h = dims.get(2).and_then(|d| d.static_val()).unwrap_or(1) as u32;
+                let w = dims.get(3).and_then(|d| d.static_val()).unwrap_or(1) as u32;
+                let c_out = c / (block_size * block_size);
+                let h_out = h * block_size;
+                let w_out = w * block_size;
+                let mut out = GpuTensor::<f32>::zeros(device,
+                    Shape::from_static(&[1, c_out as usize, h_out as usize, w_out as usize]), DType::F32)?;
+                warp_kernels::edge_ops::depth_to_space(&self.cache, device, x, &mut out, c, h, w, block_size)?;
                 owned.insert(out_name, out);
             }
 

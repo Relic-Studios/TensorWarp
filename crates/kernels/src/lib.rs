@@ -22,6 +22,7 @@ pub mod cublas_bench;
 pub mod cuda_graph;
 pub mod detect;
 pub mod device;
+pub mod edge_ops;
 pub mod elementwise;
 pub mod engine;
 pub mod fp16;
