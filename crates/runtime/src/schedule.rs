@@ -9,7 +9,6 @@
 //! near-zero CPU overhead (~5μs per inference vs ~100μs+ for individual launches).
 
 use warp_ir::{Graph, NodeId, ValueId};
-use crate::memory::TensorBuffer;
 
 /// A single step in the execution plan.
 #[derive(Debug, Clone)]

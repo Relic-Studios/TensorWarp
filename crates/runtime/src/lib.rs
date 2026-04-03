@@ -1,3 +1,4 @@
+#![allow(unused_imports, unused_variables, dead_code)]
 //! # warp-runtime
 //!
 //! Execution runtime for the Warp inference engine.

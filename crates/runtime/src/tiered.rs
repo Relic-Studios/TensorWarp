@@ -23,7 +23,7 @@ use warp_codegen::{Backend, CompiledKernel, KernelConfig};
 use warp_ir::{Graph, NodeId};
 use warp_optimizer::OptimizationLevel;
 
-use crate::engine::{CompilationResult, Engine, EngineError, KernelInfo};
+use crate::engine::{CompilationResult, Engine, EngineError};
 use crate::profile::{OptimizationHint, Profiler};
 use crate::schedule::ExecutionPlan;
 

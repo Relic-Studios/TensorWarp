@@ -380,7 +380,7 @@ impl GenerationEngine {
         let decode_start = std::time::Instant::now();
         let mut generated = Vec::new();
         let mut pos = prompt_len as u32;
-        let mut graph_cache = crate::cuda_graph::DecodeGraphCache::new();
+        let _graph_cache = crate::cuda_graph::DecodeGraphCache::new();
         let capture_stream = device.ctx.new_stream()
             .map_err(|e| DeviceError::Init(format!("capture stream: {e}")))?;
 

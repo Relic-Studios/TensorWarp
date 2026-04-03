@@ -1,3 +1,4 @@
+#![allow(unused_imports, unused_variables, dead_code)]
 //! # warp-loader
 //!
 //! Model weight loading for TensorWarp.

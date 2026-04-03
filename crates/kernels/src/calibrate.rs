@@ -186,7 +186,7 @@ impl Calibrator {
         lines.push(format!("  {} tensors observed", self.stats.len()));
 
         let mut entries: Vec<_> = self.stats.iter().collect();
-        entries.sort_by_key(|(name, _)| name.clone());
+        entries.sort_by_key(|(name, _)| (*name).clone());
 
         for (name, stats) in entries {
             lines.push(format!("  {name:30} min={:.4} max={:.4} samples={}",

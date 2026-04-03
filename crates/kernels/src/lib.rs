@@ -1,3 +1,6 @@
+// Suppress warnings from CUDA string templates and unused kernel params
+#![allow(unused_imports, unused_variables, dead_code, non_snake_case, unreachable_patterns)]
+
 //! # warp-kernels
 //!
 //! Real GPU kernel implementations for the Warp inference engine.

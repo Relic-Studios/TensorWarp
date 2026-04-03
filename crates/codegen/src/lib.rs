@@ -1,3 +1,4 @@
+#![allow(unused_imports, unused_variables, dead_code, non_snake_case)]
 //! # warp-codegen
 //!
 //! GPU kernel code generation for the Warp inference engine.

@@ -259,7 +259,7 @@ fn cmd_onnx(path: &str) {
             // Check op compatibility
             let mut unsupported = Vec::new();
             for node in &model.nodes {
-                if let Err(e) = warp_loader::onnx::OnnxModel::map_op(node) {
+                if let Err(_e) = warp_loader::onnx::OnnxModel::map_op(node) {
                     unsupported.push(format!("  {} ({})", node.op_type, node.name));
                 }
             }

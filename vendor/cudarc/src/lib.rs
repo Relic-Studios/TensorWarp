@@ -1,3 +1,4 @@
+#![allow(unused_imports, unused_variables, dead_code, non_snake_case, unreachable_patterns, unreachable_code, unused_mut, clippy::all)]
 //! Safe abstractions over:
 //! 1. [CUDA driver API](https://docs.nvidia.com/cuda/cuda-driver-api/index.html)
 //! 2. [NVRTC API](https://docs.nvidia.com/cuda/nvrtc/index.html)
