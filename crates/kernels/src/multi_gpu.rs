@@ -63,6 +63,22 @@ impl MultiDevice {
         lines.join("\n")
     }
 
+    /// Create an isolated execution context for a model.
+    /// Each model gets its own CUDA stream for concurrent execution.
+    pub fn create_model_context(&self, device_idx: usize) -> Result<ModelContext, DeviceError> {
+        let (dev, cache) = self.get(device_idx)
+            .ok_or(DeviceError::Init(format!("device {} not found", device_idx)))?;
+
+        let stream = dev.ctx.new_stream()
+            .map_err(|e| DeviceError::Init(format!("create stream: {e}")))?;
+
+        Ok(ModelContext {
+            device: dev.with_stream(stream),
+            cache: KernelCache::new(),
+            model_name: String::new(),
+        })
+    }
+
     /// Synchronize all devices.
     pub fn synchronize_all(&self) -> Result<(), DeviceError> {
         for dev in &self.devices {
@@ -98,6 +114,24 @@ impl MultiDevice {
              Results gathered via peer-to-peer copy to device 0",
             n, n, n
         )
+    }
+}
+
+/// Isolated execution context for a single model.
+/// Each model runs on its own CUDA stream for zero-conflict concurrency.
+pub struct ModelContext {
+    pub device: WarpDevice,
+    pub cache: KernelCache,
+    pub model_name: String,
+}
+
+impl ModelContext {
+    pub fn set_name(&mut self, name: &str) {
+        self.model_name = name.to_string();
+    }
+
+    pub fn synchronize(&self) -> Result<(), DeviceError> {
+        self.device.synchronize()
     }
 }
 

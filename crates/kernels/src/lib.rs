@@ -15,6 +15,7 @@ pub mod attention_ext;
 pub mod autotune;
 pub mod bench;
 pub mod builder;
+pub mod c_api;
 pub mod cache;
 pub mod calibrate;
 pub mod conv;
