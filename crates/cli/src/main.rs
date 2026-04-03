@@ -42,6 +42,17 @@ fn main() {
             }
             cmd_onnx(path);
         }
+        "compile" => {
+            let path = args.get(2).map(|s| s.as_str()).unwrap_or("");
+            if path.is_empty() {
+                eprintln!("Usage: tensorwarp compile <model.onnx> [--opt O2]");
+                std::process::exit(1);
+            }
+            cmd_compile(path);
+        }
+        "profile" => {
+            cmd_profile();
+        }
         "help" | "--help" | "-h" => cmd_help(),
         _ => {
             eprintln!("Unknown command: {cmd}");
@@ -60,10 +71,12 @@ USAGE:
 
 COMMANDS:
     info              Show GPU device information
-    bench             Run GPU kernel benchmarks
+    bench             Run GPU kernel benchmarks (F32/FP16/Q4_0/AutoFuse)
     generate          Generate tokens with a test model
     load <path>       Load and inspect a SafeTensors model file
     onnx <path>       Load and inspect an ONNX model file
+    compile <path>    Compile ONNX model through optimization pipeline
+    profile           Profile GPU performance characteristics
     help              Show this help message
 
 EXAMPLES:
@@ -277,4 +290,90 @@ fn cmd_onnx(path: &str) {
             std::process::exit(1);
         }
     }
+}
+
+fn cmd_compile(path: &str) {
+    println!("=== TensorWarp Compiler ===\n");
+    println!("Loading: {path}");
+
+    let start = Instant::now();
+    match warp_loader::OnnxModel::load(path) {
+        Ok(model) => {
+            println!("Parsed in {:.1}ms", start.elapsed().as_secs_f64() * 1000.0);
+            println!("{}", model.summary());
+
+            // Compile through optimization pipeline
+            println!("\nCompiling with O2 optimization...");
+            let compile_start = Instant::now();
+            let compiled = warp_loader::onnx_compile::compile_onnx(
+                &model, warp_optimizer::OptimizationLevel::O2);
+            let compile_time = compile_start.elapsed();
+
+            println!("Compiled in {:.1}ms", compile_time.as_secs_f64() * 1000.0);
+            println!("{}", compiled.summary());
+            println!("\nModel ready for execution!");
+        }
+        Err(e) => {
+            eprintln!("Failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_profile() {
+    let dev = WarpDevice::new(0).expect("No CUDA device");
+    println!("=== TensorWarp GPU Profiler ===\n");
+    println!("Device: {}\n", dev.summary());
+
+    let cache = KernelCache::new();
+
+    // Profile kernel launch overhead
+    let n = 1024usize;
+    let a = warp_kernels::GpuTensor::<f32>::zeros(&dev,
+        warp_ir::Shape::from_static(&[n]), warp_ir::DType::F32).unwrap();
+    let b = warp_kernels::GpuTensor::<f32>::zeros(&dev,
+        warp_ir::Shape::from_static(&[n]), warp_ir::DType::F32).unwrap();
+    let mut c = warp_kernels::GpuTensor::<f32>::zeros(&dev,
+        warp_ir::Shape::from_static(&[n]), warp_ir::DType::F32).unwrap();
+
+    // Warmup
+    warp_kernels::ops::add(&cache, &dev, &a, &b, &mut c).unwrap();
+    dev.synchronize().unwrap();
+
+    // Measure launch overhead
+    let iters = 10000;
+    let start = Instant::now();
+    for _ in 0..iters {
+        warp_kernels::ops::add(&cache, &dev, &a, &b, &mut c).unwrap();
+    }
+    dev.synchronize().unwrap();
+    let elapsed = start.elapsed();
+    let us_per_launch = elapsed.as_secs_f64() * 1e6 / iters as f64;
+
+    println!("Kernel launch overhead: {:.1}μs per launch ({iters} iters)", us_per_launch);
+
+    // Profile memory bandwidth
+    let big_n = 16 * 1024 * 1024; // 16M elements
+    let big_a = warp_kernels::GpuTensor::<f32>::zeros(&dev,
+        warp_ir::Shape::from_static(&[big_n]), warp_ir::DType::F32).unwrap();
+    let big_b = warp_kernels::GpuTensor::<f32>::zeros(&dev,
+        warp_ir::Shape::from_static(&[big_n]), warp_ir::DType::F32).unwrap();
+    let mut big_c = warp_kernels::GpuTensor::<f32>::zeros(&dev,
+        warp_ir::Shape::from_static(&[big_n]), warp_ir::DType::F32).unwrap();
+
+    warp_kernels::ops::add(&cache, &dev, &big_a, &big_b, &mut big_c).unwrap();
+    dev.synchronize().unwrap();
+
+    let bw_iters = 100;
+    let start = Instant::now();
+    for _ in 0..bw_iters {
+        warp_kernels::ops::add(&cache, &dev, &big_a, &big_b, &mut big_c).unwrap();
+    }
+    dev.synchronize().unwrap();
+    let bw_elapsed = start.elapsed();
+    let bytes = big_n as f64 * 4.0 * 3.0 * bw_iters as f64; // 3 arrays (a, b, c)
+    let bandwidth = bytes / bw_elapsed.as_secs_f64() / 1e9;
+
+    println!("Memory bandwidth: {:.0} GB/s (elementwise add, {big_n} elements)", bandwidth);
+    println!("\n{}", cache.stats());
 }

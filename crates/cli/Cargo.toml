@@ -13,6 +13,7 @@ path = "src/main.rs"
 warp-ir.workspace = true
 warp-kernels.workspace = true
 warp-loader.workspace = true
+warp-optimizer.workspace = true
 cudarc.workspace = true
 half.workspace = true
 env_logger.workspace = true

@@ -498,6 +498,7 @@ dependencies = [
  "warp-ir",
  "warp-kernels",
  "warp-loader",
+ "warp-optimizer",
 ]
 
 [[package]]
