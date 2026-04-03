@@ -758,6 +758,10 @@ pub fn gemm_tensor_core(
                 .map_err(|e: cudarc::driver::result::DriverError| DeviceError::Launch(e.to_string()))?;
         }
     } else {
+        // Small matrix: use optimized SIMT variants with auto-selected tile size
+        return crate::gemm_small::gemm_small_f16(cache, device, a, b, c, m, n, k);
+
+        // Legacy fused kernel below (kept for reference):
         // Tiny matrix: single fused kernel — load FP16, compute in F32, store FP16
         // One kernel launch instead of 4 (cast+gemm+cast)
         let fused_src = format!(r#"

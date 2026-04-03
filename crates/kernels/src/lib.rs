@@ -29,6 +29,7 @@ pub mod extended_ops;
 pub mod fp16;
 pub mod gather;
 pub mod gemm;
+pub mod gemm_small;
 pub mod generate;
 pub mod mem_pool;
 pub mod missing_ops;
