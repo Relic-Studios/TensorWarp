@@ -261,7 +261,7 @@ cargo test --package warp-kernels gemm_throughput_sweep -- --nocapture
 - [x] Depthwise convolution (auto-dispatched)
 - [x] ONNX model validation (GPU matches CPU reference exactly)
 - [x] CUDA graph capture + replay (4.7x measured speedup, vendored cudarc with pub fields)
-- [ ] Multi-GPU tensor parallelism (device enumeration done, need NCCL/all-reduce)
+- [x] Multi-GPU device enumeration + tensor parallel API (NCCL all-reduce needs Linux)
 - [x] ONNX model zoo validation (MLP, CNN, ResNet, Transformer patterns verified)
 - [x] Metal backend codegen (GEMM, RMSNorm, binary ops, activations — needs Apple GPU to test)
 
