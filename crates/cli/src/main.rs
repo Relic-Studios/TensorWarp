@@ -790,10 +790,10 @@ fn run_safetensors(
             cache: warp_kernels::cache::KernelCache::new(),
         };
 
-        println!("\nGenerating (max_seq_len={}, Q4_0 quantized)...\n", max_seq_len);
+        println!("\nGenerating (max_seq_len={}, Q4_0 quantized, pre-alloc)...\n", max_seq_len);
         println!("--- output ---");
 
-        let result = match engine.generate_with_cache(&device, &prompt_ids, &gen_config, max_seq_len) {
+        let result = match engine.generate_prealloc(&device, &prompt_ids, &gen_config, max_seq_len) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("\nGeneration failed: {e}");

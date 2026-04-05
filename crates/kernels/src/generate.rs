@@ -1375,6 +1375,289 @@ impl QuantizedGenerationEngine {
 }
 
 // ═════════════════════════════════════════════════════════════════
+// Q4 Pre-allocated Decode Buffers
+// ═════════════════════════════════════════════════════════════════
+
+/// Per-layer pre-allocated buffers for Q4 decode (eliminates cudaMalloc per step).
+pub struct Q4LayerDecodeBuffers {
+    pub normed: GpuTensor<f32>,
+    pub q: GpuTensor<f32>,
+    pub k: GpuTensor<f32>,
+    pub v: GpuTensor<f32>,
+    pub q_biased: GpuTensor<f32>,
+    pub k_biased: GpuTensor<f32>,
+    pub v_biased: GpuTensor<f32>,
+    pub q_rope: GpuTensor<f32>,
+    pub k_rope: GpuTensor<f32>,
+    pub attn_out: GpuTensor<f32>,
+    pub attn_proj: GpuTensor<f32>,
+    pub ffn_normed: GpuTensor<f32>,
+    pub residual: GpuTensor<f32>,
+    pub gate: GpuTensor<f32>,
+    pub up: GpuTensor<f32>,
+    pub swiglu: GpuTensor<f32>,
+    pub ffn_out: GpuTensor<f32>,
+    pub output: GpuTensor<f32>,
+}
+
+/// Pre-allocated tensors for Q4 decode — zero cudaMalloc during generation.
+pub struct Q4DecodeBuffers {
+    pub ids: GpuTensor<i32>,
+    pub hidden: GpuTensor<f32>,
+    pub normed: GpuTensor<f32>,
+    pub logits: GpuTensor<f32>,
+    pub layers: Vec<Q4LayerDecodeBuffers>,
+}
+
+impl Q4DecodeBuffers {
+    pub fn allocate(
+        device: &WarpDevice,
+        config: &TransformerConfig,
+        num_layers: usize,
+        vocab_size: u32,
+    ) -> Result<Self, DeviceError> {
+        let h = config.hidden_size as usize;
+        let kv = config.kv_dim() as usize;
+        let ffn = config.ffn_dim as usize;
+        let v = vocab_size as usize;
+
+        let sh = Shape::from_static(&[1, h]);
+        let sk = Shape::from_static(&[1, kv]);
+        let sf = Shape::from_static(&[1, ffn]);
+
+        let mut layers = Vec::with_capacity(num_layers);
+        for _ in 0..num_layers {
+            layers.push(Q4LayerDecodeBuffers {
+                normed: GpuTensor::zeros(device, sh.clone(), DType::F32)?,
+                q: GpuTensor::zeros(device, sh.clone(), DType::F32)?,
+                k: GpuTensor::zeros(device, sk.clone(), DType::F32)?,
+                v: GpuTensor::zeros(device, sk.clone(), DType::F32)?,
+                q_biased: GpuTensor::zeros(device, sh.clone(), DType::F32)?,
+                k_biased: GpuTensor::zeros(device, sk.clone(), DType::F32)?,
+                v_biased: GpuTensor::zeros(device, sk.clone(), DType::F32)?,
+                q_rope: GpuTensor::zeros(device, sh.clone(), DType::F32)?,
+                k_rope: GpuTensor::zeros(device, sk.clone(), DType::F32)?,
+                attn_out: GpuTensor::zeros(device, sh.clone(), DType::F32)?,
+                attn_proj: GpuTensor::zeros(device, sh.clone(), DType::F32)?,
+                ffn_normed: GpuTensor::zeros(device, sh.clone(), DType::F32)?,
+                residual: GpuTensor::zeros(device, sh.clone(), DType::F32)?,
+                gate: GpuTensor::zeros(device, sf.clone(), DType::F32)?,
+                up: GpuTensor::zeros(device, sf.clone(), DType::F32)?,
+                swiglu: GpuTensor::zeros(device, sf.clone(), DType::F32)?,
+                ffn_out: GpuTensor::zeros(device, sh.clone(), DType::F32)?,
+                output: GpuTensor::zeros(device, sh.clone(), DType::F32)?,
+            });
+        }
+
+        Ok(Self {
+            ids: GpuTensor::zeros(device, Shape::from_static(&[1]), DType::I32)?,
+            hidden: GpuTensor::zeros(device, sh.clone(), DType::F32)?,
+            normed: GpuTensor::zeros(device, sh, DType::F32)?,
+            logits: GpuTensor::zeros(device, Shape::from_static(&[1, v]), DType::F32)?,
+            layers,
+        })
+    }
+
+    pub fn buffer_count(&self) -> usize {
+        4 + self.layers.len() * 18
+    }
+
+    pub fn memory_bytes(&self) -> usize {
+        self.ids.size_bytes() + self.hidden.size_bytes() + self.normed.size_bytes()
+            + self.logits.size_bytes()
+            + self.layers.iter().map(|l| {
+                l.normed.size_bytes() + l.q.size_bytes() + l.k.size_bytes() + l.v.size_bytes()
+                + l.q_biased.size_bytes() + l.k_biased.size_bytes() + l.v_biased.size_bytes()
+                + l.q_rope.size_bytes() + l.k_rope.size_bytes() + l.attn_out.size_bytes()
+                + l.attn_proj.size_bytes() + l.ffn_normed.size_bytes() + l.residual.size_bytes()
+                + l.gate.size_bytes() + l.up.size_bytes() + l.swiglu.size_bytes()
+                + l.ffn_out.size_bytes() + l.output.size_bytes()
+            }).sum::<usize>()
+    }
+}
+
+impl QuantizedGenerationEngine {
+    /// Decode with pre-allocated buffers — zero cudaMalloc during generation.
+    fn forward_decode_prealloc(
+        &self,
+        device: &WarpDevice,
+        buffers: &mut Q4DecodeBuffers,
+        kv_cache: &mut ModelKVCache,
+        pos: u32,
+    ) -> Result<(), DeviceError> {
+        let h = self.config.hidden_size;
+        let d = self.config.head_dim;
+        let kv_dim = self.config.kv_dim();
+        let ffn = self.config.ffn_dim;
+
+        sampling::embedding(&self.cache, device, &self.embed_tokens, &buffers.ids,
+            &mut buffers.hidden, 1, h)?;
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            let x_ptr: *const GpuTensor<f32> = if i == 0 {
+                &buffers.hidden as *const _
+            } else {
+                &buffers.layers[i - 1].output as *const _
+            };
+            let x: &GpuTensor<f32> = unsafe { &*x_ptr };
+            let lb = &mut buffers.layers[i];
+
+            // 1. RMSNorm
+            ops::rmsnorm(&self.cache, device, x, &layer.attn_norm,
+                &mut lb.normed, h, self.config.norm_eps)?;
+
+            // 2. Q, K, V — M=1 specialized GEMM
+            crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.normed, &layer.wq, &mut lb.q, h, h)?;
+            crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.normed, &layer.wk, &mut lb.k, kv_dim, h)?;
+            crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.normed, &layer.wv, &mut lb.v, kv_dim, h)?;
+
+            // 3. Biases
+            let q_ref = if let Some(ref bq) = layer.bq {
+                ops::broadcast_add(&self.cache, device, &lb.q, bq, &mut lb.q_biased)?;
+                &lb.q_biased
+            } else { &lb.q };
+            let k_ref = if let Some(ref bk) = layer.bk {
+                ops::broadcast_add(&self.cache, device, &lb.k, bk, &mut lb.k_biased)?;
+                &lb.k_biased
+            } else { &lb.k };
+            let v_ref = if let Some(ref bv) = layer.bv {
+                ops::broadcast_add(&self.cache, device, &lb.v, bv, &mut lb.v_biased)?;
+                &lb.v_biased
+            } else { &lb.v };
+
+            // 4. RoPE
+            crate::rope::rope(&self.cache, device, q_ref, &mut lb.q_rope,
+                self.config.num_heads, 1, d, self.config.rope_base, pos)?;
+            crate::rope::rope(&self.cache, device, k_ref, &mut lb.k_rope,
+                self.config.num_kv_heads, 1, d, self.config.rope_base, pos)?;
+
+            // 5. KV cache append
+            {
+                let kv_layer = &mut kv_cache.layers[i];
+                kv_layer.append(&self.cache, device, &lb.k_rope, v_ref)?;
+
+                // 6. Decode attention (FlashDecoding)
+                crate::kv_cache::decode_attention_flash(
+                    &self.cache, device, &lb.q_rope, kv_layer, &mut lb.attn_out,
+                    self.config.num_heads, self.config.num_kv_heads, d,
+                )?;
+            }
+
+            // 7. Output projection — M=1 GEMM
+            crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.attn_out, &layer.wo,
+                &mut lb.attn_proj, h, h)?;
+
+            // 8. Fused residual + FFN norm
+            ops::fused_residual_rmsnorm(&self.cache, device, &lb.attn_proj, x,
+                &layer.ffn_norm, &mut lb.ffn_normed, &mut lb.residual,
+                h, self.config.norm_eps)?;
+
+            // 9. Gate + Up — M=1 GEMM
+            crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.ffn_normed, &layer.w_gate,
+                &mut lb.gate, ffn, h)?;
+            crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.ffn_normed, &layer.w_up,
+                &mut lb.up, ffn, h)?;
+
+            // 10. Fused SwiGLU
+            ops::fused_silu_mul(&self.cache, device, &lb.gate, &lb.up, &mut lb.swiglu)?;
+
+            // 11. Down projection — M=1 GEMM
+            crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.swiglu, &layer.w_down,
+                &mut lb.ffn_out, h, ffn)?;
+
+            // 12. Residual
+            ops::add(&self.cache, device, &lb.residual, &lb.ffn_out, &mut lb.output)?;
+        }
+
+        // Final norm + LM head
+        let last_layer = self.layers.len() - 1;
+        ops::rmsnorm(&self.cache, device, &buffers.layers[last_layer].output,
+            &self.final_norm, &mut buffers.normed, h, self.config.norm_eps)?;
+        ops::gemm(&self.cache, device, &buffers.normed, &self.lm_head,
+            &mut buffers.logits, 1, self.vocab_size, h)?;
+
+        Ok(())
+    }
+
+    /// Generate with pre-allocated decode buffers — zero cudaMalloc during generation.
+    pub fn generate_prealloc(
+        &self,
+        device: &WarpDevice,
+        prompt_ids: &[i32],
+        gen_config: &GenerateConfig,
+        max_seq_len: u32,
+    ) -> Result<GenerationResult, DeviceError> {
+        let kv_dim = self.config.kv_dim();
+        let num_layers = self.layers.len() as u32;
+        let vocab = self.vocab_size as usize;
+
+        let mut kv_cache = ModelKVCache::new(device, num_layers, max_seq_len, kv_dim)?;
+
+        // Pre-allocate all decode buffers (one-time cost)
+        let mut buffers = Q4DecodeBuffers::allocate(
+            device, &self.config, self.layers.len(), self.vocab_size,
+        )?;
+
+        // Prefill (still uses the allocating path — prefill is one-shot)
+        let prefill_start = std::time::Instant::now();
+        let logits = self.forward_prefill(device, prompt_ids, &mut kv_cache)?;
+        device.synchronize()?;
+        let prefill_time = prefill_start.elapsed();
+
+        let all_logits = logits.to_host(device)?;
+        let prompt_len = prompt_ids.len();
+        let mut last_logits = all_logits[(prompt_len - 1) * vocab..prompt_len * vocab].to_vec();
+
+        let decode_start = std::time::Instant::now();
+        let mut generated = Vec::new();
+        let mut pos = prompt_len as u32;
+
+        let base_seed: u64 = prompt_ids.iter().fold(42u64, |acc, &t| {
+            acc.wrapping_mul(6364136223846793005).wrapping_add(t as u64)
+        });
+
+        for step in 0..gen_config.max_tokens {
+            let rng_seed = base_seed.wrapping_add(step as u64);
+            let next_token = sample_token(&last_logits, gen_config, &generated, rng_seed);
+
+            if let Some(eos) = gen_config.eos_token_id {
+                if next_token == eos { break; }
+            }
+
+            generated.push(next_token);
+
+            if !gen_config.stop_sequences.is_empty()
+                && matches_stop_sequence(&generated, &gen_config.stop_sequences)
+            { break; }
+
+            // Write token ID into pre-allocated buffer (no allocation)
+            device.htod_copy(&[next_token], &mut buffers.ids.data)?;
+
+            // Decode with pre-allocated buffers
+            self.forward_decode_prealloc(device, &mut buffers, &mut kv_cache, pos)?;
+            device.synchronize()?;
+
+            last_logits = buffers.logits.to_host(device)?;
+            pos += 1;
+        }
+
+        let decode_time = decode_start.elapsed();
+
+        Ok(GenerationResult {
+            tokens: generated.clone(),
+            prefill_time,
+            decode_time,
+            tokens_generated: generated.len(),
+            prefill_tokens: prompt_len,
+            tokens_per_sec: if decode_time.as_secs_f64() > 0.0 {
+                generated.len() as f64 / decode_time.as_secs_f64()
+            } else { 0.0 },
+            kv_cache_memory_bytes: kv_cache.memory_bytes(),
+        })
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════
 // Q4 → FP16 Dequantized Generation Engine (ExLlamaV2-style)
 // ═════════════════════════════════════════════════════════════════
 
