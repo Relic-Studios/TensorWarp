@@ -886,6 +886,83 @@ impl DecodeBuffers {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════
+// FP16 Pre-allocated Decode Buffers
+// ═══════════════════════════════════════════════════════════════
+
+/// Per-layer FP16 buffers for zero-allocation decode.
+pub struct LayerDecodeBuffersF16 {
+    pub normed: GpuTensor<half::f16>,    // [1, H]
+    pub q: GpuTensor<half::f16>,         // [1, H]
+    pub k: GpuTensor<half::f16>,         // [1, kv_dim]
+    pub v: GpuTensor<half::f16>,         // [1, kv_dim]
+    pub q_rope: GpuTensor<half::f16>,    // [1, H]
+    pub k_rope: GpuTensor<half::f16>,    // [1, kv_dim]
+    pub attn_out: GpuTensor<half::f16>,  // [1, H]
+    pub attn_proj: GpuTensor<half::f16>, // [1, H]
+    pub ffn_normed: GpuTensor<half::f16>,// [1, H]
+    pub residual: GpuTensor<half::f16>,  // [1, H]
+    pub gate: GpuTensor<half::f16>,      // [1, FFN]
+    pub up: GpuTensor<half::f16>,        // [1, FFN]
+    pub swiglu: GpuTensor<half::f16>,    // [1, FFN]
+    pub ffn_out: GpuTensor<half::f16>,   // [1, H]
+    pub output: GpuTensor<half::f16>,    // [1, H]
+}
+
+/// Pre-allocated FP16 decode buffers for the full FP16 pipeline.
+pub struct DecodeBuffersF16 {
+    pub hidden_f16: GpuTensor<half::f16>,   // [1, H] — layer input
+    pub hidden_f32: GpuTensor<f32>,         // [1, H] — for embedding + final norm
+    pub normed_f32: GpuTensor<f32>,         // [1, H] — final norm output
+    pub logits: GpuTensor<f32>,             // [1, V] — output logits (F32 for argmax)
+    pub layer_buffers: Vec<LayerDecodeBuffersF16>,
+}
+
+impl DecodeBuffersF16 {
+    pub fn allocate(
+        device: &WarpDevice,
+        config: &TransformerConfig,
+        num_layers: usize,
+        vocab_size: u32,
+    ) -> Result<Self, DeviceError> {
+        let h = config.hidden_size as usize;
+        let kv = config.kv_dim() as usize;
+        let ffn = config.ffn_dim as usize;
+        let sh = Shape::from_static(&[1, h]);
+        let sk = Shape::from_static(&[1, kv]);
+        let sf = Shape::from_static(&[1, ffn]);
+
+        let mut layer_buffers = Vec::with_capacity(num_layers);
+        for _ in 0..num_layers {
+            layer_buffers.push(LayerDecodeBuffersF16 {
+                normed: GpuTensor::<half::f16>::zeros(device, sh.clone(), DType::F16)?,
+                q: GpuTensor::<half::f16>::zeros(device, sh.clone(), DType::F16)?,
+                k: GpuTensor::<half::f16>::zeros(device, sk.clone(), DType::F16)?,
+                v: GpuTensor::<half::f16>::zeros(device, sk.clone(), DType::F16)?,
+                q_rope: GpuTensor::<half::f16>::zeros(device, sh.clone(), DType::F16)?,
+                k_rope: GpuTensor::<half::f16>::zeros(device, sk.clone(), DType::F16)?,
+                attn_out: GpuTensor::<half::f16>::zeros(device, sh.clone(), DType::F16)?,
+                attn_proj: GpuTensor::<half::f16>::zeros(device, sh.clone(), DType::F16)?,
+                ffn_normed: GpuTensor::<half::f16>::zeros(device, sh.clone(), DType::F16)?,
+                residual: GpuTensor::<half::f16>::zeros(device, sh.clone(), DType::F16)?,
+                gate: GpuTensor::<half::f16>::zeros(device, sf.clone(), DType::F16)?,
+                up: GpuTensor::<half::f16>::zeros(device, sf.clone(), DType::F16)?,
+                swiglu: GpuTensor::<half::f16>::zeros(device, sf.clone(), DType::F16)?,
+                ffn_out: GpuTensor::<half::f16>::zeros(device, sh.clone(), DType::F16)?,
+                output: GpuTensor::<half::f16>::zeros(device, sh.clone(), DType::F16)?,
+            });
+        }
+
+        Ok(Self {
+            hidden_f16: GpuTensor::<half::f16>::zeros(device, sh.clone(), DType::F16)?,
+            hidden_f32: GpuTensor::<f32>::zeros(device, sh.clone(), DType::F32)?,
+            normed_f32: GpuTensor::<f32>::zeros(device, sh, DType::F32)?,
+            logits: GpuTensor::<f32>::zeros(device, Shape::from_static(&[1, vocab_size as usize]), DType::F32)?,
+            layer_buffers,
+        })
+    }
+}
+
 impl GenerationEngine {
     /// Decode forward pass using pre-allocated buffers — zero allocation overhead.
     ///
@@ -1480,53 +1557,37 @@ impl GenerationEngineF16 {
             acc.wrapping_mul(6364136223846793005).wrapping_add(t as u64)
         });
 
-        // Full FP16 pipeline: hidden state stays FP16 across all layers.
+        // Full FP16 pipeline with pre-allocated buffers.
         let h = self.config.hidden_size;
-        let num_layers = self.layers.len();
+        let d = self.config.head_dim;
         let kv_dim = self.config.kv_dim();
+        let ffn = self.config.ffn_dim;
+        let num_layers = self.layers.len();
 
-        // Pre-allocate FP16 hidden state buffers (ping-pong between layers)
-        let mut hidden_f16_a = GpuTensor::<half::f16>::zeros(device,
-            Shape::from_static(&[1, h as usize]), DType::F16)?;
-        let mut hidden_f16_b = GpuTensor::<half::f16>::zeros(device,
-            Shape::from_static(&[1, h as usize]), DType::F16)?;
-        let mut hidden_f32 = GpuTensor::<f32>::zeros(device,
-            Shape::from_static(&[1, h as usize]), DType::F32)?;
-        let mut normed_f32 = GpuTensor::<f32>::zeros(device,
-            Shape::from_static(&[1, h as usize]), DType::F32)?;
-        let mut logits_buf = GpuTensor::<f32>::zeros(device,
-            Shape::from_static(&[1, self.vocab_size as usize]), DType::F32)?;
+        // Pre-allocate ALL FP16 decode buffers (zero cudaMalloc during decode)
+        let mut bufs = DecodeBuffersF16::allocate(device, &self.config, num_layers, self.vocab_size)?;
 
-        // FP16 KV cache for decode (half the bandwidth for attention)
-        let mut kv_cache_f16 = crate::kv_cache::ModelKVCacheF16::new(
-            device, num_layers as u32, max_seq_len, kv_dim)?;
+        // FP16 KV cache
+        let mut kv_f16 = crate::kv_cache::ModelKVCacheF16::new(device, num_layers as u32, max_seq_len, kv_dim)?;
 
-        // Copy F32 KV cache from prefill into F16 KV cache
-        // This is a one-time cost after prefill; decode uses F16 cache exclusively
+        // Copy prefill KV cache (F32) to FP16
         for i in 0..num_layers {
-            let f32_layer = &kv_cache.layers[i];
-            let f16_layer = &mut kv_cache_f16.layers[i];
-            let cache_elements = f32_layer.len as usize * kv_dim as usize;
-            if cache_elements > 0 {
-                // Cast K and V from F32 to F16
-                let mut k_f16_tmp = GpuTensor::<half::f16>::zeros(device,
-                    f32_layer.k.shape.clone(), DType::F16)?;
-                let mut v_f16_tmp = GpuTensor::<half::f16>::zeros(device,
-                    f32_layer.v.shape.clone(), DType::F16)?;
-                // Cast uses numel from input — but we only need cache_elements
-                // Temporarily set numel to valid range
-                let saved_k = f32_layer.k.numel;
-                // Just cast the whole buffer — only the first cache_elements matter
-                crate::fp16::cast_f32_to_f16(&self.cache, device, &f32_layer.k, &mut k_f16_tmp)?;
-                crate::fp16::cast_f32_to_f16(&self.cache, device, &f32_layer.v, &mut v_f16_tmp)?;
-                f16_layer.k = k_f16_tmp;
-                f16_layer.v = v_f16_tmp;
-                f16_layer.len = f32_layer.len;
+            let f32_l = &kv_cache.layers[i];
+            let f16_l = &mut kv_f16.layers[i];
+            if f32_l.len > 0 {
+                let mut kt = GpuTensor::<half::f16>::zeros(device, f32_l.k.shape.clone(), DType::F16)?;
+                let mut vt = GpuTensor::<half::f16>::zeros(device, f32_l.v.shape.clone(), DType::F16)?;
+                crate::fp16::cast_f32_to_f16(&self.cache, device, &f32_l.k, &mut kt)?;
+                crate::fp16::cast_f32_to_f16(&self.cache, device, &f32_l.v, &mut vt)?;
+                f16_l.k = kt;
+                f16_l.v = vt;
+                f16_l.len = f32_l.len;
             }
         }
 
-        // Phase 2: Full FP16 decode — NO casting between layers.
-        // Hidden state enters as FP16, stays FP16 through all layers.
+        // Phase 2: Full FP16 decode with pre-allocated buffers — zero cudaMalloc.
+        let bn = 1u32;
+
         for step in 0..gen_config.max_tokens {
             let rng_seed = base_seed.wrapping_add(step as u64);
             let next_token = sample_token(&last_logits, gen_config, &generated, rng_seed);
@@ -1545,45 +1606,100 @@ impl GenerationEngineF16 {
             let ids_t = GpuTensor::from_host(device, &[next_token],
                 Shape::from_static(&[1]), DType::I32)?;
             sampling::embedding(&self.cache, device, &self.embed_tokens, &ids_t,
-                &mut hidden_f32, 1, h)?;
-            crate::fp16::cast_f32_to_f16(&self.cache, device, &hidden_f32, &mut hidden_f16_a)?;
+                &mut bufs.hidden_f32, 1, h)?;
+            crate::fp16::cast_f32_to_f16(&self.cache, device, &bufs.hidden_f32, &mut bufs.hidden_f16)?;
 
-            // Run all layers in FP16 — ping-pong between hidden_f16_a and hidden_f16_b
-            let mut use_a = true;
+            // Run all layers — FP16 throughout, pre-allocated buffers
             for (i, layer) in self.layers.iter().enumerate() {
-                let (input, output) = if use_a {
-                    (&hidden_f16_a as &GpuTensor<half::f16>, &mut hidden_f16_b)
+                // Input: first layer reads from bufs.hidden_f16, subsequent from prev layer output
+                let x_ptr: *const GpuTensor<half::f16> = if i == 0 {
+                    &bufs.hidden_f16 as *const _
                 } else {
-                    (&hidden_f16_b as &GpuTensor<half::f16>, &mut hidden_f16_a)
+                    &bufs.layer_buffers[i - 1].output as *const _
                 };
+                let x: &GpuTensor<half::f16> = unsafe { &*x_ptr };
+                let lb = &mut bufs.layer_buffers[i];
 
-                let layer_result = crate::transformer::transformer_block_decode_full_f16(
-                    &self.cache, device, input, layer, &self.config,
-                    &mut kv_cache_f16.layers[i], 1, pos,
-                )?;
+                // 1. RMSNorm (FP16 in/out, F32 internal)
+                crate::fp16::f16_rmsnorm(&self.cache, device, x, layer.attn_norm_f16(),
+                    &mut lb.normed, h, self.config.norm_eps)?;
 
-                // Copy result into the output ping-pong buffer
-                // TODO: make transformer_block_decode_full_f16 write directly into output buffer
-                if use_a {
-                    hidden_f16_b = layer_result;
-                } else {
-                    hidden_f16_a = layer_result;
+                // 2. QKV GEMMs (cuBLAS HGEMM — tensor cores)
+                crate::cublas_gemm::gemm_cublas_f16(device, &lb.normed, &layer.wq, &mut lb.q, bn, h, h)?;
+                crate::cublas_gemm::gemm_cublas_f16(device, &lb.normed, &layer.wk, &mut lb.k, bn, kv_dim, h)?;
+                crate::cublas_gemm::gemm_cublas_f16(device, &lb.normed, &layer.wv, &mut lb.v, bn, kv_dim, h)?;
+
+                // 2b. Biases (cast F32→F16 and add — small tensors, negligible cost)
+                // TODO: pre-compute FP16 biases at load time
+                if let Some(ref bq) = layer.bq {
+                    let mut bq_f16 = GpuTensor::<half::f16>::zeros(device, bq.shape.clone(), DType::F16)?;
+                    crate::fp16::cast_f32_to_f16(&self.cache, device, bq, &mut bq_f16)?;
+                    let mut qb = GpuTensor::<half::f16>::zeros(device, lb.q.shape.clone(), DType::F16)?;
+                    crate::fp16::f16_add(&self.cache, device, &lb.q, &bq_f16, &mut qb)?;
+                    lb.q = qb;
                 }
-                use_a = !use_a;
+                if let Some(ref bk) = layer.bk {
+                    let mut bk_f16 = GpuTensor::<half::f16>::zeros(device, bk.shape.clone(), DType::F16)?;
+                    crate::fp16::cast_f32_to_f16(&self.cache, device, bk, &mut bk_f16)?;
+                    let mut kb = GpuTensor::<half::f16>::zeros(device, lb.k.shape.clone(), DType::F16)?;
+                    crate::fp16::f16_add(&self.cache, device, &lb.k, &bk_f16, &mut kb)?;
+                    lb.k = kb;
+                }
+                if let Some(ref bv) = layer.bv {
+                    let mut bv_f16 = GpuTensor::<half::f16>::zeros(device, bv.shape.clone(), DType::F16)?;
+                    crate::fp16::cast_f32_to_f16(&self.cache, device, bv, &mut bv_f16)?;
+                    let mut vb = GpuTensor::<half::f16>::zeros(device, lb.v.shape.clone(), DType::F16)?;
+                    crate::fp16::f16_add(&self.cache, device, &lb.v, &bv_f16, &mut vb)?;
+                    lb.v = vb;
+                }
+
+                // 3. RoPE (FP16)
+                crate::fp16::f16_rope(&self.cache, device, &lb.q, &mut lb.q_rope,
+                    1 * self.config.num_heads, 1, d, self.config.rope_base, pos)?;
+                crate::fp16::f16_rope(&self.cache, device, &lb.k, &mut lb.k_rope,
+                    1 * self.config.num_kv_heads, 1, d, self.config.rope_base, pos)?;
+
+                // 4. KV cache append + attention (FP16)
+                {
+                    let kv_l = &mut kv_f16.layers[i];
+                    kv_l.append(&self.cache, device, &lb.k_rope, &lb.v)?;
+                    crate::kv_cache::decode_attention_multihead_f16(
+                        &self.cache, device, &lb.q_rope, kv_l, &mut lb.attn_out,
+                        self.config.num_heads, self.config.num_kv_heads, d,
+                    )?;
+                }
+
+                // 5. Output projection (cuBLAS HGEMM)
+                crate::cublas_gemm::gemm_cublas_f16(device, &lb.attn_out, &layer.wo, &mut lb.attn_proj, bn, h, h)?;
+
+                // 6+7. Fused residual + FFN norm (FP16)
+                crate::fp16::f16_fused_residual_rmsnorm(&self.cache, device,
+                    &lb.attn_proj, x, layer.ffn_norm_f16(),
+                    &mut lb.ffn_normed, &mut lb.residual, h, self.config.norm_eps)?;
+
+                // 8-9. Gate + Up (cuBLAS HGEMM) + SwiGLU (FP16)
+                crate::cublas_gemm::gemm_cublas_f16(device, &lb.ffn_normed, &layer.w_gate, &mut lb.gate, bn, ffn, h)?;
+                crate::cublas_gemm::gemm_cublas_f16(device, &lb.ffn_normed, &layer.w_up, &mut lb.up, bn, ffn, h)?;
+                crate::fp16::f16_fused_silu_mul(&self.cache, device, &lb.gate, &lb.up, &mut lb.swiglu)?;
+
+                // 10. Down projection (cuBLAS HGEMM)
+                crate::cublas_gemm::gemm_cublas_f16(device, &lb.swiglu, &layer.w_down, &mut lb.ffn_out, bn, h, ffn)?;
+
+                // 11. Final residual (FP16 add)
+                crate::fp16::f16_add(&self.cache, device, &lb.residual, &lb.ffn_out, &mut lb.output)?;
             }
 
-            // Get final hidden state (whichever buffer has it)
-            let final_hidden = if use_a { &hidden_f16_a } else { &hidden_f16_b };
-
-            // Cast FP16 → F32 for final norm + LM head (ONCE per token)
-            crate::fp16::cast_f16_to_f32(&self.cache, device, final_hidden, &mut hidden_f32)?;
-            ops::rmsnorm(&self.cache, device, &hidden_f32, &self.final_norm,
-                &mut normed_f32, h, self.config.norm_eps)?;
-            ops::gemm(&self.cache, device, &normed_f32, &self.lm_head,
-                &mut logits_buf, 1, self.vocab_size, h)?;
+            // Cast final hidden FP16 → F32 for norm + LM head (ONCE per token)
+            let last_output = &bufs.layer_buffers.last().unwrap().output;
+            let last_ptr: *const GpuTensor<half::f16> = last_output;
+            crate::fp16::cast_f16_to_f32(&self.cache, device, unsafe { &*last_ptr }, &mut bufs.hidden_f32)?;
+            ops::rmsnorm(&self.cache, device, &bufs.hidden_f32, &self.final_norm,
+                &mut bufs.normed_f32, h, self.config.norm_eps)?;
+            ops::gemm(&self.cache, device, &bufs.normed_f32, &self.lm_head,
+                &mut bufs.logits, 1, self.vocab_size, h)?;
             device.synchronize()?;
 
-            last_logits = logits_buf.to_host(device)?;
+            last_logits = bufs.logits.to_host(device)?;
             pos += 1;
         }
 
