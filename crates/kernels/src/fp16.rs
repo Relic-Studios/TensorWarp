@@ -431,6 +431,62 @@ pub fn f16_rope(
     Ok(())
 }
 
+/// FP16 RoPE variant that reads position from a GPU buffer (for CUDA graph capture).
+const F16_ROPE_DEVICE_POS_SRC: &str = r#"
+#include <cuda_fp16.h>
+extern "C" __global__ void warp_f16_rope_device_pos(
+    half *out, const half *input,
+    unsigned int B, unsigned int N, unsigned int D,
+    float base, const unsigned int *pos_buf
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = B * N * (D / 2);
+    if (idx >= total) return;
+
+    unsigned int pair = idx % (D / 2);
+    unsigned int pos_in_seq = (idx / (D / 2)) % N;
+    unsigned int b = idx / (N * (D / 2));
+    unsigned int pos = pos_in_seq + pos_buf[0];
+
+    float freq = 1.0f / powf(base, 2.0f * (float)pair / (float)D);
+    float theta = (float)pos * freq;
+    float cos_t = cosf(theta);
+    float sin_t = sinf(theta);
+
+    unsigned int base_offset = b * N * D + pos_in_seq * D;
+    float x0 = __half2float(input[base_offset + pair]);
+    float x1 = __half2float(input[base_offset + pair + D / 2]);
+
+    out[base_offset + pair]         = __float2half(x0 * cos_t - x1 * sin_t);
+    out[base_offset + pair + D / 2] = __float2half(x0 * sin_t + x1 * cos_t);
+}
+"#;
+
+/// FP16 RoPE that reads position from a GPU buffer (CUDA graph compatible).
+pub fn f16_rope_device_pos(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    input: &GpuTensor<half::f16>,
+    out: &mut GpuTensor<half::f16>,
+    batch: u32,
+    seq_len: u32,
+    head_dim: u32,
+    base: f32,
+    pos_buf: &GpuTensor<u32>,  // [1] on GPU — position value
+) -> Result<(), DeviceError> {
+    let f = compile_fp16(cache, device, F16_ROPE_DEVICE_POS_SRC, "warp_f16_rope_device_pos")?;
+    let total = batch * seq_len * (head_dim / 2);
+    let cfg = LaunchConfig::for_num_elems(total);
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut out.data).arg(&input.data)
+            .arg(&batch).arg(&seq_len).arg(&head_dim)
+            .arg(&base).arg(&pos_buf.data)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
 // ── FP16 Scaled Dot-Product Attention ───────────────────────────
 
 // FP16 attention with shared memory reduction — handles any head_dim.

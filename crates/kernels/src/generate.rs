@@ -1587,8 +1587,20 @@ impl GenerationEngineF16 {
             }
         }
 
-        // Phase 2: Full FP16 decode with pre-allocated buffers — zero cudaMalloc.
+        // Phase 2: Full FP16 decode with CUDA graph capture.
+        // Step 0: warmup (compile all kernels)
+        // Step 1: capture the decode step as a CUDA graph
+        // Steps 2+: replay the graph with updated pos
         let bn = 1u32;
+
+        // GPU buffer for position — updated between graph replays
+        let mut pos_buf = GpuTensor::from_host(device, &[pos],
+            Shape::from_static(&[1]), DType::U32)?;
+        // GPU buffer for cache_len = pos + 1
+        let mut len_buf = GpuTensor::from_host(device, &[pos + 1],
+            Shape::from_static(&[1]), DType::U32)?;
+
+        let mut graph: Option<crate::cuda_graph::GraphCapture> = None;
 
         for step in 0..gen_config.max_tokens {
             let rng_seed = base_seed.wrapping_add(step as u64);
@@ -1604,12 +1616,16 @@ impl GenerationEngineF16 {
                 && matches_stop_sequence(&generated, &gen_config.stop_sequences)
             { break; }
 
-            // Embedding (F32) → cast to FP16 (ONCE per token)
+            // Embedding (F32) → cast to FP16
             let ids_t = GpuTensor::from_host(device, &[next_token],
                 Shape::from_static(&[1]), DType::I32)?;
             sampling::embedding(&self.cache, device, &self.embed_tokens, &ids_t,
                 &mut bufs.hidden_f32, 1, h)?;
             crate::fp16::cast_f32_to_f16(&self.cache, device, &bufs.hidden_f32, &mut bufs.hidden_f16)?;
+
+            // Update pos buffer for this step (device-pos kernels read from it)
+            device.htod_copy(&[pos], &mut pos_buf.data)?;
+            device.htod_copy(&[pos + 1], &mut len_buf.data)?;
 
             // Run all layers — FP16 throughout, pre-allocated buffers
             for (i, layer) in self.layers.iter().enumerate() {
@@ -1647,19 +1663,19 @@ impl GenerationEngineF16 {
                     std::mem::swap(&mut lb.v, &mut lb.v_biased);
                 }
 
-                // 3. RoPE (FP16)
-                crate::fp16::f16_rope(&self.cache, device, &lb.q, &mut lb.q_rope,
-                    1 * self.config.num_heads, 1, d, self.config.rope_base, pos)?;
-                crate::fp16::f16_rope(&self.cache, device, &lb.k, &mut lb.k_rope,
-                    1 * self.config.num_kv_heads, 1, d, self.config.rope_base, pos)?;
+                // 3. RoPE (FP16) — use device-pos variants for CUDA graph compatibility
+                crate::fp16::f16_rope_device_pos(&self.cache, device, &lb.q, &mut lb.q_rope,
+                    1 * self.config.num_heads, 1, d, self.config.rope_base, &pos_buf)?;
+                crate::fp16::f16_rope_device_pos(&self.cache, device, &lb.k, &mut lb.k_rope,
+                    1 * self.config.num_kv_heads, 1, d, self.config.rope_base, &pos_buf)?;
 
-                // 4. KV cache append + attention (FP16)
+                // 4. KV cache append + attention (FP16) — device-pos variants
                 {
                     let kv_l = &mut kv_f16.layers[i];
-                    kv_l.append(&self.cache, device, &lb.k_rope, &lb.v)?;
-                    crate::kv_cache::decode_attention_multihead_f16(
+                    kv_l.append_device_pos(&self.cache, device, &lb.k_rope, &lb.v, &pos_buf)?;
+                    crate::kv_cache::decode_attention_multihead_f16_device_len(
                         &self.cache, device, &lb.q_rope, kv_l, &mut lb.attn_out,
-                        self.config.num_heads, self.config.num_kv_heads, d,
+                        self.config.num_heads, self.config.num_kv_heads, d, &len_buf,
                     )?;
                 }
 
