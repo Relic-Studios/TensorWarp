@@ -749,6 +749,75 @@ extern "C" __global__ void warp_gemm_q4_0_m1(
 }
 "#;
 
+// ── Optimized M=1 Q4 GEMM with shared-memory A vector ──────────
+//
+// V2: Loads A vector into shared memory cooperatively (all threads in block).
+// Each thread processes COLS_PER_THREAD output columns to amortize the A load.
+// For K=3584, this reduces redundant global reads of A from 256x to 1x per block.
+
+const GEMM_Q4_0_M1_V2_SRC: &str = r#"
+#define COLS_PER_THREAD 4
+#define BLOCK_THREADS 256
+
+extern "C" __global__ void warp_gemm_q4_0_m1_v2(
+    float* __restrict__ C,
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ B_q4,
+    int K,
+    int N
+) {
+    // Shared memory for A vector — loaded cooperatively by all threads
+    extern __shared__ float smem_A[];
+
+    // Load A into shared memory (K can be larger than blockDim.x)
+    for (int i = threadIdx.x; i < K; i += BLOCK_THREADS) {
+        smem_A[i] = A[i];
+    }
+    __syncthreads();
+
+    const int num_k_blocks = K / 32;
+
+    // Each thread processes COLS_PER_THREAD output columns
+    int base_n = (blockIdx.x * BLOCK_THREADS + threadIdx.x) * COLS_PER_THREAD;
+
+    float dots[COLS_PER_THREAD];
+    #pragma unroll
+    for (int c = 0; c < COLS_PER_THREAD; c++) dots[c] = 0.0f;
+
+    for (int b = 0; b < num_k_blocks; b++) {
+        int k_base = b * 32;
+
+        #pragma unroll
+        for (int c = 0; c < COLS_PER_THREAD; c++) {
+            int n = base_n + c;
+            if (n >= N) continue;
+
+            const unsigned char* blk = B_q4 + ((long long)n * num_k_blocks + b) * 20;
+            float scale = *((const float*)blk);
+            const unsigned int* packed = (const unsigned int*)(blk + 4);
+
+            #pragma unroll
+            for (int v = 0; v < 4; v++) {
+                unsigned int val = packed[v];
+                #pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    unsigned char byte = (val >> (i * 8)) & 0xFF;
+                    int ki = k_base + v * 8 + i * 2;
+                    dots[c] += smem_A[ki] * (float)((byte & 0x0F) - 8) * scale;
+                    dots[c] += smem_A[ki + 1] * (float)(((byte >> 4) & 0x0F) - 8) * scale;
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int c = 0; c < COLS_PER_THREAD; c++) {
+        int n = base_n + c;
+        if (n < N) C[n] = dots[c];
+    }
+}
+"#;
+
 /// M=1 specialized Q4_0 GEMM: C[1,N] = A[1,K] × dequant(B_q4[K,N])
 ///
 /// ~5-10x faster than the generic 32×32 tiled kernel for single-token decode.
