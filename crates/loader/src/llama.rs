@@ -451,6 +451,8 @@ fn load_layer_q4(
         w_up: load_and_quantize_q4(loader, device, &format!("{prefix}.mlp.up_proj.weight"), h, ffn)?,
         w_down: load_and_quantize_q4(loader, device, &format!("{prefix}.mlp.down_proj.weight"), ffn, h)?,
         bq, bk, bv,
+        wq_bm: None, wk_bm: None, wv_bm: None, wo_bm: None,
+        w_gate_bm: None, w_up_bm: None, w_down_bm: None,
     })
 }
 

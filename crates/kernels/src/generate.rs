@@ -1506,10 +1506,16 @@ impl QuantizedGenerationEngine {
             ops::rmsnorm(&self.cache, device, x, &layer.attn_norm,
                 &mut lb.normed, h, self.config.norm_eps)?;
 
-            // 2. Q, K, V — M=1 specialized GEMM
-            crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.normed, &layer.wq, &mut lb.q, h, h)?;
-            crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.normed, &layer.wk, &mut lb.k, kv_dim, h)?;
-            crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.normed, &layer.wv, &mut lb.v, kv_dim, h)?;
+            // 2. Q, K, V — M=1 specialized GEMM (block-major if available)
+            if let Some(ref wq_bm) = layer.wq_bm {
+                crate::quantize::gemm_q4_0_m1_blockmajor(&self.cache, device, &lb.normed, wq_bm, &mut lb.q, h, h)?;
+                crate::quantize::gemm_q4_0_m1_blockmajor(&self.cache, device, &lb.normed, layer.wk_bm.as_ref().unwrap(), &mut lb.k, kv_dim, h)?;
+                crate::quantize::gemm_q4_0_m1_blockmajor(&self.cache, device, &lb.normed, layer.wv_bm.as_ref().unwrap(), &mut lb.v, kv_dim, h)?;
+            } else {
+                crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.normed, &layer.wq, &mut lb.q, h, h)?;
+                crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.normed, &layer.wk, &mut lb.k, kv_dim, h)?;
+                crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.normed, &layer.wv, &mut lb.v, kv_dim, h)?;
+            }
 
             // 3+4+5. Fused bias + RoPE + KV cache append (1 launch replaces 6)
             let has_bias = layer.bq.is_some();
@@ -1538,27 +1544,44 @@ impl QuantizedGenerationEngine {
                 )?;
             }
 
-            // 7. Output projection — M=1 GEMM
-            crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.attn_out, &layer.wo,
-                &mut lb.attn_proj, h, h)?;
+            // 7. Output projection — M=1 GEMM (block-major if available)
+            if let Some(ref wo_bm) = layer.wo_bm {
+                crate::quantize::gemm_q4_0_m1_blockmajor(&self.cache, device, &lb.attn_out, wo_bm,
+                    &mut lb.attn_proj, h, h)?;
+            } else {
+                crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.attn_out, &layer.wo,
+                    &mut lb.attn_proj, h, h)?;
+            }
 
             // 8. Fused residual + FFN norm
             ops::fused_residual_rmsnorm(&self.cache, device, &lb.attn_proj, x,
                 &layer.ffn_norm, &mut lb.ffn_normed, &mut lb.residual,
                 h, self.config.norm_eps)?;
 
-            // 9. Gate + Up — M=1 GEMM
-            crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.ffn_normed, &layer.w_gate,
-                &mut lb.gate, ffn, h)?;
-            crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.ffn_normed, &layer.w_up,
-                &mut lb.up, ffn, h)?;
+            // 9. Gate + Up — M=1 GEMM (block-major if available)
+            if let Some(ref wg_bm) = layer.w_gate_bm {
+                crate::quantize::gemm_q4_0_m1_blockmajor(&self.cache, device, &lb.ffn_normed, wg_bm,
+                    &mut lb.gate, ffn, h)?;
+                crate::quantize::gemm_q4_0_m1_blockmajor(&self.cache, device, &lb.ffn_normed, layer.w_up_bm.as_ref().unwrap(),
+                    &mut lb.up, ffn, h)?;
+            } else {
+                crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.ffn_normed, &layer.w_gate,
+                    &mut lb.gate, ffn, h)?;
+                crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.ffn_normed, &layer.w_up,
+                    &mut lb.up, ffn, h)?;
+            }
 
             // 10. Fused SwiGLU
             ops::fused_silu_mul(&self.cache, device, &lb.gate, &lb.up, &mut lb.swiglu)?;
 
-            // 11. Down projection — M=1 GEMM
-            crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.swiglu, &layer.w_down,
-                &mut lb.ffn_out, h, ffn)?;
+            // 11. Down projection — M=1 GEMM (block-major if available)
+            if let Some(ref wd_bm) = layer.w_down_bm {
+                crate::quantize::gemm_q4_0_m1_blockmajor(&self.cache, device, &lb.swiglu, wd_bm,
+                    &mut lb.ffn_out, h, ffn)?;
+            } else {
+                crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.swiglu, &layer.w_down,
+                    &mut lb.ffn_out, h, ffn)?;
+            }
 
             // 12. Residual
             ops::add(&self.cache, device, &lb.residual, &lb.ffn_out, &mut lb.output)?;

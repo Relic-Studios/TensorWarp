@@ -256,6 +256,40 @@ pub struct QuantizedBlockWeights {
     pub bq: Option<GpuTensor<f32>>,
     pub bk: Option<GpuTensor<f32>>,
     pub bv: Option<GpuTensor<f32>>,
+    /// Block-major reordered weights for coalesced M=1 GEMM reads.
+    /// Created once by `reorder_for_decode()`. None until reordered.
+    pub wq_bm: Option<GpuTensor<u8>>,
+    pub wk_bm: Option<GpuTensor<u8>>,
+    pub wv_bm: Option<GpuTensor<u8>>,
+    pub wo_bm: Option<GpuTensor<u8>>,
+    pub w_gate_bm: Option<GpuTensor<u8>>,
+    pub w_up_bm: Option<GpuTensor<u8>>,
+    pub w_down_bm: Option<GpuTensor<u8>>,
+}
+
+impl QuantizedBlockWeights {
+    /// Reorder all weight matrices to block-major layout for coalesced M=1 GEMM reads.
+    /// Call once after loading weights. Creates copies — original column-major weights
+    /// remain for prefill (which uses the generic tiled GEMM).
+    pub fn reorder_for_decode(
+        &mut self,
+        device: &WarpDevice,
+        config: &TransformerConfig,
+    ) -> Result<(), crate::device::DeviceError> {
+        let h = config.hidden_size;
+        let kv = config.kv_dim();
+        let ffn = config.ffn_dim;
+
+        self.wq_bm = Some(quantize::reorder_q4_block_major(device, &self.wq, h, h)?);
+        self.wk_bm = Some(quantize::reorder_q4_block_major(device, &self.wk, h, kv)?);
+        self.wv_bm = Some(quantize::reorder_q4_block_major(device, &self.wv, h, kv)?);
+        self.wo_bm = Some(quantize::reorder_q4_block_major(device, &self.wo, h, h)?);
+        self.w_gate_bm = Some(quantize::reorder_q4_block_major(device, &self.w_gate, h, ffn)?);
+        self.w_up_bm = Some(quantize::reorder_q4_block_major(device, &self.w_up, h, ffn)?);
+        self.w_down_bm = Some(quantize::reorder_q4_block_major(device, &self.w_down, ffn, h)?);
+
+        Ok(())
+    }
 }
 
 /// Quantize a full-precision block's weights to Q4_0.
@@ -295,6 +329,8 @@ pub fn quantize_block_weights(
             Some(t) => Some(GpuTensor::from_host(device, &t.to_host(device)?, t.shape.clone(), warp_ir::DType::F32)?),
             None => None,
         },
+        wq_bm: None, wk_bm: None, wv_bm: None, wo_bm: None,
+        w_gate_bm: None, w_up_bm: None, w_down_bm: None,
     })
 }
 

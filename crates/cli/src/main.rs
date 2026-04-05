@@ -780,7 +780,7 @@ fn run_safetensors(
             }
         };
 
-        let engine = warp_kernels::generate::QuantizedGenerationEngine {
+        let mut engine = warp_kernels::generate::QuantizedGenerationEngine {
             config: model.transformer_config.clone(),
             vocab_size: llama_config.vocab_size,
             embed_tokens: model.embed_tokens,
@@ -789,6 +789,13 @@ fn run_safetensors(
             lm_head: model.lm_head,
             cache: warp_kernels::cache::KernelCache::new(),
         };
+
+        // Reorder weights to block-major layout for coalesced M=1 GEMM reads
+        let reorder_start = std::time::Instant::now();
+        for layer in &mut engine.layers {
+            layer.reorder_for_decode(&device, &engine.config).unwrap();
+        }
+        println!("Block-major weight reorder: {:.1}ms", reorder_start.elapsed().as_secs_f64() * 1000.0);
 
         println!("\nGenerating (max_seq_len={}, Q4_0 quantized, pre-alloc)...\n", max_seq_len);
         println!("--- output ---");

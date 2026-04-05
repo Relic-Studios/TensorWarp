@@ -692,6 +692,136 @@ impl DequantizedF16Weights {
 // one thread per output column, with each thread computing the full
 // K-dimension dot product. Expected: 5-10x speedup for M=1.
 
+// ── Block-major Q4 weight reordering for coalesced M=1 reads ────
+//
+// Column-major layout: (col_j * num_k_blocks + block_b) * 20
+//   → Adjacent threads read blocks 2240 bytes apart (terrible coalescing)
+//
+// Block-major layout: (block_b * N + col_j) * 20
+//   → Adjacent threads read blocks 20 bytes apart (excellent coalescing)
+//
+// Reorder is done once at model load (CPU, ~ms). Zero runtime cost.
+
+/// Reorder Q4_0 weights from column-major to block-major layout.
+/// This enables coalesced memory reads in the M=1 GEMM kernel.
+///
+/// Column-major: offset = (col * num_k_blocks + block) * 20
+/// Block-major:  offset = (block * N + col) * 20
+pub fn reorder_q4_block_major(
+    device: &WarpDevice,
+    col_major: &GpuTensor<u8>,
+    k: u32,
+    n: u32,
+) -> Result<GpuTensor<u8>, DeviceError> {
+    let num_k_blocks = k / BLOCK_SIZE;
+    let total_blocks = (num_k_blocks * n) as usize;
+    let total_bytes = total_blocks * Q4_0_BLOCK_BYTES as usize;
+
+    let src = col_major.to_host(device)?;
+    let mut dst = vec![0u8; total_bytes];
+
+    for col in 0..n as usize {
+        for blk in 0..num_k_blocks as usize {
+            let src_offset = (col * num_k_blocks as usize + blk) * Q4_0_BLOCK_BYTES as usize;
+            let dst_offset = (blk * n as usize + col) * Q4_0_BLOCK_BYTES as usize;
+            dst[dst_offset..dst_offset + Q4_0_BLOCK_BYTES as usize]
+                .copy_from_slice(&src[src_offset..src_offset + Q4_0_BLOCK_BYTES as usize]);
+        }
+    }
+
+    GpuTensor::from_host(device, &dst,
+        warp_ir::Shape::from_static(&[total_bytes]),
+        warp_ir::DType::U8)
+}
+
+/// M=1 Q4_0 GEMM kernel for block-major weight layout.
+/// Adjacent threads read adjacent 20-byte blocks for coalesced global reads.
+const GEMM_Q4_0_M1_BLOCKMAJOR_SRC: &str = r#"
+extern "C" __global__ void warp_gemm_q4_0_m1_bm(
+    float* __restrict__ C,
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ B_q4,
+    int K,
+    int N
+) {
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= N) return;
+
+    float dot = 0.0f;
+    const int num_k_blocks = K / 32;
+
+    for (int b = 0; b < num_k_blocks; b++) {
+        // Block-major layout: (b * N + n) * 20
+        // Adjacent threads (n, n+1) read adjacent 20-byte blocks — coalesced!
+        const unsigned char* blk = B_q4 + ((long long)b * N + n) * 20;
+
+        float scale = *((const float*)blk);
+        const unsigned int* packed = (const unsigned int*)(blk + 4);
+        unsigned int val0 = packed[0];
+        unsigned int val1 = packed[1];
+        unsigned int val2 = packed[2];
+        unsigned int val3 = packed[3];
+
+        int k_base = b * 32;
+
+        #define BM_PROCESS(V, off) { \
+            unsigned int _v = V; \
+            for (int i = 0; i < 4; i++) { \
+                unsigned char byte = (_v >> (i * 8)) & 0xFF; \
+                int ki = k_base + (off) + i * 2; \
+                dot += __ldg(&A[ki]) * (float)((byte & 0x0F) - 8) * scale; \
+                dot += __ldg(&A[ki + 1]) * (float)(((byte >> 4) & 0x0F) - 8) * scale; \
+            } \
+        }
+
+        BM_PROCESS(val0, 0);
+        BM_PROCESS(val1, 8);
+        BM_PROCESS(val2, 16);
+        BM_PROCESS(val3, 24);
+
+        #undef BM_PROCESS
+    }
+
+    C[n] = dot;
+}
+"#;
+
+/// M=1 Q4_0 GEMM with block-major weights (coalesced reads).
+pub fn gemm_q4_0_m1_blockmajor(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    a: &GpuTensor<f32>,       // [1, K]
+    b_quant: &GpuTensor<u8>,  // block-major Q4_0 [K, N]
+    c: &mut GpuTensor<f32>,   // [1, N]
+    n: u32,
+    k: u32,
+) -> Result<(), DeviceError> {
+    assert!(k % BLOCK_SIZE == 0, "K must be divisible by {BLOCK_SIZE}");
+
+    let f = cache.get_or_compile(device, GEMM_Q4_0_M1_BLOCKMAJOR_SRC, "warp_gemm_q4_0_m1_bm")?;
+    let threads = 256u32;
+    let blocks = (n + threads - 1) / threads;
+    let cfg = LaunchConfig {
+        grid_dim: (blocks, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let k_i = k as i32;
+    let n_i = n as i32;
+
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut c.data)
+            .arg(&a.data)
+            .arg(&b_quant.data)
+            .arg(&k_i)
+            .arg(&n_i)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
 const GEMM_Q4_0_M1_SRC: &str = r#"
 extern "C" __global__ void warp_gemm_q4_0_m1(
     float* __restrict__ C,
