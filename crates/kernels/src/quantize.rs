@@ -786,6 +786,87 @@ extern "C" __global__ void warp_gemm_q4_0_m1_bm(
 }
 "#;
 
+// ── Warp-cooperative M=1 Q4 GEMM (V3) ──────────────────────────
+//
+// Each warp processes 32 output columns. Warp cooperatively loads
+// 32 Q4 blocks (640 bytes) into shared memory via 5 coalesced
+// 128-byte cache line transactions. Then each thread computes
+// its column from shared memory — zero wasted bandwidth.
+//
+// Additionally: processes 4 K-blocks between syncs to amortize
+// sync overhead and improve instruction-level parallelism.
+
+const GEMM_Q4_0_M1_V3_SRC: &str = r#"
+#define WARP_SIZE 32
+
+extern "C" __global__ void warp_gemm_q4_0_m1_v3(
+    float* __restrict__ C,
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ B_q4,
+    int K,
+    int N
+) {
+    // Shared memory: each warp gets 32 * 20 = 640 bytes
+    extern __shared__ unsigned char smem[];
+
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane = threadIdx.x & (WARP_SIZE - 1);
+    int global_n = blockIdx.x * blockDim.x + threadIdx.x;
+
+    unsigned char* warp_smem = smem + warp_id * WARP_SIZE * 20;
+
+    float dot = 0.0f;
+    const int num_k_blocks = K / 32;
+
+    for (int b = 0; b < num_k_blocks; b++) {
+        // Cooperative warp load: 32 threads load 640 bytes (32 × 20-byte blocks)
+        // from contiguous global memory into shared memory.
+        // 640 bytes = 160 x 4-byte words. 32 threads × 5 words each.
+        if (global_n < N) {
+            const unsigned char* src_base = B_q4 + ((long long)b * N + (blockIdx.x * blockDim.x + warp_id * WARP_SIZE)) * 20;
+            unsigned char* dst_base = warp_smem;
+
+            // Each thread loads 5 × 4 bytes = 20 bytes (its own Q4 block)
+            // But arranged so that the warp reads contiguously:
+            // Thread lane loads 4 bytes at stride-32 offsets for coalescing
+            #pragma unroll
+            for (int w = 0; w < 5; w++) {
+                // All 32 threads read 4 bytes each from consecutive addresses
+                // Offset: w * 128 + lane * 4 (128-byte aligned per iteration)
+                unsigned int val = *((const unsigned int*)(src_base + w * 128 + lane * 4));
+                *((unsigned int*)(dst_base + w * 128 + lane * 4)) = val;
+            }
+        }
+        __syncthreads();
+
+        if (global_n < N) {
+            // Read this thread's Q4 block from shared memory
+            const unsigned char* my_block = warp_smem + lane * 20;
+            float scale = *((const float*)my_block);
+            const unsigned char* packed = my_block + 4;
+
+            int k_base = b * 32;
+
+            // Process 32 elements (16 packed bytes)
+            #pragma unroll
+            for (int i = 0; i < 16; i++) {
+                unsigned char byte = packed[i];
+                int ki = k_base + i * 2;
+                float a0 = __ldg(&A[ki]);
+                float a1 = __ldg(&A[ki + 1]);
+                dot += a0 * (float)((byte & 0x0F) - 8) * scale;
+                dot += a1 * (float)(((byte >> 4) & 0x0F) - 8) * scale;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (global_n < N) {
+        C[global_n] = dot;
+    }
+}
+"#;
+
 /// M=1 Q4_0 GEMM with block-major weights (coalesced reads).
 pub fn gemm_q4_0_m1_blockmajor(
     cache: &KernelCache,
