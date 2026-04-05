@@ -1836,17 +1836,17 @@ impl QuantizedGenerationEngine {
                 && matches_stop_sequence(&generated, &gen_config.stop_sequences)
             { break; }
 
-            // Update device-side buffers (tiny async copies, no sync needed)
-            device.htod_copy(&[next_token], &mut buffers.ids.data)?;
-            device.htod_copy(&[pos], &mut buffers.pos_buf)?;
-            device.htod_copy(&[pos + 1], &mut buffers.cache_len_buf)?;
+            // Update device-side buffers on the CAPTURE stream (same stream as graph)
+            graph_device.htod_copy(&[next_token], &mut buffers.ids.data)?;
+            graph_device.htod_copy(&[pos], &mut buffers.pos_buf)?;
+            graph_device.htod_copy(&[pos + 1], &mut buffers.cache_len_buf)?;
 
             // Replay graph — single GPU launch for all transformer layers!
             graph.replay()?;
 
-            // LM head runs eagerly (cuBLAS may not be graph-safe)
-            self.forward_lm_head(device, &mut buffers)?;
-            device.synchronize()?;
+            // LM head runs eagerly on capture stream (cuBLAS uses this stream's handle)
+            self.forward_lm_head(&graph_device, &mut buffers)?;
+            graph_device.synchronize()?;
 
             // Update KV cache lengths on CPU side
             for kv_layer in &mut kv_cache.layers {

@@ -209,14 +209,29 @@ impl LaunchArgs<'_> {
         &mut self,
         cfg: LaunchConfig,
     ) -> Result<Option<(CudaEvent, CudaEvent)>, DriverError> {
-        self.stream.ctx.bind_to_thread()?;
-        for &event in self.waits.iter() {
-            self.stream.wait(event)?;
+        // Check if stream is capturing — if so, skip bind_to_thread and events
+        // which can invalidate capture state. Context must be pre-bound before
+        // capture starts (see GraphCapture::record_with_device).
+        let capturing = {
+            let mut status: sys::CUstreamCaptureStatus = sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
+            let res = sys::cuStreamIsCapturing(self.stream.cu_stream, &mut status);
+            res == sys::cudaError_enum::CUDA_SUCCESS
+                && status != sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE
+        };
+
+        if !capturing {
+            self.stream.ctx.bind_to_thread()?;
         }
-        let start_event = self
-            .flags
-            .map(|flags| self.stream.record_event(Some(flags)))
-            .transpose()?;
+        if !capturing {
+            for &event in self.waits.iter() {
+                self.stream.wait(event)?;
+            }
+        }
+        let start_event = if !capturing {
+            self.flags
+                .map(|flags| self.stream.record_event(Some(flags)))
+                .transpose()?
+        } else { None };
         result::launch_kernel(
             self.func.cu_function,
             cfg.grid_dim,
@@ -225,12 +240,15 @@ impl LaunchArgs<'_> {
             self.stream.cu_stream,
             &mut self.args,
         )?;
-        let end_event = self
-            .flags
-            .map(|flags| self.stream.record_event(Some(flags)))
-            .transpose()?;
-        for &event in self.records.iter() {
-            event.record(self.stream)?;
+        let end_event = if !capturing {
+            self.flags
+                .map(|flags| self.stream.record_event(Some(flags)))
+                .transpose()?
+        } else { None };
+        if !capturing {
+            for &event in self.records.iter() {
+                event.record(self.stream)?;
+            }
         }
         Ok(start_event.zip(end_event))
     }
