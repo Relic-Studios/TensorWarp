@@ -48,6 +48,15 @@ impl WarpDevice {
         let blas = CudaBlas::new(stream.clone())
             .map_err(|e| DeviceError::Init(format!("cuBLAS init: {e}")))?;
 
+        // Enable tensor core math for ALL cuBLAS operations.
+        // This allows cuBLAS to use tensor cores for FP16 and TF32 GEMMs.
+        unsafe {
+            cudarc::cublas::sys::cublasSetMathMode(
+                *blas.handle(),
+                cudarc::cublas::sys::cublasMath_t::CUBLAS_TENSOR_OP_MATH,
+            );
+        }
+
         Ok(Self {
             ctx,
             stream,
