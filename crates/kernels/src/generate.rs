@@ -1511,30 +1511,25 @@ impl QuantizedGenerationEngine {
             crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.normed, &layer.wk, &mut lb.k, kv_dim, h)?;
             crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.normed, &layer.wv, &mut lb.v, kv_dim, h)?;
 
-            // 3. Biases
-            let q_ref = if let Some(ref bq) = layer.bq {
-                ops::broadcast_add(&self.cache, device, &lb.q, bq, &mut lb.q_biased)?;
-                &lb.q_biased
-            } else { &lb.q };
-            let k_ref = if let Some(ref bk) = layer.bk {
-                ops::broadcast_add(&self.cache, device, &lb.k, bk, &mut lb.k_biased)?;
-                &lb.k_biased
-            } else { &lb.k };
-            let v_ref = if let Some(ref bv) = layer.bv {
-                ops::broadcast_add(&self.cache, device, &lb.v, bv, &mut lb.v_biased)?;
-                &lb.v_biased
-            } else { &lb.v };
+            // 3+4+5. Fused bias + RoPE + KV cache append (1 launch replaces 6)
+            let has_bias = layer.bq.is_some();
+            let bq_ref = if has_bias { layer.bq.as_ref().unwrap() } else { &lb.q };
+            let bk_ref = if has_bias { layer.bk.as_ref().unwrap() } else { &lb.k };
+            let bv_ref = if has_bias { layer.bv.as_ref().unwrap() } else { &lb.v };
 
-            // 4. RoPE
-            crate::rope::rope(&self.cache, device, q_ref, &mut lb.q_rope,
-                self.config.num_heads, 1, d, self.config.rope_base, pos)?;
-            crate::rope::rope(&self.cache, device, k_ref, &mut lb.k_rope,
-                self.config.num_kv_heads, 1, d, self.config.rope_base, pos)?;
-
-            // 5. KV cache append
             {
                 let kv_layer = &mut kv_cache.layers[i];
-                kv_layer.append(&self.cache, device, &lb.k_rope, v_ref)?;
+                ops::fused_bias_rope_append(
+                    &self.cache, device,
+                    &lb.q, &lb.k, &lb.v,
+                    &mut lb.q_rope, &mut lb.k_rope,
+                    bq_ref, bk_ref, bv_ref,
+                    &mut kv_layer.k, &mut kv_layer.v,
+                    self.config.num_heads, self.config.num_kv_heads, d,
+                    kv_dim, pos, kv_layer.max_seq_len,
+                    self.config.rope_base, has_bias,
+                )?;
+                kv_layer.len = pos + 1;
 
                 // 6. Decode attention (FlashDecoding)
                 crate::kv_cache::decode_attention_flash(
