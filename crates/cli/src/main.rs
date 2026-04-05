@@ -53,7 +53,8 @@ fn main() {
             let max_tokens = parse_u32_arg(&args, "--max-tokens").unwrap_or(128);
             let temperature = parse_f32_arg(&args, "--temperature").unwrap_or(0.7);
             let fp16 = args.iter().any(|a| a == "--fp16");
-            cmd_run(model_id, &prompt, max_tokens, temperature, fp16);
+            let q4 = args.iter().any(|a| a == "--q4");
+            cmd_run(model_id, &prompt, max_tokens, temperature, fp16, q4);
         }
         "compile" => {
             let path = args.get(2).map(|s| s.as_str()).unwrap_or("");
@@ -427,7 +428,7 @@ fn cmd_profile() {
     println!("\n{}", cache.stats());
 }
 
-fn cmd_run(model_id: &str, prompt: &str, max_tokens: u32, temperature: f32, fp16: bool) {
+fn cmd_run(model_id: &str, prompt: &str, max_tokens: u32, temperature: f32, fp16: bool, q4: bool) {
     println!("=== TensorWarp Run ===\n");
 
     let total_start = Instant::now();
@@ -467,7 +468,7 @@ fn cmd_run(model_id: &str, prompt: &str, max_tokens: u32, temperature: f32, fp16
         ModelFormat::SafeTensors => {
             run_safetensors(
                 &model_path, prompt, max_tokens, temperature,
-                top_k, top_p, rep_penalty, greedy, chat, system_prompt.as_deref(), fp16,
+                top_k, top_p, rep_penalty, greedy, chat, system_prompt.as_deref(), fp16, q4,
             );
         }
 
@@ -556,6 +557,7 @@ fn run_safetensors(
     chat: bool,
     system_prompt: Option<&str>,
     fp16: bool,
+    q4: bool,
 ) {
     use warp_kernels::generate::GenerateConfig;
     use warp_kernels::mem_pool::GpuMemPool;
@@ -659,7 +661,8 @@ fn run_safetensors(
     }
 
     // 7. Load model weights
-    println!("\nLoading model weights{}...", if fp16 { " (FP16 mixed-precision)" } else { "" });
+    let prec_label = if q4 { " (Q4_0 quantized)" } else if fp16 { " (FP16 mixed-precision)" } else { "" };
+    println!("\nLoading model weights{}...", prec_label);
     let load_start = Instant::now();
 
     // Use sharded loader for multi-file models (7B+), single loader otherwise
@@ -694,8 +697,52 @@ fn run_safetensors(
 
     let max_seq_len = llama_config.max_position_embeddings.unwrap_or(4096);
 
-    // Branch: FP16 mixed-precision or F32
-    let (result, kernel_stats) = if fp16 {
+    // Branch: Q4 quantized, FP16 mixed-precision, or F32
+    let (result, kernel_stats) = if q4 {
+        // Q4_0 quantized path — 6.4x memory savings
+        let model = match warp_loader::LlamaModelQ4::load_q4(&loader, &llama_config, &device) {
+            Ok(m) => {
+                let load_time = load_start.elapsed();
+                println!("Model loaded in {:.1}ms", load_time.as_secs_f64() * 1000.0);
+                println!("{}", m.summary());
+                m
+            }
+            Err(e) => {
+                eprintln!("Failed to load model: {e}");
+                std::process::exit(1);
+            }
+        };
+
+        let engine = warp_kernels::generate::QuantizedGenerationEngine {
+            config: model.transformer_config.clone(),
+            vocab_size: llama_config.vocab_size,
+            embed_tokens: model.embed_tokens,
+            layers: model.layers,
+            final_norm: model.final_norm,
+            lm_head: model.lm_head,
+            cache: warp_kernels::cache::KernelCache::new(),
+        };
+
+        println!("\nGenerating (max_seq_len={}, Q4_0 quantized)...\n", max_seq_len);
+        println!("--- output ---");
+
+        let result = match engine.generate_with_cache(&device, &prompt_ids, &gen_config, max_seq_len) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("\nGeneration failed: {e}");
+                std::process::exit(1);
+            }
+        };
+
+        if let Some(ref tok) = tokenizer {
+            let out_ids: Vec<u32> = result.tokens.iter().map(|&t| t as u32).collect();
+            let output = tok.decode(&out_ids);
+            println!("{}", output);
+        }
+        println!("--- end ---");
+
+        (result, engine.cache.stats())
+    } else if fp16 {
         // FP16 mixed-precision path
         let model = match warp_loader::LlamaModelF16::load_f16(&loader, &llama_config, &device) {
             Ok(m) => {

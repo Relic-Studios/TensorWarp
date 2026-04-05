@@ -24,7 +24,7 @@ pub mod hub;
 pub mod debug_model;
 
 pub use safetensors_loader::SafeTensorsLoader;
-pub use llama::{LlamaConfig, LlamaModel, LlamaModelF16};
+pub use llama::{LlamaConfig, LlamaModel, LlamaModelF16, LlamaModelQ4};
 pub use onnx::OnnxModel;
 pub use onnx_exec::OnnxExecutor;
 pub use graph_exec::GraphExecutor;

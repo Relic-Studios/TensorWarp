@@ -498,14 +498,16 @@ pub fn transformer_block_decode_q4(
     // 4. Append to KV cache
     kv.append(cache, device, &k_rope, &new_v)?;
 
-    // 5. Decode attention
-    let mut attn_out = GpuTensor::<f32>::zeros(device,
-        warp_ir::Shape::from_static(&[batch as usize, d as usize]), warp_ir::DType::F32)?;
-    crate::kv_cache::decode_attention(cache, device, &q_rope, kv, &mut attn_out, d)?;
+    // 5. Decode attention (multihead with GQA support)
+    let mut attn_out = GpuTensor::<f32>::zeros(device, shape_bh.clone(), warp_ir::DType::F32)?;
+    crate::kv_cache::decode_attention_multihead(
+        cache, device, &q_rope, kv, &mut attn_out,
+        config.num_heads, config.num_kv_heads, d,
+    )?;
 
-    // 6. Output projection — W4A16
+    // 6. Output projection — W4A16 (K=h, not K=d)
     let mut attn_projected = GpuTensor::<f32>::zeros(device, shape_bh.clone(), warp_ir::DType::F32)?;
-    quantize::gemm_q4_0(cache, device, &attn_out, &weights.wo, &mut attn_projected, bn, h, d)?;
+    quantize::gemm_q4_0(cache, device, &attn_out, &weights.wo, &mut attn_projected, bn, h, h)?;
 
     // 7+8. Fused residual + FFN norm (2 launches → 1)
     let mut ffn_normed = GpuTensor::<f32>::zeros(device, shape_bh.clone(), warp_ir::DType::F32)?;

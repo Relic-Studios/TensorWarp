@@ -5,6 +5,7 @@
 //! weight naming convention.
 
 use crate::safetensors_loader::{LoaderError, SafeTensorsLoader, ShardedSafeTensorsLoader};
+use warp_kernels::transformer::QuantizedBlockWeights;
 use warp_kernels::cache::KernelCache;
 use warp_kernels::device::{DeviceError, WarpDevice};
 use warp_kernels::tensor::GpuTensor;
@@ -400,6 +401,135 @@ impl LlamaModelF16 {
             self.config.intermediate_size,
             self.config.vocab_size,
             self.memory_bytes() as f64 / 1e9,
+        )
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// INT4 Quantized Model Loading
+// ═══════════════════════════════════════════════════════════════
+
+/// Load a single weight as F32, quantize to Q4_0 on GPU, free the F32.
+fn load_and_quantize_q4(
+    loader: &ShardedSafeTensorsLoader,
+    device: &WarpDevice,
+    name: &str,
+) -> Result<GpuTensor<u8>, LoaderError> {
+    let cache = warp_kernels::cache::KernelCache::new();
+    // Load as F32 (temporary — will be freed after quantization)
+    let f32_weight = loader.load_f32_transposed(name, device)?;
+    let numel = f32_weight.numel;
+
+    // Q4_0: each block of 32 elements → 20 bytes (4 byte scale + 16 packed nibbles)
+    let num_blocks = numel / 32;
+    let q4_bytes = num_blocks * 20;
+    let mut q4_weight = GpuTensor::<u8>::zeros(device,
+        warp_ir::Shape::from_static(&[q4_bytes]), warp_ir::DType::U8)
+        .map_err(|e| LoaderError::Device(e.to_string()))?;
+
+    // Quantize on GPU
+    warp_kernels::quantize::quantize_q4_0(&cache, device, &f32_weight, &mut q4_weight)
+        .map_err(|e| LoaderError::Device(e.to_string()))?;
+
+    // f32_weight is dropped here — VRAM freed
+    Ok(q4_weight)
+}
+
+fn load_layer_q4(
+    loader: &ShardedSafeTensorsLoader,
+    device: &WarpDevice,
+    prefix: &str,
+) -> Result<QuantizedBlockWeights, LoaderError> {
+    Ok(QuantizedBlockWeights {
+        attn_norm: loader.load_f32(&format!("{prefix}.input_layernorm.weight"), device)?,
+        wq: load_and_quantize_q4(loader, device, &format!("{prefix}.self_attn.q_proj.weight"))?,
+        wk: load_and_quantize_q4(loader, device, &format!("{prefix}.self_attn.k_proj.weight"))?,
+        wv: load_and_quantize_q4(loader, device, &format!("{prefix}.self_attn.v_proj.weight"))?,
+        wo: load_and_quantize_q4(loader, device, &format!("{prefix}.self_attn.o_proj.weight"))?,
+        ffn_norm: loader.load_f32(&format!("{prefix}.post_attention_layernorm.weight"), device)?,
+        w_gate: load_and_quantize_q4(loader, device, &format!("{prefix}.mlp.gate_proj.weight"))?,
+        w_up: load_and_quantize_q4(loader, device, &format!("{prefix}.mlp.up_proj.weight"))?,
+        w_down: load_and_quantize_q4(loader, device, &format!("{prefix}.mlp.down_proj.weight"))?,
+    })
+}
+
+/// A loaded LLaMA model with INT4 quantized weights.
+/// Weights quantized to Q4_0 on GPU during loading — 6.4x memory savings.
+pub struct LlamaModelQ4 {
+    pub config: LlamaConfig,
+    pub transformer_config: TransformerConfig,
+    pub embed_tokens: GpuTensor<f32>,
+    pub layers: Vec<QuantizedBlockWeights>,
+    pub final_norm: GpuTensor<f32>,
+    pub lm_head: GpuTensor<f32>,
+}
+
+impl LlamaModelQ4 {
+    /// Load model with on-the-fly INT4 quantization.
+    /// Loads each weight as F32, quantizes to Q4_0 on GPU, frees the F32.
+    /// Peak VRAM: one F32 weight matrix + all Q4 weights so far.
+    pub fn load_q4(
+        loader: &ShardedSafeTensorsLoader,
+        config: &LlamaConfig,
+        device: &WarpDevice,
+    ) -> Result<Self, LoaderError> {
+        let tc = config.to_transformer_config();
+        let h = config.hidden_size as usize;
+        let kv_dim = (config.num_key_value_heads * config.head_dim()) as usize;
+        let ffn = config.intermediate_size as usize;
+
+        // Embedding stays F32 (indexed by token ID, not multiplied)
+        let embed_tokens = loader.load_f32("model.embed_tokens.weight", device)?;
+
+        let mut layers = Vec::new();
+        for i in 0..config.num_hidden_layers {
+            let prefix = format!("model.layers.{i}");
+            log::info!("Quantizing layer {i}/{} to Q4_0...", config.num_hidden_layers);
+            let layer = load_layer_q4(loader, device, &prefix)?;
+            layers.push(layer);
+        }
+
+        let final_norm = loader.load_f32("model.norm.weight", device)?;
+
+        // LM head stays F32
+        let lm_head = if config.tie_word_embeddings {
+            match loader.load_f32_transposed("lm_head.weight", device) {
+                Ok(t) => t,
+                Err(_) => loader.load_f32_transposed("model.embed_tokens.weight", device)?,
+            }
+        } else {
+            match loader.load_f32_transposed("lm_head.weight", device) {
+                Ok(t) => t,
+                Err(_) => loader.load_f32_transposed("model.embed_tokens.weight", device)?,
+            }
+        };
+
+        Ok(Self {
+            config: config.clone(),
+            transformer_config: tc,
+            embed_tokens,
+            layers,
+            final_norm,
+            lm_head,
+        })
+    }
+
+    pub fn memory_bytes(&self) -> usize {
+        let mut total = self.embed_tokens.size_bytes() + self.final_norm.size_bytes() + self.lm_head.size_bytes();
+        for layer in &self.layers {
+            total += layer.attn_norm.size_bytes()
+                + layer.wq.size_bytes() + layer.wk.size_bytes() + layer.wv.size_bytes()
+                + layer.wo.size_bytes() + layer.ffn_norm.size_bytes()
+                + layer.w_gate.size_bytes() + layer.w_up.size_bytes() + layer.w_down.size_bytes();
+        }
+        total
+    }
+
+    pub fn summary(&self) -> String {
+        format!(
+            "LlamaModelQ4: {} layers, H={}, FFN={}, vocab={}, {:.1} GB (Q4_0 weights)",
+            self.layers.len(), self.config.hidden_size, self.config.intermediate_size,
+            self.config.vocab_size, self.memory_bytes() as f64 / 1e9,
         )
     }
 }
