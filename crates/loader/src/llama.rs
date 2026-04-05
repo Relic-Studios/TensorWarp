@@ -253,10 +253,25 @@ fn load_layer_f16(
     let bk = loader.load_f32(&format!("{prefix}.self_attn.k_proj.bias"), device).ok();
     let bv = loader.load_f32(&format!("{prefix}.self_attn.v_proj.bias"), device).ok();
 
+    let attn_norm = loader.load_f32(&format!("{prefix}.input_layernorm.weight"), device)?;
+    let ffn_norm = loader.load_f32(&format!("{prefix}.post_attention_layernorm.weight"), device)?;
+
+    // Pre-compute FP16 norm weights for the full FP16 pipeline
+    let cache = warp_kernels::cache::KernelCache::new();
+    let mut attn_norm_f16 = warp_kernels::tensor::GpuTensor::<half::f16>::zeros(device, attn_norm.shape.clone(), warp_ir::DType::F16)
+        .map_err(|e| LoaderError::Device(e.to_string()))?;
+    warp_kernels::fp16::cast_f32_to_f16(&cache, device, &attn_norm, &mut attn_norm_f16)
+        .map_err(|e| LoaderError::Device(e.to_string()))?;
+    let mut ffn_norm_f16 = warp_kernels::tensor::GpuTensor::<half::f16>::zeros(device, ffn_norm.shape.clone(), warp_ir::DType::F16)
+        .map_err(|e| LoaderError::Device(e.to_string()))?;
+    warp_kernels::fp16::cast_f32_to_f16(&cache, device, &ffn_norm, &mut ffn_norm_f16)
+        .map_err(|e| LoaderError::Device(e.to_string()))?;
+
     Ok(TransformerBlockWeightsF16 {
-        // Norms stay F32 for numerical stability
-        attn_norm: loader.load_f32(&format!("{prefix}.input_layernorm.weight"), device)?,
-        ffn_norm: loader.load_f32(&format!("{prefix}.post_attention_layernorm.weight"), device)?,
+        attn_norm,
+        ffn_norm,
+        attn_norm_f16: Some(attn_norm_f16),
+        ffn_norm_f16: Some(ffn_norm_f16),
         // Weight matrices loaded as FP16 — half the memory bandwidth
         wq: loader.load_f16_transposed(&format!("{prefix}.self_attn.q_proj.weight"), device)?,
         wk: loader.load_f16_transposed(&format!("{prefix}.self_attn.k_proj.weight"), device)?,

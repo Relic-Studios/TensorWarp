@@ -424,6 +424,204 @@ pub fn decode_attention(
     Ok(())
 }
 
+// ═══════════════════════════════════════════════════════════════
+// FP16 KV Cache — halves memory bandwidth for attention
+// ═══════════════════════════════════════════════════════════════
+
+/// FP16 KV cache for one transformer layer.
+pub struct LayerKVCacheF16 {
+    pub k: GpuTensor<half::f16>,
+    pub v: GpuTensor<half::f16>,
+    pub len: u32,
+    pub max_seq_len: u32,
+    pub kv_dim: u32,
+}
+
+impl LayerKVCacheF16 {
+    pub fn new(device: &WarpDevice, max_seq_len: u32, kv_dim: u32) -> Result<Self, DeviceError> {
+        let shape = Shape::from_static(&[max_seq_len as usize, kv_dim as usize]);
+        let k = GpuTensor::<half::f16>::zeros(device, shape.clone(), DType::F16)?;
+        let v = GpuTensor::<half::f16>::zeros(device, shape, DType::F16)?;
+        Ok(Self { k, v, len: 0, max_seq_len, kv_dim })
+    }
+
+    /// Bulk prefill from [seq_len, kv_dim] FP16 tensors.
+    pub fn prefill(
+        &mut self,
+        kernel_cache: &KernelCache,
+        device: &WarpDevice,
+        k_all: &GpuTensor<half::f16>,
+        v_all: &GpuTensor<half::f16>,
+        seq_len: u32,
+    ) -> Result<(), DeviceError> {
+        let f = kernel_cache.get_or_compile_with_opts(device, KV_CACHE_PREFILL_F16_SRC, "warp_kv_cache_prefill_f16", &[WarpDevice::cuda_include_path()], None)?;
+        let total = seq_len * self.kv_dim;
+        let cfg = LaunchConfig::for_num_elems(total);
+        unsafe {
+            device.stream.launch_builder(&f)
+                .arg(&mut self.k.data).arg(&k_all.data).arg(&seq_len).arg(&self.kv_dim).arg(&self.max_seq_len)
+                .launch(cfg)
+                .map_err(|e: cudarc::driver::result::DriverError| DeviceError::Launch(e.to_string()))?;
+            device.stream.launch_builder(&f)
+                .arg(&mut self.v.data).arg(&v_all.data).arg(&seq_len).arg(&self.kv_dim).arg(&self.max_seq_len)
+                .launch(cfg)
+                .map_err(|e: cudarc::driver::result::DriverError| DeviceError::Launch(e.to_string()))?;
+        }
+        self.len = seq_len;
+        Ok(())
+    }
+
+    /// Append K and V for one new token (FP16).
+    pub fn append(
+        &mut self,
+        kernel_cache: &KernelCache,
+        device: &WarpDevice,
+        new_k: &GpuTensor<half::f16>,
+        new_v: &GpuTensor<half::f16>,
+    ) -> Result<(), DeviceError> {
+        let f = kernel_cache.get_or_compile_with_opts(device, KV_CACHE_APPEND_F16_SRC, "warp_kv_cache_append_f16", &[WarpDevice::cuda_include_path()], None)?;
+        let cfg = LaunchConfig::for_num_elems(self.kv_dim);
+        unsafe {
+            device.stream.launch_builder(&f)
+                .arg(&mut self.k.data).arg(&mut self.v.data)
+                .arg(&new_k.data).arg(&new_v.data)
+                .arg(&self.len).arg(&self.kv_dim).arg(&self.max_seq_len)
+                .launch(cfg)
+                .map_err(|e: cudarc::driver::result::DriverError| DeviceError::Launch(e.to_string()))?;
+        }
+        self.len += 1;
+        Ok(())
+    }
+}
+
+const KV_CACHE_PREFILL_F16_SRC: &str = r#"
+#include <cuda_fp16.h>
+extern "C" __global__ void warp_kv_cache_prefill_f16(
+    half *cache, const half *src,
+    unsigned int seq_len, unsigned int dim, unsigned int max_seq
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = seq_len * dim;
+    if (idx >= total) return;
+    unsigned int pos = idx / dim;
+    if (pos >= max_seq) return;
+    cache[idx] = src[idx];
+}
+"#;
+
+const KV_CACHE_APPEND_F16_SRC: &str = r#"
+#include <cuda_fp16.h>
+extern "C" __global__ void warp_kv_cache_append_f16(
+    half *k_cache, half *v_cache,
+    const half *new_k, const half *new_v,
+    unsigned int pos, unsigned int dim, unsigned int max_seq
+) {
+    unsigned int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= dim || pos >= max_seq) return;
+    k_cache[pos * dim + d] = new_k[d];
+    v_cache[pos * dim + d] = new_v[d];
+}
+"#;
+
+/// FP16 multihead decode attention — all Q heads vs FP16 KV cache.
+const DECODE_ATTENTION_MULTIHEAD_F16_SRC: &str = r#"
+#include <cuda_fp16.h>
+extern "C" __global__ void warp_decode_attention_multihead_f16(
+    half *out,
+    const half *Q,
+    const half *K_cache,
+    const half *V_cache,
+    unsigned int cache_len,
+    unsigned int num_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    float scale
+) {
+    unsigned int q_head = blockIdx.x;
+    if (q_head >= num_heads) return;
+
+    unsigned int n_rep = num_heads / num_kv_heads;
+    unsigned int kv_head = q_head / n_rep;
+    unsigned int d = threadIdx.x;
+    if (d >= head_dim) return;
+
+    unsigned int kv_dim = num_kv_heads * head_dim;
+
+    float max_score = -1e30f;
+    float sum_exp = 0.0f;
+    float out_val = 0.0f;
+
+    for (unsigned int pos = 0; pos < cache_len; pos++) {
+        float score = 0.0f;
+        for (unsigned int dd = 0; dd < head_dim; dd++) {
+            score += __half2float(Q[q_head * head_dim + dd])
+                   * __half2float(K_cache[pos * kv_dim + kv_head * head_dim + dd]);
+        }
+        score *= scale;
+
+        float new_max = fmaxf(max_score, score);
+        float correction = expf(max_score - new_max);
+        float weight = expf(score - new_max);
+
+        sum_exp = sum_exp * correction + weight;
+        out_val = out_val * correction
+                + weight * __half2float(V_cache[pos * kv_dim + kv_head * head_dim + d]);
+        max_score = new_max;
+    }
+
+    out[q_head * head_dim + d] = __float2half(out_val / sum_exp);
+}
+"#;
+
+/// FP16 multihead decode attention.
+pub fn decode_attention_multihead_f16(
+    kernel_cache: &KernelCache,
+    device: &WarpDevice,
+    q: &GpuTensor<half::f16>,
+    kv: &LayerKVCacheF16,
+    out: &mut GpuTensor<half::f16>,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+) -> Result<(), DeviceError> {
+    if kv.len == 0 { return Ok(()); }
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let f = kernel_cache.get_or_compile_with_opts(device, DECODE_ATTENTION_MULTIHEAD_F16_SRC, "warp_decode_attention_multihead_f16", &[WarpDevice::cuda_include_path()], None)?;
+    let cfg = LaunchConfig {
+        grid_dim: (num_heads, 1, 1),
+        block_dim: (head_dim, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        device.stream.launch_builder(&f)
+            .arg(&mut out.data).arg(&q.data).arg(&kv.k.data).arg(&kv.v.data)
+            .arg(&kv.len).arg(&num_heads).arg(&num_kv_heads).arg(&head_dim).arg(&scale)
+            .launch(cfg)
+            .map_err(|e: cudarc::driver::result::DriverError| DeviceError::Launch(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// FP16 model KV cache (all layers).
+pub struct ModelKVCacheF16 {
+    pub layers: Vec<LayerKVCacheF16>,
+    pub max_seq_len: u32,
+}
+
+impl ModelKVCacheF16 {
+    pub fn new(device: &WarpDevice, num_layers: u32, max_seq_len: u32, kv_dim: u32) -> Result<Self, DeviceError> {
+        let mut layers = Vec::new();
+        for _ in 0..num_layers {
+            layers.push(LayerKVCacheF16::new(device, max_seq_len, kv_dim)?);
+        }
+        Ok(Self { layers, max_seq_len })
+    }
+
+    pub fn memory_bytes(&self) -> usize {
+        self.layers.iter().map(|l| l.k.size_bytes() + l.v.size_bytes()).sum()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

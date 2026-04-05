@@ -53,6 +53,9 @@ pub struct TransformerBlockWeightsF16 {
     pub bq: Option<GpuTensor<f32>>,
     pub bk: Option<GpuTensor<f32>>,
     pub bv: Option<GpuTensor<f32>>,
+    /// Pre-computed FP16 norm weights (avoid per-call casting)
+    pub attn_norm_f16: Option<GpuTensor<half::f16>>,
+    pub ffn_norm_f16: Option<GpuTensor<half::f16>>,
 }
 
 impl TransformerBlockWeightsF16 {
@@ -70,7 +73,36 @@ impl TransformerBlockWeightsF16 {
         if let Some(ref bq) = self.bq { total += bq.size_bytes(); }
         if let Some(ref bk) = self.bk { total += bk.size_bytes(); }
         if let Some(ref bv) = self.bv { total += bv.size_bytes(); }
+        if let Some(ref n) = self.attn_norm_f16 { total += n.size_bytes(); }
+        if let Some(ref n) = self.ffn_norm_f16 { total += n.size_bytes(); }
         total
+    }
+
+    /// Get FP16 attention norm weight (pre-computed or panic).
+    pub fn attn_norm_f16(&self) -> &GpuTensor<half::f16> {
+        self.attn_norm_f16.as_ref().expect("FP16 norm weights not prepared — call prepare_f16_norms first")
+    }
+
+    /// Get FP16 FFN norm weight (pre-computed or panic).
+    pub fn ffn_norm_f16(&self) -> &GpuTensor<half::f16> {
+        self.ffn_norm_f16.as_ref().expect("FP16 norm weights not prepared — call prepare_f16_norms first")
+    }
+
+    /// Pre-compute FP16 norm weights from F32 (call once at load time).
+    pub fn prepare_f16_norms(
+        &mut self,
+        cache: &crate::cache::KernelCache,
+        device: &crate::device::WarpDevice,
+    ) -> Result<(), crate::device::DeviceError> {
+        let mut attn_f16 = GpuTensor::<half::f16>::zeros(device, self.attn_norm.shape.clone(), warp_ir::DType::F16)?;
+        fp16::cast_f32_to_f16(cache, device, &self.attn_norm, &mut attn_f16)?;
+        self.attn_norm_f16 = Some(attn_f16);
+
+        let mut ffn_f16 = GpuTensor::<half::f16>::zeros(device, self.ffn_norm.shape.clone(), warp_ir::DType::F16)?;
+        fp16::cast_f32_to_f16(cache, device, &self.ffn_norm, &mut ffn_f16)?;
+        self.ffn_norm_f16 = Some(ffn_f16);
+
+        Ok(())
     }
 }
 
@@ -1398,6 +1430,117 @@ pub fn transformer_block_decode_f16_mixed_prealloc(
     // 11. Residual (F32)
     let mut output = GpuTensor::<f32>::zeros(device, shape_bh, warp_ir::DType::F32)?;
     ops::add(cache, device, &residual, &ffn_out, &mut output)?;
+
+    Ok(output)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Full FP16 decode — NO casting. Hidden state stays FP16 throughout.
+// Only cast F32→F16 once (from embedding) and F16→F32 once (for LM head argmax).
+// This eliminates 14 cast kernels per layer = 336 fewer launches for 24 layers.
+// ═══════════════════════════════════════════════════════════════
+
+/// Full FP16 transformer decode — hidden state stays FP16 across all operations.
+/// Norms compute internally in F32 for stability but input/output FP16.
+/// GEMMs use cuBLAS HGEMM (FP16 × FP16 → FP16 with F32 accumulate).
+/// Attention uses F32 accumulation internally but FP16 I/O.
+pub fn transformer_block_decode_full_f16(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    x: &GpuTensor<half::f16>,                // [1, H] FP16 input
+    weights: &TransformerBlockWeightsF16,
+    config: &TransformerConfig,
+    kv: &mut crate::kv_cache::LayerKVCacheF16,
+    batch: u32,
+    pos: u32,
+) -> Result<GpuTensor<half::f16>, DeviceError> {
+    let h = config.hidden_size;
+    let d = config.head_dim;
+    let kv_dim = config.kv_dim();
+    let ffn = config.ffn_dim;
+    let bn = batch;
+
+    let shape_bh = warp_ir::Shape::from_static(&[batch as usize, h as usize]);
+    let shape_bk = warp_ir::Shape::from_static(&[batch as usize, kv_dim as usize]);
+    let shape_bf = warp_ir::Shape::from_static(&[batch as usize, ffn as usize]);
+
+    // 1. RMSNorm (FP16 in → F32 internal → FP16 out)
+    let mut normed = GpuTensor::<half::f16>::zeros(device, shape_bh.clone(), warp_ir::DType::F16)?;
+    fp16::f16_rmsnorm(cache, device, x, &weights.attn_norm_f16(), &mut normed, h, config.norm_eps)?;
+
+    // 2. QKV GEMMs (FP16 × FP16 → FP16, tensor cores)
+    let mut q = GpuTensor::<half::f16>::zeros(device, shape_bh.clone(), warp_ir::DType::F16)?;
+    let mut new_k = GpuTensor::<half::f16>::zeros(device, shape_bk.clone(), warp_ir::DType::F16)?;
+    let mut new_v = GpuTensor::<half::f16>::zeros(device, shape_bk.clone(), warp_ir::DType::F16)?;
+
+    cublas_gemm::gemm_cublas_f16(device, &normed, &weights.wq, &mut q, bn, h, h)?;
+    cublas_gemm::gemm_cublas_f16(device, &normed, &weights.wk, &mut new_k, bn, kv_dim, h)?;
+    cublas_gemm::gemm_cublas_f16(device, &normed, &weights.wv, &mut new_v, bn, kv_dim, h)?;
+
+    // 2b. Biases (F32 bias added after casting — small overhead, maintains precision)
+    if let Some(ref bq) = weights.bq {
+        // For now, cast bias to F16 and use f16_add. Could pre-store F16 biases.
+        let mut bq_f16 = GpuTensor::<half::f16>::zeros(device, bq.shape.clone(), warp_ir::DType::F16)?;
+        fp16::cast_f32_to_f16(cache, device, bq, &mut bq_f16)?;
+        let mut qb = GpuTensor::<half::f16>::zeros(device, q.shape.clone(), warp_ir::DType::F16)?;
+        fp16::f16_add(cache, device, &q, &bq_f16, &mut qb)?;
+        q = qb;
+    }
+    if let Some(ref bk) = weights.bk {
+        let mut bk_f16 = GpuTensor::<half::f16>::zeros(device, bk.shape.clone(), warp_ir::DType::F16)?;
+        fp16::cast_f32_to_f16(cache, device, bk, &mut bk_f16)?;
+        let mut kb = GpuTensor::<half::f16>::zeros(device, new_k.shape.clone(), warp_ir::DType::F16)?;
+        fp16::f16_add(cache, device, &new_k, &bk_f16, &mut kb)?;
+        new_k = kb;
+    }
+    if let Some(ref bv) = weights.bv {
+        let mut bv_f16 = GpuTensor::<half::f16>::zeros(device, bv.shape.clone(), warp_ir::DType::F16)?;
+        fp16::cast_f32_to_f16(cache, device, bv, &mut bv_f16)?;
+        let mut vb = GpuTensor::<half::f16>::zeros(device, new_v.shape.clone(), warp_ir::DType::F16)?;
+        fp16::f16_add(cache, device, &new_v, &bv_f16, &mut vb)?;
+        new_v = vb;
+    }
+
+    // 3. RoPE (FP16)
+    let mut q_rope = GpuTensor::<half::f16>::zeros(device, shape_bh.clone(), warp_ir::DType::F16)?;
+    let mut k_rope = GpuTensor::<half::f16>::zeros(device, shape_bk.clone(), warp_ir::DType::F16)?;
+    fp16::f16_rope(cache, device, &q, &mut q_rope, batch * config.num_heads, 1, d, config.rope_base, pos)?;
+    fp16::f16_rope(cache, device, &new_k, &mut k_rope, batch * config.num_kv_heads, 1, d, config.rope_base, pos)?;
+
+    // 4. KV cache append + attention (FP16)
+    kv.append(cache, device, &k_rope, &new_v)?;
+    let mut attn_out = GpuTensor::<half::f16>::zeros(device, shape_bh.clone(), warp_ir::DType::F16)?;
+    crate::kv_cache::decode_attention_multihead_f16(
+        cache, device, &q_rope, kv, &mut attn_out,
+        config.num_heads, config.num_kv_heads, d,
+    )?;
+
+    // 5. Output projection (FP16 HGEMM)
+    let mut attn_proj = GpuTensor::<half::f16>::zeros(device, shape_bh.clone(), warp_ir::DType::F16)?;
+    cublas_gemm::gemm_cublas_f16(device, &attn_out, &weights.wo, &mut attn_proj, bn, h, h)?;
+
+    // 6+7. Fused residual + FFN norm (FP16 with F32 internal)
+    let mut ffn_normed = GpuTensor::<half::f16>::zeros(device, shape_bh.clone(), warp_ir::DType::F16)?;
+    let mut residual = GpuTensor::<half::f16>::zeros(device, shape_bh.clone(), warp_ir::DType::F16)?;
+    fp16::f16_fused_residual_rmsnorm(cache, device, &attn_proj, x, &weights.ffn_norm_f16(),
+        &mut ffn_normed, &mut residual, h, config.norm_eps)?;
+
+    // 8-9. Gate + Up + SwiGLU (FP16)
+    let mut gate = GpuTensor::<half::f16>::zeros(device, shape_bf.clone(), warp_ir::DType::F16)?;
+    let mut up = GpuTensor::<half::f16>::zeros(device, shape_bf.clone(), warp_ir::DType::F16)?;
+    cublas_gemm::gemm_cublas_f16(device, &ffn_normed, &weights.w_gate, &mut gate, bn, ffn, h)?;
+    cublas_gemm::gemm_cublas_f16(device, &ffn_normed, &weights.w_up, &mut up, bn, ffn, h)?;
+
+    let mut swiglu = GpuTensor::<half::f16>::zeros(device, shape_bf, warp_ir::DType::F16)?;
+    fp16::f16_fused_silu_mul(cache, device, &gate, &up, &mut swiglu)?;
+
+    // 10. Down projection (FP16 HGEMM)
+    let mut ffn_out = GpuTensor::<half::f16>::zeros(device, shape_bh.clone(), warp_ir::DType::F16)?;
+    cublas_gemm::gemm_cublas_f16(device, &swiglu, &weights.w_down, &mut ffn_out, bn, h, ffn)?;
+
+    // 11. Final residual (FP16)
+    let mut output = GpuTensor::<half::f16>::zeros(device, shape_bh, warp_ir::DType::F16)?;
+    fp16::f16_add(cache, device, &residual, &ffn_out, &mut output)?;
 
     Ok(output)
 }
