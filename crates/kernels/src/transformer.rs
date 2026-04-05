@@ -252,6 +252,10 @@ pub struct QuantizedBlockWeights {
     pub w_up: GpuTensor<u8>,
     /// Down projection [ffn_dim, hidden_size] — Q4_0
     pub w_down: GpuTensor<u8>,
+    /// Optional Q/K/V biases (Qwen, Phi — stays F32)
+    pub bq: Option<GpuTensor<f32>>,
+    pub bk: Option<GpuTensor<f32>>,
+    pub bv: Option<GpuTensor<f32>>,
 }
 
 /// Quantize a full-precision block's weights to Q4_0.
@@ -279,6 +283,7 @@ pub fn quantize_block_weights(
         w_gate: quantize::quantize_weights_q4_0(cache, device, &weights.w_gate, h, ffn)?,
         w_up: quantize::quantize_weights_q4_0(cache, device, &weights.w_up, h, ffn)?,
         w_down: quantize::quantize_weights_q4_0(cache, device, &weights.w_down, ffn, h)?,
+        bq: None, bk: None, bv: None,
     })
 }
 
@@ -488,6 +493,23 @@ pub fn transformer_block_decode_q4(
     quantize::gemm_q4_0(cache, device, &normed, &weights.wq, &mut q, bn, h, h)?;
     quantize::gemm_q4_0(cache, device, &normed, &weights.wk, &mut new_k, bn, kv_dim, h)?;
     quantize::gemm_q4_0(cache, device, &normed, &weights.wv, &mut new_v, bn, kv_dim, h)?;
+
+    // 2b. Biases (Qwen/Phi)
+    if let Some(ref bq) = weights.bq {
+        let mut qb = GpuTensor::<f32>::zeros(device, q.shape.clone(), warp_ir::DType::F32)?;
+        ops::broadcast_add(cache, device, &q, bq, &mut qb)?;
+        q = qb;
+    }
+    if let Some(ref bk) = weights.bk {
+        let mut kb = GpuTensor::<f32>::zeros(device, new_k.shape.clone(), warp_ir::DType::F32)?;
+        ops::broadcast_add(cache, device, &new_k, bk, &mut kb)?;
+        new_k = kb;
+    }
+    if let Some(ref bv) = weights.bv {
+        let mut vb = GpuTensor::<f32>::zeros(device, new_v.shape.clone(), warp_ir::DType::F32)?;
+        ops::broadcast_add(cache, device, &new_v, bv, &mut vb)?;
+        new_v = vb;
+    }
 
     // 3. RoPE
     let mut q_rope = GpuTensor::<f32>::zeros(device, shape_bh.clone(), warp_ir::DType::F32)?;
