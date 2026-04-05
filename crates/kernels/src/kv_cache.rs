@@ -243,6 +243,9 @@ impl ModelKVCache {
 ///
 /// NOTE: For long sequences (>512 tokens), prefer decode_attention_flash() which
 /// uses Split-K parallelization across the KV cache for 2-8x better performance.
+///
+/// For CUDA graph capture, use decode_attention_multihead_device_len() which
+/// reads cache_len from a device pointer instead of a kernel argument.
 const DECODE_ATTENTION_MULTIHEAD_SRC: &str = r#"
 extern "C" __global__ void warp_decode_attention_multihead(
     float *out,              // [num_heads * head_dim]
@@ -334,6 +337,81 @@ pub fn decode_attention_multihead(
             .arg(&kv.k.data)
             .arg(&kv.v.data)
             .arg(&kv.len)
+            .arg(&num_heads)
+            .arg(&num_kv_heads)
+            .arg(&head_dim)
+            .arg(&scale)
+            .launch(cfg)
+            .map_err(|e: cudarc::driver::result::DriverError| DeviceError::Launch(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Device-len variant: reads cache_len from device pointer for CUDA graph compatibility.
+const DECODE_ATTENTION_MULTIHEAD_DEVICE_LEN_SRC: &str = r#"
+extern "C" __global__ void warp_decode_attention_multihead_dl(
+    float *out, const float *Q, const float *K_cache, const float *V_cache,
+    const unsigned int *cache_len_buf,
+    unsigned int num_heads, unsigned int num_kv_heads, unsigned int head_dim, float scale
+) {
+    unsigned int cache_len = cache_len_buf[0];
+    unsigned int q_head = blockIdx.x;
+    if (q_head >= num_heads) return;
+    unsigned int n_rep = num_heads / num_kv_heads;
+    unsigned int kv_head = q_head / n_rep;
+    unsigned int d = threadIdx.x;
+    if (d >= head_dim) return;
+    unsigned int kv_dim = num_kv_heads * head_dim;
+
+    float max_score = -1e30f;
+    float sum_exp = 0.0f;
+    float out_val = 0.0f;
+
+    for (unsigned int pos = 0; pos < cache_len; pos++) {
+        float score = 0.0f;
+        for (unsigned int dd = 0; dd < head_dim; dd++) {
+            score += Q[q_head * head_dim + dd] * K_cache[pos * kv_dim + kv_head * head_dim + dd];
+        }
+        score *= scale;
+        float new_max = fmaxf(max_score, score);
+        float correction = expf(max_score - new_max);
+        float weight = expf(score - new_max);
+        sum_exp = sum_exp * correction + weight;
+        out_val = out_val * correction + weight * V_cache[pos * kv_dim + kv_head * head_dim + d];
+        max_score = new_max;
+    }
+    out[q_head * head_dim + d] = out_val / sum_exp;
+}
+"#;
+
+/// Device-len variant of multihead decode attention for CUDA graph capture.
+/// Reads cache_len from a device pointer instead of a kernel argument.
+pub fn decode_attention_multihead_device_len(
+    kernel_cache: &KernelCache,
+    device: &WarpDevice,
+    q: &GpuTensor<f32>,
+    kv: &LayerKVCache,
+    out: &mut GpuTensor<f32>,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    cache_len_buf: &cudarc::driver::CudaSlice<u32>,
+) -> Result<(), DeviceError> {
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let f = kernel_cache.get_or_compile(device, DECODE_ATTENTION_MULTIHEAD_DEVICE_LEN_SRC,
+        "warp_decode_attention_multihead_dl")?;
+    let cfg = LaunchConfig {
+        grid_dim: (num_heads, 1, 1),
+        block_dim: (head_dim, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        device.stream.launch_builder(&f)
+            .arg(&mut out.data)
+            .arg(&q.data)
+            .arg(&kv.k.data)
+            .arg(&kv.v.data)
+            .arg(cache_len_buf)
             .arg(&num_heads)
             .arg(&num_kv_heads)
             .arg(&head_dim)

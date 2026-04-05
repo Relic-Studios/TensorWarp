@@ -1808,6 +1808,93 @@ extern "C" __global__ void warp_fused_bias_rope_append(
 }
 "#;
 
+/// Device-pos variant: reads pos from a device pointer for CUDA graph compatibility.
+const FUSED_BIAS_ROPE_APPEND_DEVICE_POS_SRC: &str = r#"
+extern "C" __global__ void warp_fused_bias_rope_append_dp(
+    float *q_out, float *k_out,
+    float *k_cache, float *v_cache,
+    const float *q_in, const float *k_in, const float *v_in,
+    const float *bq, const float *bk, const float *bv,
+    unsigned int num_heads, unsigned int num_kv_heads,
+    unsigned int head_dim, unsigned int kv_dim,
+    const unsigned int *pos_buf,  // device pointer to pos
+    unsigned int max_seq, float rope_base, unsigned int has_bias
+) {
+    unsigned int pos = pos_buf[0];
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int q_total = num_heads * head_dim;
+    unsigned int half_d = head_dim / 2;
+
+    if (idx < q_total) {
+        unsigned int head = idx / head_dim;
+        unsigned int d = idx % head_dim;
+        unsigned int pair = d % half_d;
+        float freq = 1.0f / powf(rope_base, 2.0f * (float)pair / (float)head_dim);
+        float theta = (float)pos * freq;
+        float cos_t = cosf(theta); float sin_t = sinf(theta);
+        unsigned int base_off = head * head_dim;
+        float x0 = q_in[base_off + pair]; float x1 = q_in[base_off + pair + half_d];
+        if (has_bias) { x0 += bq[base_off + pair]; x1 += bq[base_off + pair + half_d]; }
+        if (d < half_d) q_out[idx] = x0 * cos_t - x1 * sin_t;
+        else q_out[idx] = x0 * sin_t + x1 * cos_t;
+    }
+
+    if (idx < kv_dim) {
+        unsigned int kv_head = idx / head_dim;
+        unsigned int d = idx % head_dim;
+        unsigned int pair = d % half_d;
+        float freq = 1.0f / powf(rope_base, 2.0f * (float)pair / (float)head_dim);
+        float theta = (float)pos * freq;
+        float cos_t = cosf(theta); float sin_t = sinf(theta);
+        unsigned int kv_base = kv_head * head_dim;
+        float k0 = k_in[kv_base + pair]; float k1 = k_in[kv_base + pair + half_d];
+        if (has_bias) { k0 += bk[kv_base + pair]; k1 += bk[kv_base + pair + half_d]; }
+        float k_roped;
+        if (d < half_d) k_roped = k0 * cos_t - k1 * sin_t;
+        else k_roped = k0 * sin_t + k1 * cos_t;
+        k_out[idx] = k_roped;
+        if (pos < max_seq) k_cache[pos * kv_dim + idx] = k_roped;
+        float vval = v_in[idx];
+        if (has_bias) vval += bv[idx];
+        if (pos < max_seq) v_cache[pos * kv_dim + idx] = vval;
+    }
+}
+"#;
+
+/// Fused bias + RoPE + KV cache append with device-side pos pointer.
+/// For CUDA graph capture: pos is read from device memory, not kernel arg.
+pub fn fused_bias_rope_append_device_pos(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    q_in: &GpuTensor<f32>, k_in: &GpuTensor<f32>, v_in: &GpuTensor<f32>,
+    q_out: &mut GpuTensor<f32>, k_out: &mut GpuTensor<f32>,
+    bq: &GpuTensor<f32>, bk: &GpuTensor<f32>, bv: &GpuTensor<f32>,
+    k_cache: &mut GpuTensor<f32>, v_cache: &mut GpuTensor<f32>,
+    num_heads: u32, num_kv_heads: u32, head_dim: u32, kv_dim: u32,
+    pos_buf: &cudarc::driver::CudaSlice<u32>,
+    max_seq: u32, rope_base: f32, has_bias: bool,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, FUSED_BIAS_ROPE_APPEND_DEVICE_POS_SRC,
+        "warp_fused_bias_rope_append_dp")?;
+    let q_total = num_heads * head_dim;
+    let total = q_total.max(kv_dim);
+    let cfg = LaunchConfig::for_num_elems(total);
+    let has_bias_flag: u32 = if has_bias { 1 } else { 0 };
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut q_out.data).arg(&mut k_out.data)
+            .arg(&mut k_cache.data).arg(&mut v_cache.data)
+            .arg(&q_in.data).arg(&k_in.data).arg(&v_in.data)
+            .arg(&bq.data).arg(&bk.data).arg(&bv.data)
+            .arg(&num_heads).arg(&num_kv_heads)
+            .arg(&head_dim).arg(&kv_dim)
+            .arg(pos_buf)
+            .arg(&max_seq).arg(&rope_base).arg(&has_bias_flag)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
 /// Fused bias + RoPE + KV cache append.
 ///
 /// Replaces 6 separate kernel launches with 1:

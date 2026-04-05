@@ -797,10 +797,17 @@ fn run_safetensors(
         }
         println!("Block-major weight reorder: {:.1}ms", reorder_start.elapsed().as_secs_f64() * 1000.0);
 
-        println!("\nGenerating (max_seq_len={}, Q4_0 quantized, pre-alloc)...\n", max_seq_len);
+        let use_graph = std::env::args().any(|a| a == "--graph");
+        let mode = if use_graph { "CUDA graph" } else { "pre-alloc" };
+        println!("\nGenerating (max_seq_len={}, Q4_0 quantized, {})...\n", max_seq_len, mode);
         println!("--- output ---");
 
-        let result = match engine.generate_prealloc(&device, &prompt_ids, &gen_config, max_seq_len) {
+        let result = if use_graph {
+            engine.generate_with_graph(&device, &prompt_ids, &gen_config, max_seq_len)
+        } else {
+            engine.generate_prealloc(&device, &prompt_ids, &gen_config, max_seq_len)
+        };
+        let result = match result {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("\nGeneration failed: {e}");

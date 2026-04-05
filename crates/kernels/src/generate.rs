@@ -1407,6 +1407,10 @@ pub struct Q4DecodeBuffers {
     pub normed: GpuTensor<f32>,
     pub logits: GpuTensor<f32>,
     pub layers: Vec<Q4LayerDecodeBuffers>,
+    /// Device-side pos buffer for CUDA graph capture (kernels read pos from here).
+    pub pos_buf: cudarc::driver::CudaSlice<u32>,
+    /// Device-side cache_len buffer (= pos + 1) for graph-captured attention.
+    pub cache_len_buf: cudarc::driver::CudaSlice<u32>,
 }
 
 impl Q4DecodeBuffers {
@@ -1455,6 +1459,8 @@ impl Q4DecodeBuffers {
             normed: GpuTensor::zeros(device, sh, DType::F32)?,
             logits: GpuTensor::zeros(device, Shape::from_static(&[1, v]), DType::F32)?,
             layers,
+            pos_buf: device.alloc_zeros::<u32>(1)?,
+            cache_len_buf: device.alloc_zeros::<u32>(1)?,
         })
     }
 
@@ -1595,6 +1601,275 @@ impl QuantizedGenerationEngine {
             &mut buffers.logits, 1, self.vocab_size, h)?;
 
         Ok(())
+    }
+
+    /// Graph-capturable decode: all position-dependent kernels read from device buffers.
+    /// Call this inside a CUDA graph capture closure.
+    fn forward_decode_graph_capturable(
+        &self,
+        device: &WarpDevice,
+        buffers: &mut Q4DecodeBuffers,
+        kv_cache: &mut ModelKVCache,
+    ) -> Result<(), DeviceError> {
+        let h = self.config.hidden_size;
+        let d = self.config.head_dim;
+        let kv_dim = self.config.kv_dim();
+        let ffn = self.config.ffn_dim;
+
+        sampling::embedding(&self.cache, device, &self.embed_tokens, &buffers.ids,
+            &mut buffers.hidden, 1, h)?;
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            let x_ptr: *const GpuTensor<f32> = if i == 0 {
+                &buffers.hidden as *const _
+            } else {
+                &buffers.layers[i - 1].output as *const _
+            };
+            let x: &GpuTensor<f32> = unsafe { &*x_ptr };
+            let lb = &mut buffers.layers[i];
+
+            ops::rmsnorm(&self.cache, device, x, &layer.attn_norm,
+                &mut lb.normed, h, self.config.norm_eps)?;
+
+            // Q, K, V — M=1 GEMM (block-major if available)
+            if let Some(ref wq_bm) = layer.wq_bm {
+                crate::quantize::gemm_q4_0_m1_blockmajor(&self.cache, device, &lb.normed, wq_bm, &mut lb.q, h, h)?;
+                crate::quantize::gemm_q4_0_m1_blockmajor(&self.cache, device, &lb.normed, layer.wk_bm.as_ref().unwrap(), &mut lb.k, kv_dim, h)?;
+                crate::quantize::gemm_q4_0_m1_blockmajor(&self.cache, device, &lb.normed, layer.wv_bm.as_ref().unwrap(), &mut lb.v, kv_dim, h)?;
+            } else {
+                crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.normed, &layer.wq, &mut lb.q, h, h)?;
+                crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.normed, &layer.wk, &mut lb.k, kv_dim, h)?;
+                crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.normed, &layer.wv, &mut lb.v, kv_dim, h)?;
+            }
+
+            // Fused bias + RoPE + KV append (DEVICE-POS variant for graph capture)
+            let has_bias = layer.bq.is_some();
+            let bq_ref = if has_bias { layer.bq.as_ref().unwrap() } else { &lb.q };
+            let bk_ref = if has_bias { layer.bk.as_ref().unwrap() } else { &lb.k };
+            let bv_ref = if has_bias { layer.bv.as_ref().unwrap() } else { &lb.v };
+
+            {
+                let kv_layer = &mut kv_cache.layers[i];
+                ops::fused_bias_rope_append_device_pos(
+                    &self.cache, device,
+                    &lb.q, &lb.k, &lb.v,
+                    &mut lb.q_rope, &mut lb.k_rope,
+                    bq_ref, bk_ref, bv_ref,
+                    &mut kv_layer.k, &mut kv_layer.v,
+                    self.config.num_heads, self.config.num_kv_heads, d,
+                    kv_dim, &buffers.pos_buf,
+                    kv_layer.max_seq_len, self.config.rope_base, has_bias,
+                )?;
+                // Note: kv_layer.len is updated on CPU side before replay
+
+                // Attention (DEVICE-LEN variant for graph capture)
+                crate::kv_cache::decode_attention_multihead_device_len(
+                    &self.cache, device, &lb.q_rope, kv_layer, &mut lb.attn_out,
+                    self.config.num_heads, self.config.num_kv_heads, d,
+                    &buffers.cache_len_buf,
+                )?;
+            }
+
+            // Output projection
+            if let Some(ref wo_bm) = layer.wo_bm {
+                crate::quantize::gemm_q4_0_m1_blockmajor(&self.cache, device, &lb.attn_out, wo_bm,
+                    &mut lb.attn_proj, h, h)?;
+            } else {
+                crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.attn_out, &layer.wo,
+                    &mut lb.attn_proj, h, h)?;
+            }
+
+            ops::fused_residual_rmsnorm(&self.cache, device, &lb.attn_proj, x,
+                &layer.ffn_norm, &mut lb.ffn_normed, &mut lb.residual,
+                h, self.config.norm_eps)?;
+
+            // FFN GEMMs
+            if let Some(ref wg_bm) = layer.w_gate_bm {
+                crate::quantize::gemm_q4_0_m1_blockmajor(&self.cache, device, &lb.ffn_normed, wg_bm,
+                    &mut lb.gate, ffn, h)?;
+                crate::quantize::gemm_q4_0_m1_blockmajor(&self.cache, device, &lb.ffn_normed, layer.w_up_bm.as_ref().unwrap(),
+                    &mut lb.up, ffn, h)?;
+            } else {
+                crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.ffn_normed, &layer.w_gate,
+                    &mut lb.gate, ffn, h)?;
+                crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.ffn_normed, &layer.w_up,
+                    &mut lb.up, ffn, h)?;
+            }
+
+            ops::fused_silu_mul(&self.cache, device, &lb.gate, &lb.up, &mut lb.swiglu)?;
+
+            if let Some(ref wd_bm) = layer.w_down_bm {
+                crate::quantize::gemm_q4_0_m1_blockmajor(&self.cache, device, &lb.swiglu, wd_bm,
+                    &mut lb.ffn_out, h, ffn)?;
+            } else {
+                crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.swiglu, &layer.w_down,
+                    &mut lb.ffn_out, h, ffn)?;
+            }
+
+            ops::add(&self.cache, device, &lb.residual, &lb.ffn_out, &mut lb.output)?;
+        }
+
+        // NOTE: final norm + LM head are run OUTSIDE the graph (cuBLAS compatibility)
+        // The graph captures only the transformer layers.
+
+        Ok(())
+    }
+
+    /// Run final norm + LM head (outside graph, uses cuBLAS which may not be graph-safe).
+    fn forward_lm_head(&self, device: &WarpDevice, buffers: &mut Q4DecodeBuffers) -> Result<(), DeviceError> {
+        let h = self.config.hidden_size;
+        let last_layer = self.layers.len() - 1;
+        ops::rmsnorm(&self.cache, device, &buffers.layers[last_layer].output,
+            &self.final_norm, &mut buffers.normed, h, self.config.norm_eps)?;
+        ops::gemm(&self.cache, device, &buffers.normed, &self.lm_head,
+            &mut buffers.logits, 1, self.vocab_size, h)?;
+        Ok(())
+    }
+
+    /// Generate with CUDA graph capture — single GPU launch per decode step.
+    /// First decode step runs eagerly (captures graph + warms up kernels).
+    /// All subsequent steps replay the graph with updated pos/cache_len.
+    pub fn generate_with_graph(
+        &self,
+        device: &WarpDevice,
+        prompt_ids: &[i32],
+        gen_config: &GenerateConfig,
+        max_seq_len: u32,
+    ) -> Result<GenerationResult, DeviceError> {
+        let kv_dim = self.config.kv_dim();
+        let num_layers = self.layers.len() as u32;
+        let vocab = self.vocab_size as usize;
+
+        let mut kv_cache = ModelKVCache::new(device, num_layers, max_seq_len, kv_dim)?;
+        let mut buffers = Q4DecodeBuffers::allocate(
+            device, &self.config, self.layers.len(), self.vocab_size,
+        )?;
+
+        // Prefill (eager, allocating path — one-shot)
+        let prefill_start = std::time::Instant::now();
+        let logits = self.forward_prefill(device, prompt_ids, &mut kv_cache)?;
+        device.synchronize()?;
+        let prefill_time = prefill_start.elapsed();
+
+        let all_logits = logits.to_host(device)?;
+        let prompt_len = prompt_ids.len();
+        let mut last_logits = all_logits[(prompt_len - 1) * vocab..prompt_len * vocab].to_vec();
+
+        // Warmup: run first decode step eagerly to compile all kernels
+        let decode_start = std::time::Instant::now();
+        let mut generated = Vec::new();
+        let mut pos = prompt_len as u32;
+
+        let base_seed: u64 = prompt_ids.iter().fold(42u64, |acc, &t| {
+            acc.wrapping_mul(6364136223846793005).wrapping_add(t as u64)
+        });
+
+        // Step 0: warmup decode (compiles kernels, no graph yet)
+        {
+            let rng_seed = base_seed;
+            let next_token = sample_token(&last_logits, gen_config, &generated, rng_seed);
+            if let Some(eos) = gen_config.eos_token_id {
+                if next_token == eos {
+                    let decode_time = decode_start.elapsed();
+                    return Ok(GenerationResult {
+                        tokens: vec![], prefill_time, decode_time, tokens_generated: 0,
+                        prefill_tokens: prompt_len,
+                        tokens_per_sec: 0.0, kv_cache_memory_bytes: kv_cache.memory_bytes(),
+                    });
+                }
+            }
+            generated.push(next_token);
+            device.htod_copy(&[next_token], &mut buffers.ids.data)?;
+            // Update device-side pos buffers
+            device.htod_copy(&[pos], &mut buffers.pos_buf)?;
+            device.htod_copy(&[pos + 1], &mut buffers.cache_len_buf)?;
+            // Run eagerly (warms up kernel cache including device-pos variants)
+            self.forward_decode_graph_capturable(device, &mut buffers, &mut kv_cache)?;
+            self.forward_lm_head(device, &mut buffers)?;
+            device.synchronize()?;
+            // Update KV cache lengths on CPU side
+            for kv_layer in &mut kv_cache.layers {
+                kv_layer.len = pos + 1;
+            }
+            last_logits = buffers.logits.to_host(device)?;
+            pos += 1;
+        }
+
+        // Capture CUDA graph on a dedicated stream
+        let capture_stream = device.ctx.new_stream()
+            .map_err(|e| DeviceError::Launch(format!("capture stream: {e}")))?;
+        let graph_device = device.with_stream(capture_stream.clone());
+
+        // Set up pos/cache_len for capture (values don't matter — graph records addresses not values)
+        graph_device.htod_copy(&[pos], &mut buffers.pos_buf)?;
+        graph_device.htod_copy(&[pos + 1], &mut buffers.cache_len_buf)?;
+        graph_device.synchronize()?;
+
+        // Pre-compile all device-pos kernels by running once on the capture stream (NOT captured yet)
+        self.forward_decode_graph_capturable(&graph_device, &mut buffers, &mut kv_cache)?;
+        graph_device.synchronize()?;
+        // Reset KV cache lengths (the pre-compile run wrote to cache)
+        for kv_layer in &mut kv_cache.layers {
+            kv_layer.len = pos; // undo the append from pre-compile run
+        }
+
+        // NOW capture the graph
+        let graph = crate::cuda_graph::GraphCapture::record_with_device(
+            &graph_device, &capture_stream,
+            || {
+                self.forward_decode_graph_capturable(&graph_device, &mut buffers, &mut kv_cache)?;
+                Ok(())
+            },
+        )?;
+
+        // Decode loop: replay graph with updated pos
+        for step in 1..gen_config.max_tokens {
+            let rng_seed = base_seed.wrapping_add(step as u64);
+            let next_token = sample_token(&last_logits, gen_config, &generated, rng_seed);
+
+            if let Some(eos) = gen_config.eos_token_id {
+                if next_token == eos { break; }
+            }
+            generated.push(next_token);
+
+            if !gen_config.stop_sequences.is_empty()
+                && matches_stop_sequence(&generated, &gen_config.stop_sequences)
+            { break; }
+
+            // Update device-side buffers (tiny async copies, no sync needed)
+            device.htod_copy(&[next_token], &mut buffers.ids.data)?;
+            device.htod_copy(&[pos], &mut buffers.pos_buf)?;
+            device.htod_copy(&[pos + 1], &mut buffers.cache_len_buf)?;
+
+            // Replay graph — single GPU launch for all transformer layers!
+            graph.replay()?;
+
+            // LM head runs eagerly (cuBLAS may not be graph-safe)
+            self.forward_lm_head(device, &mut buffers)?;
+            device.synchronize()?;
+
+            // Update KV cache lengths on CPU side
+            for kv_layer in &mut kv_cache.layers {
+                kv_layer.len = pos + 1;
+            }
+
+            last_logits = buffers.logits.to_host(device)?;
+            pos += 1;
+        }
+
+        let decode_time = decode_start.elapsed();
+
+        Ok(GenerationResult {
+            tokens: generated.clone(),
+            prefill_time,
+            decode_time,
+            tokens_generated: generated.len(),
+            prefill_tokens: prompt_len,
+            tokens_per_sec: if decode_time.as_secs_f64() > 0.0 {
+                generated.len() as f64 / decode_time.as_secs_f64()
+            } else { 0.0 },
+            kv_cache_memory_bytes: kv_cache.memory_bytes(),
+        })
     }
 
     /// Generate with pre-allocated decode buffers — zero cudaMalloc during generation.
