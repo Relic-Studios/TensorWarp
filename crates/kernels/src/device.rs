@@ -12,6 +12,10 @@ use cudarc::driver::result::DriverError;
 use cudarc::nvrtc;
 use std::sync::Arc;
 
+/// cuBLAS workspace size (256 MB) — pre-allocated for CUDA graph capture compatibility.
+/// Without this, cuBLAS may attempt stream-ordered allocation during graph capture, which fails.
+const CUBLAS_WORKSPACE_SIZE: usize = 256 * 1024 * 1024;
+
 /// Warp's GPU device handle.
 pub struct WarpDevice {
     /// The underlying cudarc CUDA context.
@@ -27,6 +31,9 @@ pub struct WarpDevice {
     /// cuBLAS handle for high-performance GEMM.
     /// Created eagerly on device init — cuBLAS is always available.
     pub blas: CudaBlas,
+    /// Pre-allocated cuBLAS workspace for CUDA graph capture.
+    /// Must outlive the cuBLAS handle.
+    _cublas_workspace: cudarc::driver::CudaSlice<u8>,
 }
 
 impl WarpDevice {
@@ -57,6 +64,22 @@ impl WarpDevice {
             );
         }
 
+        // Pre-allocate cuBLAS workspace for CUDA graph capture compatibility.
+        // Without this, cuBLAS uses stream-ordered allocation which is prohibited during capture.
+        let cublas_workspace: cudarc::driver::CudaSlice<u8> = stream
+            .alloc_zeros(CUBLAS_WORKSPACE_SIZE)
+            .map_err(|e| DeviceError::Memory(format!("cuBLAS workspace alloc: {e}")))?;
+        unsafe {
+            let status = cudarc::cublas::sys::cublasSetWorkspace_v2(
+                *blas.handle(),
+                cublas_workspace.cu_device_ptr as *mut std::ffi::c_void,
+                CUBLAS_WORKSPACE_SIZE,
+            );
+            if status != cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                return Err(DeviceError::Init(format!("cublasSetWorkspace failed: {:?}", status)));
+            }
+        }
+
         Ok(Self {
             ctx,
             stream,
@@ -64,6 +87,7 @@ impl WarpDevice {
             compute_capability: (major, minor),
             sm_version,
             blas,
+            _cublas_workspace: cublas_workspace,
         })
     }
 
@@ -202,10 +226,33 @@ impl WarpDevice {
 
     /// Create a clone of this device pointing to a different stream.
     /// Used for CUDA graph capture — the capture stream records kernel launches.
-    /// Creates a new cuBLAS handle bound to the given stream.
+    /// Creates a new cuBLAS handle bound to the given stream with pre-allocated workspace.
     pub fn with_stream(&self, stream: std::sync::Arc<CudaStream>) -> Self {
         let blas = CudaBlas::new(stream.clone())
             .expect("cuBLAS init failed for new stream");
+
+        // Enable tensor core math on the new handle
+        unsafe {
+            cudarc::cublas::sys::cublasSetMathMode(
+                *blas.handle(),
+                cudarc::cublas::sys::cublasMath_t::CUBLAS_TENSOR_OP_MATH,
+            );
+        }
+
+        // Pre-allocate workspace for the capture stream's cuBLAS handle
+        let cublas_workspace: cudarc::driver::CudaSlice<u8> = stream
+            .alloc_zeros(CUBLAS_WORKSPACE_SIZE)
+            .expect("cuBLAS workspace alloc failed for new stream");
+        unsafe {
+            let status = cudarc::cublas::sys::cublasSetWorkspace_v2(
+                *blas.handle(),
+                cublas_workspace.cu_device_ptr as *mut std::ffi::c_void,
+                CUBLAS_WORKSPACE_SIZE,
+            );
+            assert_eq!(status, cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS,
+                "cublasSetWorkspace failed on capture stream");
+        }
+
         Self {
             ctx: self.ctx.clone(),
             stream,
@@ -213,6 +260,7 @@ impl WarpDevice {
             compute_capability: self.compute_capability,
             sm_version: self.sm_version,
             blas,
+            _cublas_workspace: cublas_workspace,
         }
     }
 

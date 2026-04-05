@@ -521,6 +521,273 @@ pub fn quantize_weights_q8_0(
     )
 }
 
+// ── Q4_0 → FP16 Dequantization (ExLlamaV2-style) ───────────────
+//
+// Pre-dequantize Q4_0 column-block weights to a standard row-major FP16
+// matrix. This is done ONCE at model load. At inference time, we use
+// cublasHgemm on the FP16 weights instead of the custom 32×32 tile GEMM.
+//
+// This trades VRAM (2× more than Q4) for much higher throughput from
+// cuBLAS's optimized memory access patterns and tensor core utilization.
+
+const DEQUANT_Q4_TO_F16_SRC: &str = r#"
+#include <cuda_fp16.h>
+extern "C" __global__ void warp_dequant_q4_to_f16(
+    __half *out,                    // [K, N] row-major FP16
+    const unsigned char *B_quant,   // Q4_0 column-block format
+    unsigned int K,
+    unsigned int N,
+    unsigned int num_k_blocks       // K / 32
+) {
+    // Each thread dequantizes one element of the output matrix
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = K * N;
+    if (idx >= total) return;
+
+    unsigned int row = idx / N;   // K dimension
+    unsigned int col = idx % N;   // N dimension
+
+    // Find the Q4_0 block: column col, block (row / 32)
+    unsigned int block_idx = row / 32;
+    unsigned int elem_in_block = row % 32;
+    unsigned int block_offset = (col * num_k_blocks + block_idx) * 20;
+
+    // Read scale (f32 at block start)
+    float scale = *((const float *)(B_quant + block_offset));
+
+    // Read packed nibble
+    unsigned int byte_idx = elem_in_block / 2;
+    unsigned char byte = B_quant[block_offset + 4 + byte_idx];
+    int q;
+    if (elem_in_block % 2 == 0) {
+        q = (byte & 0x0F) - 8;
+    } else {
+        q = ((byte >> 4) & 0x0F) - 8;
+    }
+
+    out[row * N + col] = __float2half(scale * (float)q);
+}
+"#;
+
+/// Dequantize Q4_0 column-block weights to a standard row-major FP16 matrix.
+///
+/// This is the ExLlamaV2-style approach: dequant once at load time, then
+/// use cublasHgemm for all subsequent GEMM calls.
+///
+/// b_quant: Q4_0 column-block format (from `quantize_weights_q4_0`)
+/// Returns: [K, N] row-major FP16 tensor
+pub fn dequant_q4_to_f16(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    b_quant: &GpuTensor<u8>,
+    k: u32,
+    n: u32,
+) -> Result<GpuTensor<half::f16>, DeviceError> {
+    assert!(k % BLOCK_SIZE == 0, "K must be divisible by {BLOCK_SIZE}");
+    let num_k_blocks = k / BLOCK_SIZE;
+    let total_elements = (k * n) as usize;
+
+    let mut output = GpuTensor::<half::f16>::zeros(
+        device,
+        warp_ir::Shape::from_static(&[k as usize, n as usize]),
+        warp_ir::DType::F16,
+    )?;
+
+    let include = crate::device::WarpDevice::cuda_include_path();
+    let f = cache.get_or_compile_with_opts(device, DEQUANT_Q4_TO_F16_SRC, "warp_dequant_q4_to_f16", &[include], None)?;
+
+    let threads = 256u32;
+    let blocks = (total_elements as u32 + threads - 1) / threads;
+    let cfg = LaunchConfig {
+        grid_dim: (blocks, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut output.data)
+            .arg(&b_quant.data)
+            .arg(&k)
+            .arg(&n)
+            .arg(&num_k_blocks)
+            .launch(cfg))?;
+    }
+    Ok(output)
+}
+
+/// Pre-dequantized FP16 weight set for a transformer block.
+/// Created once at model load from QuantizedBlockWeights.
+/// Uses 2× more VRAM than Q4 but enables cuBLAS HGEMM.
+pub struct DequantizedF16Weights {
+    pub attn_norm: GpuTensor<f32>,
+    pub wq: GpuTensor<half::f16>,    // [hidden, hidden]
+    pub wk: GpuTensor<half::f16>,    // [hidden, kv_dim]
+    pub wv: GpuTensor<half::f16>,    // [hidden, kv_dim]
+    pub wo: GpuTensor<half::f16>,    // [hidden, hidden]
+    pub ffn_norm: GpuTensor<f32>,
+    pub w_gate: GpuTensor<half::f16>, // [hidden, ffn_dim]
+    pub w_up: GpuTensor<half::f16>,   // [hidden, ffn_dim]
+    pub w_down: GpuTensor<half::f16>, // [ffn_dim, hidden]
+    pub bq: Option<GpuTensor<f32>>,
+    pub bk: Option<GpuTensor<f32>>,
+    pub bv: Option<GpuTensor<f32>>,
+}
+
+impl DequantizedF16Weights {
+    /// Convert QuantizedBlockWeights to pre-dequantized FP16.
+    /// This is a one-time cost at model load that enables cuBLAS HGEMM.
+    pub fn from_quantized(
+        cache: &KernelCache,
+        device: &WarpDevice,
+        q: &crate::transformer::QuantizedBlockWeights,
+        config: &crate::transformer::TransformerConfig,
+    ) -> Result<Self, DeviceError> {
+        let h = config.hidden_size;
+        let kv = config.kv_dim();
+        let ffn = config.ffn_dim;
+
+        Ok(Self {
+            attn_norm: GpuTensor::from_host(device,
+                &q.attn_norm.to_host(device)?,
+                q.attn_norm.shape.clone(), warp_ir::DType::F32)?,
+            wq: dequant_q4_to_f16(cache, device, &q.wq, h, h)?,
+            wk: dequant_q4_to_f16(cache, device, &q.wk, h, kv)?,
+            wv: dequant_q4_to_f16(cache, device, &q.wv, h, kv)?,
+            wo: dequant_q4_to_f16(cache, device, &q.wo, h, h)?,
+            ffn_norm: GpuTensor::from_host(device,
+                &q.ffn_norm.to_host(device)?,
+                q.ffn_norm.shape.clone(), warp_ir::DType::F32)?,
+            w_gate: dequant_q4_to_f16(cache, device, &q.w_gate, h, ffn)?,
+            w_up: dequant_q4_to_f16(cache, device, &q.w_up, h, ffn)?,
+            w_down: dequant_q4_to_f16(cache, device, &q.w_down, ffn, h)?,
+            bq: match &q.bq {
+                Some(t) => Some(GpuTensor::from_host(device, &t.to_host(device)?, t.shape.clone(), warp_ir::DType::F32)?),
+                None => None,
+            },
+            bk: match &q.bk {
+                Some(t) => Some(GpuTensor::from_host(device, &t.to_host(device)?, t.shape.clone(), warp_ir::DType::F32)?),
+                None => None,
+            },
+            bv: match &q.bv {
+                Some(t) => Some(GpuTensor::from_host(device, &t.to_host(device)?, t.shape.clone(), warp_ir::DType::F32)?),
+                None => None,
+            },
+        })
+    }
+
+    /// VRAM usage in bytes.
+    pub fn memory_bytes(&self) -> usize {
+        self.wq.size_bytes() + self.wk.size_bytes() + self.wv.size_bytes()
+            + self.wo.size_bytes() + self.w_gate.size_bytes()
+            + self.w_up.size_bytes() + self.w_down.size_bytes()
+            + self.attn_norm.size_bytes() + self.ffn_norm.size_bytes()
+    }
+}
+
+// ── M=1 Specialized Q4_0 GEMM (decode-optimized) ───────────────
+//
+// For M=1 (single-token decode), the generic 32×32 tiled kernel wastes
+// 31/32 threads in the M dimension. This specialized kernel assigns
+// one thread per output column, with each thread computing the full
+// K-dimension dot product. Expected: 5-10x speedup for M=1.
+
+const GEMM_Q4_0_M1_SRC: &str = r#"
+extern "C" __global__ void warp_gemm_q4_0_m1(
+    float* __restrict__ C,
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ B_q4,
+    int K,
+    int N
+) {
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= N) return;
+
+    float dot = 0.0f;
+    const int num_k_blocks = K / 32;
+
+    // Base pointer for column n
+    const unsigned char* B_col = B_q4 + (long long)n * num_k_blocks * 20;
+
+    for (int b = 0; b < num_k_blocks; b++) {
+        const unsigned char* blk = B_col + (long long)b * 20;
+
+        // Load scale
+        float scale = *((const float*)blk);
+
+        // Load 16 packed bytes as 4 uints for efficient aligned access
+        const unsigned int* packed = (const unsigned int*)(blk + 4);
+        unsigned int val0 = packed[0];
+        unsigned int val1 = packed[1];
+        unsigned int val2 = packed[2];
+        unsigned int val3 = packed[3];
+
+        int k_base = b * 32;
+
+        // Unroll: each uint = 4 bytes = 8 elements
+        #define PROCESS_UINT(V, offset) { \
+            unsigned int _v = V; \
+            for (int i = 0; i < 4; i++) { \
+                unsigned char byte = (_v >> (i * 8)) & 0xFF; \
+                float q0 = (float)((byte & 0x0F) - 8) * scale; \
+                float q1 = (float)(((byte >> 4) & 0x0F) - 8) * scale; \
+                int ki = k_base + (offset) + i * 2; \
+                dot += __ldg(&A[ki]) * q0; \
+                dot += __ldg(&A[ki + 1]) * q1; \
+            } \
+        }
+
+        PROCESS_UINT(val0, 0);
+        PROCESS_UINT(val1, 8);
+        PROCESS_UINT(val2, 16);
+        PROCESS_UINT(val3, 24);
+
+        #undef PROCESS_UINT
+    }
+
+    C[n] = dot;
+}
+"#;
+
+/// M=1 specialized Q4_0 GEMM: C[1,N] = A[1,K] × dequant(B_q4[K,N])
+///
+/// ~5-10x faster than the generic 32×32 tiled kernel for single-token decode.
+/// One thread per output column, full K dot product per thread.
+pub fn gemm_q4_0_m1(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    a: &GpuTensor<f32>,       // [1, K]
+    b_quant: &GpuTensor<u8>,  // quantized [K, N]
+    c: &mut GpuTensor<f32>,   // [1, N]
+    n: u32,
+    k: u32,
+) -> Result<(), DeviceError> {
+    assert!(k % BLOCK_SIZE == 0, "K must be divisible by {BLOCK_SIZE}");
+
+    let f = cache.get_or_compile(device, GEMM_Q4_0_M1_SRC, "warp_gemm_q4_0_m1")?;
+    let threads = 256u32;
+    let blocks = (n + threads - 1) / threads;
+    let cfg = LaunchConfig {
+        grid_dim: (blocks, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let k_i = k as i32;
+    let n_i = n as i32;
+
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut c.data)
+            .arg(&a.data)
+            .arg(&b_quant.data)
+            .arg(&k_i)
+            .arg(&n_i)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
 /// W4A16 Quantized GEMM: C = A × dequant(B_q4)
 ///
 /// A: [M, K] f32 activations
@@ -2308,5 +2575,68 @@ mod tests {
         assert!(max_abs_err < 1.5, "Per-channel INT8 GEMM max error {max_abs_err} >= 1.5");
         assert!(nrmse < 0.10, "Per-channel INT8 GEMM NRMSE {nrmse:.4} too high");
         println!("  PASSED");
+    }
+
+    #[test]
+    fn dequant_q4_to_f16_correctness() {
+        let (dev, cache) = match setup() {
+            Some(s) => s,
+            None => { println!("No CUDA, skipping"); return; }
+        };
+
+        let k = 128u32;
+        let n = 64u32;
+
+        // Create random weights [K, N]
+        let w_data: Vec<f32> = (0..(k * n) as usize)
+            .map(|i| ((i * 17 + 3) % 101) as f32 * 0.02 - 1.0)
+            .collect();
+        let weights = GpuTensor::from_host(&dev, &w_data,
+            warp_ir::Shape::from_static(&[k as usize, n as usize]), warp_ir::DType::F32).unwrap();
+
+        // Quantize to Q4_0
+        let q4_weights = quantize_weights_q4_0(&cache, &dev, &weights, k, n).unwrap();
+        dev.synchronize().unwrap();
+
+        // Dequant to FP16
+        let f16_weights = dequant_q4_to_f16(&cache, &dev, &q4_weights, k, n).unwrap();
+        dev.synchronize().unwrap();
+
+        // Read back FP16 and compare with CPU-dequanted Q4
+        let f16_host = f16_weights.to_host(&dev).unwrap();
+
+        // Also dequant on CPU for reference by reading Q4 data
+        let q4_host = q4_weights.to_host(&dev).unwrap();
+        let num_k_blocks = k / BLOCK_SIZE;
+
+        let mut max_err = 0.0f32;
+        for row in 0..k as usize {
+            for col in 0..n as usize {
+                let block_idx = row / 32;
+                let elem = row % 32;
+                let block_offset = (col * num_k_blocks as usize + block_idx) * Q4_0_BLOCK_BYTES as usize;
+
+                let scale = f32::from_le_bytes([
+                    q4_host[block_offset],
+                    q4_host[block_offset + 1],
+                    q4_host[block_offset + 2],
+                    q4_host[block_offset + 3],
+                ]);
+                let byte_idx = elem / 2;
+                let byte = q4_host[block_offset + 4 + byte_idx];
+                let q = if elem % 2 == 0 {
+                    (byte & 0x0F) as i32 - 8
+                } else {
+                    ((byte >> 4) & 0x0F) as i32 - 8
+                };
+                let expected = scale * q as f32;
+                let actual = f16_host[row * n as usize + col].to_f32();
+                let err = (expected - actual).abs();
+                max_err = max_err.max(err);
+            }
+        }
+
+        println!("Q4→FP16 dequant ({k}x{n}): max error = {max_err:.6}");
+        assert!(max_err < 0.01, "Q4→FP16 dequant max error {max_err} too high");
     }
 }

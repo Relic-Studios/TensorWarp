@@ -54,7 +54,8 @@ fn main() {
             let temperature = parse_f32_arg(&args, "--temperature").unwrap_or(0.7);
             let fp16 = args.iter().any(|a| a == "--fp16");
             let q4 = args.iter().any(|a| a == "--q4");
-            cmd_run(model_id, &prompt, max_tokens, temperature, fp16, q4);
+            let q4_f16 = args.iter().any(|a| a == "--q4-f16");
+            cmd_run(model_id, &prompt, max_tokens, temperature, fp16, q4, q4_f16);
         }
         "compile" => {
             let path = args.get(2).map(|s| s.as_str()).unwrap_or("");
@@ -428,7 +429,7 @@ fn cmd_profile() {
     println!("\n{}", cache.stats());
 }
 
-fn cmd_run(model_id: &str, prompt: &str, max_tokens: u32, temperature: f32, fp16: bool, q4: bool) {
+fn cmd_run(model_id: &str, prompt: &str, max_tokens: u32, temperature: f32, fp16: bool, q4: bool, q4_f16: bool) {
     println!("=== TensorWarp Run ===\n");
 
     let total_start = Instant::now();
@@ -468,7 +469,7 @@ fn cmd_run(model_id: &str, prompt: &str, max_tokens: u32, temperature: f32, fp16
         ModelFormat::SafeTensors => {
             run_safetensors(
                 &model_path, prompt, max_tokens, temperature,
-                top_k, top_p, rep_penalty, greedy, chat, system_prompt.as_deref(), fp16, q4,
+                top_k, top_p, rep_penalty, greedy, chat, system_prompt.as_deref(), fp16, q4, q4_f16,
             );
         }
 
@@ -558,6 +559,7 @@ fn run_safetensors(
     system_prompt: Option<&str>,
     fp16: bool,
     q4: bool,
+    q4_f16: bool,
 ) {
     use warp_kernels::generate::GenerateConfig;
     use warp_kernels::mem_pool::GpuMemPool;
@@ -661,7 +663,7 @@ fn run_safetensors(
     }
 
     // 7. Load model weights
-    let prec_label = if q4 { " (Q4_0 quantized)" } else if fp16 { " (FP16 mixed-precision)" } else { "" };
+    let prec_label = if q4_f16 { " (Q4→FP16 dequantized)" } else if q4 { " (Q4_0 quantized)" } else if fp16 { " (FP16 mixed-precision)" } else { "" };
     println!("\nLoading model weights{}...", prec_label);
     let load_start = Instant::now();
 
@@ -695,10 +697,75 @@ fn run_safetensors(
         stop_sequences: Vec::new(),
     };
 
-    let max_seq_len = llama_config.max_position_embeddings.unwrap_or(4096);
+    // Cap KV cache to a sensible default — full context window (131K for Qwen 7B)
+    // would require 15+ GB of VRAM for cache alone.
+    let model_max = llama_config.max_position_embeddings.unwrap_or(4096);
+    let cli_args: Vec<String> = std::env::args().collect();
+    let max_seq_len = parse_u32_arg(&cli_args, "--max-seq-len")
+        .unwrap_or(2048.min(model_max))
+        .min(model_max);
 
-    // Branch: Q4 quantized, FP16 mixed-precision, or F32
-    let (result, kernel_stats) = if q4 {
+    // Branch: Q4→FP16 dequantized, Q4 quantized, FP16 mixed-precision, or F32
+    let (result, kernel_stats) = if q4_f16 {
+        // Q4→FP16 path: load Q4, dequant to FP16, use cuBLAS HGEMM for decode
+        let model = match warp_loader::LlamaModelQ4::load_q4(&loader, &llama_config, &device) {
+            Ok(m) => {
+                let load_time = load_start.elapsed();
+                println!("Q4 model loaded in {:.1}ms", load_time.as_secs_f64() * 1000.0);
+                println!("{}", m.summary());
+                m
+            }
+            Err(e) => {
+                eprintln!("Failed to load model: {e}");
+                std::process::exit(1);
+            }
+        };
+
+        let q_engine = warp_kernels::generate::QuantizedGenerationEngine {
+            config: model.transformer_config.clone(),
+            vocab_size: llama_config.vocab_size,
+            embed_tokens: model.embed_tokens,
+            layers: model.layers,
+            final_norm: model.final_norm,
+            lm_head: model.lm_head,
+            cache: warp_kernels::cache::KernelCache::new(),
+        };
+
+        println!("Dequantizing Q4→FP16...");
+        let dequant_start = std::time::Instant::now();
+        let f16_engine = match warp_kernels::generate::DequantF16GenerationEngine::from_quantized(&device, &q_engine) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("Failed to dequantize: {e}");
+                std::process::exit(1);
+            }
+        };
+        println!("Dequantized in {:.1}ms (FP16 weights: {:.1} MB)",
+            dequant_start.elapsed().as_secs_f64() * 1000.0,
+            f16_engine.weight_memory_bytes() as f64 / 1e6);
+
+        println!("\nGenerating (max_seq_len={}, Q4→FP16 cuBLAS HGEMM)...\n", max_seq_len);
+        println!("--- output ---");
+
+        let result = match f16_engine.generate_with_cache(
+            &device, &prompt_ids, &gen_config, max_seq_len, &q_engine.layers,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("\nGeneration failed: {e}");
+                std::process::exit(1);
+            }
+        };
+
+        if let Some(ref tok) = tokenizer {
+            let out_ids: Vec<u32> = result.tokens.iter().map(|&t| t as u32).collect();
+            let output = tok.decode(&out_ids);
+            println!("{}", output);
+        }
+        println!("--- end ---");
+
+        (result, f16_engine.cache.stats())
+    } else if q4 {
         // Q4_0 quantized path — 6.4x memory savings
         let model = match warp_loader::LlamaModelQ4::load_q4(&loader, &llama_config, &device) {
             Ok(m) => {
