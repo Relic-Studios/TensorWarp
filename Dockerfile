@@ -10,7 +10,7 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 
 WORKDIR /app
 COPY . .
-RUN cargo build --release
+RUN cargo build --release --workspace --exclude cudarc
 
 # Stage 2: Runtime
 FROM nvidia/cuda:12.4.0-runtime-ubuntu22.04
@@ -23,7 +23,6 @@ RUN apt-get update && apt-get install -y python3 python3-pip && \
     pip3 install numpy
 
 COPY python/ /opt/tensorwarp/python/
-RUN pip3 install -e /opt/tensorwarp/python/
 
 WORKDIR /workspace
 ENTRYPOINT ["tensorwarp"]

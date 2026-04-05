@@ -17,6 +17,7 @@ serde_json.workspace = true
 half.workspace = true
 thiserror.workspace = true
 log.workspace = true
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 
 [dev-dependencies]
 pretty_assertions.workspace = true

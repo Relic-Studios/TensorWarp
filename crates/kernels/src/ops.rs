@@ -352,6 +352,40 @@ pub fn add(
     Ok(())
 }
 
+/// Broadcast add: out[i] = a[i] + b[i % b_len].
+/// Adds a 1D bias vector to each row of a 2D tensor.
+/// a: [rows, cols], b: [cols], out: [rows, cols]
+const BROADCAST_ADD_SRC: &str = r#"
+extern "C" __global__ void warp_broadcast_add(
+    float *out, const float *a, const float *b,
+    size_t total, size_t b_len
+) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) {
+        out[i] = a[i] + b[i % b_len];
+    }
+}
+"#;
+
+pub fn broadcast_add(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    a: &GpuTensor<f32>,       // [rows, cols]
+    bias: &GpuTensor<f32>,    // [cols]
+    out: &mut GpuTensor<f32>, // [rows, cols]
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, BROADCAST_ADD_SRC, "warp_broadcast_add")?;
+    let total = a.numel;
+    let b_len = bias.numel;
+    let cfg = LaunchConfig::for_num_elems(total as u32);
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut out.data).arg(&a.data).arg(&bias.data).arg(&total).arg(&b_len)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
 /// Cached elementwise mul.
 pub fn mul(
     cache: &KernelCache,
@@ -1171,7 +1205,7 @@ extern "C" __global__ void warp_gemm_tiled(
 ///   - Fast register-tiled (128×128 blocks) for sizes >= 128
 ///   - Simple tiled (32×32) for small sizes
 pub fn gemm(
-    cache: &KernelCache,
+    _cache: &KernelCache,
     device: &WarpDevice,
     a: &GpuTensor<f32>,
     b: &GpuTensor<f32>,
@@ -1180,13 +1214,21 @@ pub fn gemm(
     n: u32,
     k: u32,
 ) -> Result<(), DeviceError> {
-    // Smart dispatch: best kernel per size range
+    // Always use cuBLAS — it's faster than our custom kernels at ALL sizes.
+    // cuBLAS launch overhead (~5-10μs) is negligible vs our NVRTC kernels.
+    match crate::cublas_gemm::gemm_cublas_f32(device, a, b, c, m, n, k) {
+        Ok(()) => return Ok(()),
+        Err(e) => {
+            log::warn!("cuBLAS GEMM failed ({}x{}x{}): {}. Falling back.", m, n, k, e);
+        }
+    }
+
+    // Custom NVRTC kernels — faster than cuBLAS for small matrices due to lower overhead
+    let cache = _cache;
     if m >= 128 && n >= 128 {
-        // Large: register-tiled v1 (beats double-buffered v2 at these sizes)
         return crate::gemm_fast::gemm_fast(cache, device, a, b, c, m, n, k);
     }
     if m >= 64 && n >= 64 {
-        // Medium: v2 medium-block variant
         return crate::gemm_v2::gemm_v2_med(cache, device, a, b, c, m, n, k);
     }
 
@@ -1360,6 +1402,471 @@ pub fn instancenorm(
                 .arg(&eps)
                 .launch(cfg))?;
         }
+    }
+    Ok(())
+}
+
+// ── Broadcast Copy ─────────────────────────────────────────────
+// Fills a [rows, cols] matrix by broadcasting a [cols] bias vector across rows.
+
+const BROADCAST_COPY_SRC: &str = r#"
+extern "C" __global__ void warp_broadcast_copy(
+    float *out, const float *bias, unsigned int rows, unsigned int cols
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < rows * cols) {
+        out[idx] = bias[idx % cols];
+    }
+}
+"#;
+
+/// Broadcast a 1D bias [N] into a 2D tensor [M, N] by repeating per row.
+pub fn broadcast_copy(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    bias: &GpuTensor<f32>,   // [N]
+    out: &mut GpuTensor<f32>, // [M, N]
+    m: u32, n: u32,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, BROADCAST_COPY_SRC, "warp_broadcast_copy")?;
+    let total = m * n;
+    let cfg = LaunchConfig::for_num_elems(total);
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut out.data).arg(&bias.data).arg(&m).arg(&n)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+/// GEMM + bias fusion: C = A @ B + bias (single cuBLAS launch + 1 cheap copy).
+///
+/// Pre-loads bias into C via broadcast_copy, then runs cuBLAS with beta=1.0.
+/// Eliminates the separate broadcast_add kernel launch.
+pub fn gemm_bias(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    a: &GpuTensor<f32>,
+    b: &GpuTensor<f32>,
+    bias: &GpuTensor<f32>,
+    c: &mut GpuTensor<f32>,
+    m: u32, n: u32, k: u32,
+) -> Result<(), DeviceError> {
+    // Broadcast bias into c: each row gets a copy of bias[0..N]
+    broadcast_copy(cache, device, bias, c, m, n)?;
+    // GEMM with beta=1.0: C = 1.0*A@B + 1.0*C = A@B + bias
+    crate::cublas_gemm::gemm_cublas_f32_add(device, a, b, c, m, n, k)?;
+    Ok(())
+}
+
+// ── Fused QKV / Gate+Up Split Kernels ─────────────────────────
+// Split a fused [batch, total] output back into separate tensors on GPU.
+// Avoids GPU→CPU→GPU roundtrip.
+
+const SPLIT_QKV_SRC: &str = r#"
+extern "C" __global__ void warp_split_qkv(
+    float *q_out, float *k_out, float *v_out,
+    const float *qkv, unsigned int h, unsigned int kv_dim, unsigned int batch
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total_per_row = h + kv_dim + kv_dim;
+    unsigned int total = batch * total_per_row;
+    if (idx >= total) return;
+
+    unsigned int b = idx / total_per_row;
+    unsigned int d = idx % total_per_row;
+
+    if (d < h) {
+        q_out[b * h + d] = qkv[idx];
+    } else if (d < h + kv_dim) {
+        k_out[b * kv_dim + (d - h)] = qkv[idx];
+    } else {
+        v_out[b * kv_dim + (d - h - kv_dim)] = qkv[idx];
+    }
+}
+"#;
+
+const SPLIT_GATE_UP_SRC: &str = r#"
+extern "C" __global__ void warp_split_gate_up(
+    float *gate_out, float *up_out,
+    const float *gate_up, unsigned int ffn_dim, unsigned int batch
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total_per_row = ffn_dim + ffn_dim;
+    unsigned int total = batch * total_per_row;
+    if (idx >= total) return;
+
+    unsigned int b = idx / total_per_row;
+    unsigned int d = idx % total_per_row;
+
+    if (d < ffn_dim) {
+        gate_out[b * ffn_dim + d] = gate_up[idx];
+    } else {
+        up_out[b * ffn_dim + (d - ffn_dim)] = gate_up[idx];
+    }
+}
+"#;
+
+/// Split a fused QKV tensor [batch, h+kv_dim+kv_dim] into Q, K, V on GPU.
+pub fn split_qkv(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    qkv: &GpuTensor<f32>,
+    q: &mut GpuTensor<f32>,
+    k: &mut GpuTensor<f32>,
+    v: &mut GpuTensor<f32>,
+    h: u32,
+    kv_dim: u32,
+    batch: u32,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, SPLIT_QKV_SRC, "warp_split_qkv")?;
+    let total = batch * (h + kv_dim + kv_dim);
+    let cfg = LaunchConfig::for_num_elems(total);
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut q.data).arg(&mut k.data).arg(&mut v.data)
+            .arg(&qkv.data).arg(&h).arg(&kv_dim).arg(&batch)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+/// Split a fused gate+up tensor [batch, 2*ffn_dim] into gate and up on GPU.
+pub fn split_gate_up(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    gate_up: &GpuTensor<f32>,
+    gate: &mut GpuTensor<f32>,
+    up: &mut GpuTensor<f32>,
+    ffn_dim: u32,
+    batch: u32,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, SPLIT_GATE_UP_SRC, "warp_split_gate_up")?;
+    let total = batch * ffn_dim * 2;
+    let cfg = LaunchConfig::for_num_elems(total);
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut gate.data).arg(&mut up.data)
+            .arg(&gate_up.data).arg(&ffn_dim).arg(&batch)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+/// Concatenate 2 or 3 weight matrices along the N (column) dimension on CPU,
+/// then upload the fused matrix to GPU. Runs once at model load time.
+///
+/// All inputs must have shape [K, N_i]. Output has shape [K, N_total].
+pub fn concat_weights_n(
+    device: &WarpDevice,
+    matrices: &[&GpuTensor<f32>],
+) -> Result<GpuTensor<f32>, DeviceError> {
+    assert!(matrices.len() >= 2, "Need at least 2 matrices to concatenate");
+
+    let k = matrices[0].shape.dim(0).static_val().expect("dim 0 must be static");
+    let ns: Vec<usize> = matrices.iter().map(|m| m.shape.dim(1).static_val().expect("dim 1 must be static")).collect();
+    let n_total: usize = ns.iter().sum();
+
+    // Download all matrices to host
+    let host_data: Vec<Vec<f32>> = matrices
+        .iter()
+        .map(|m| m.to_host(device))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Interleave rows: for each row, copy columns from each matrix
+    let mut fused = vec![0.0f32; k * n_total];
+    for row in 0..k {
+        let mut col_offset = 0;
+        for (mat_idx, n_i) in ns.iter().enumerate() {
+            fused[row * n_total + col_offset..row * n_total + col_offset + n_i]
+                .copy_from_slice(&host_data[mat_idx][row * n_i..(row + 1) * n_i]);
+            col_offset += n_i;
+        }
+    }
+
+    GpuTensor::from_host(
+        device,
+        &fused,
+        warp_ir::Shape::from_static(&[k, n_total]),
+        warp_ir::DType::F32,
+    )
+}
+
+/// Concatenate bias vectors (1D) on CPU, upload to GPU. Runs once at load time.
+pub fn concat_biases(
+    device: &WarpDevice,
+    biases: &[&GpuTensor<f32>],
+) -> Result<GpuTensor<f32>, DeviceError> {
+    let mut total_len = 0usize;
+    let mut host_parts: Vec<Vec<f32>> = Vec::new();
+    for b in biases {
+        let data = b.to_host(device)?;
+        total_len += data.len();
+        host_parts.push(data);
+    }
+    let mut fused = Vec::with_capacity(total_len);
+    for part in &host_parts {
+        fused.extend_from_slice(part);
+    }
+    GpuTensor::from_host(
+        device,
+        &fused,
+        warp_ir::Shape::from_static(&[total_len]),
+        warp_ir::DType::F32,
+    )
+}
+
+// ── Layout Transpose Kernels ───────────────────────────────────
+// Transpose between positions-first [S, H*D] and heads-first [H, S, D]
+// layouts entirely on GPU — eliminates catastrophic CPU roundtrips.
+
+const TRANSPOSE_SHD_TO_HSD_SRC: &str = r#"
+extern "C" __global__ void warp_transpose_shd_hsd(
+    float *out,       // [H, S, D] (heads-first)
+    const float *in_data,  // [S, H*D] (positions-first)
+    unsigned int H, unsigned int S, unsigned int D
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = H * S * D;
+    if (idx >= total) return;
+
+    // Decompose flat index as positions-first [S, H*D]
+    unsigned int d = idx % D;
+    unsigned int h = (idx / D) % H;
+    unsigned int s = idx / (H * D);
+
+    // Write to heads-first [H, S, D]
+    out[h * S * D + s * D + d] = in_data[idx];
+}
+"#;
+
+const TRANSPOSE_HSD_TO_SHD_SRC: &str = r#"
+extern "C" __global__ void warp_transpose_hsd_shd(
+    float *out,       // [S, H*D] (positions-first)
+    const float *in_data,  // [H, S, D] (heads-first)
+    unsigned int H, unsigned int S, unsigned int D
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = H * S * D;
+    if (idx >= total) return;
+
+    // Decompose flat index as heads-first [H, S, D]
+    unsigned int d = idx % D;
+    unsigned int s = (idx / D) % S;
+    unsigned int h = idx / (S * D);
+
+    // Write to positions-first [S, H*D]
+    out[s * H * D + h * D + d] = in_data[idx];
+}
+"#;
+
+/// Transpose [S, H*D] (positions-first) → [H, S, D] (heads-first) on GPU.
+pub fn transpose_to_heads_first(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    input: &GpuTensor<f32>,   // [S, H*D]
+    output: &mut GpuTensor<f32>, // [H, S, D]
+    num_heads: u32,
+    seq_len: u32,
+    head_dim: u32,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, TRANSPOSE_SHD_TO_HSD_SRC, "warp_transpose_shd_hsd")?;
+    let total = num_heads * seq_len * head_dim;
+    let cfg = LaunchConfig::for_num_elems(total);
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut output.data).arg(&input.data)
+            .arg(&num_heads).arg(&seq_len).arg(&head_dim)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+/// Transpose [H, S, D] (heads-first) → [S, H*D] (positions-first) on GPU.
+pub fn transpose_to_positions_first(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    input: &GpuTensor<f32>,   // [H, S, D]
+    output: &mut GpuTensor<f32>, // [S, H*D]
+    num_heads: u32,
+    seq_len: u32,
+    head_dim: u32,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, TRANSPOSE_HSD_TO_SHD_SRC, "warp_transpose_hsd_shd")?;
+    let total = num_heads * seq_len * head_dim;
+    let cfg = LaunchConfig::for_num_elems(total);
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut output.data).arg(&input.data)
+            .arg(&num_heads).arg(&seq_len).arg(&head_dim)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+// ── Fused Bias + RoPE + KV Cache Append ──────────────────────
+// Replaces 6 separate launches (3 bias_add + 2 RoPE + 1 KV append) with 1.
+// For decode (single token), processes Q bias+RoPE, K bias+RoPE+cache_append,
+// and V bias+cache_append in a single kernel.
+//
+// Uses rotate_half pairing: (dim i, dim i+D/2), matching the existing RoPE kernel.
+const FUSED_BIAS_ROPE_APPEND_SRC: &str = r#"
+extern "C" __global__ void warp_fused_bias_rope_append(
+    float *q_out,            // [num_heads * head_dim] — Q with bias + RoPE applied
+    float *k_out,            // [kv_dim] — K with bias + RoPE applied
+    float *k_cache,          // [max_seq, kv_dim]
+    float *v_cache,          // [max_seq, kv_dim]
+    const float *q_in,       // [num_heads * head_dim] — raw Q from GEMM
+    const float *k_in,       // [kv_dim] — raw K from GEMM
+    const float *v_in,       // [kv_dim] — raw V from GEMM
+    const float *bq,         // Q bias [num_heads * head_dim] (ignored if has_bias == 0)
+    const float *bk,         // K bias [kv_dim]
+    const float *bv,         // V bias [kv_dim]
+    unsigned int num_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    unsigned int kv_dim,
+    unsigned int pos,
+    unsigned int max_seq,
+    float rope_base,
+    unsigned int has_bias     // 1 = apply biases, 0 = skip bias pointers
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int q_total = num_heads * head_dim;
+    unsigned int half_d = head_dim / 2;
+
+    // ── Q: bias + RoPE (rotate_half pairing) ──
+    if (idx < q_total) {
+        unsigned int head = idx / head_dim;
+        unsigned int d = idx % head_dim;
+        unsigned int pair = d % half_d;  // dimension pair index
+
+        // Compute RoPE angle
+        float freq = 1.0f / powf(rope_base, 2.0f * (float)pair / (float)head_dim);
+        float theta = (float)pos * freq;
+        float cos_t = cosf(theta);
+        float sin_t = sinf(theta);
+
+        unsigned int base_off = head * head_dim;
+        // Load both halves of the pair, applying bias
+        float x0 = q_in[base_off + pair];
+        float x1 = q_in[base_off + pair + half_d];
+        if (has_bias) {
+            x0 += bq[base_off + pair];
+            x1 += bq[base_off + pair + half_d];
+        }
+
+        if (d < half_d) {
+            q_out[idx] = x0 * cos_t - x1 * sin_t;
+        } else {
+            q_out[idx] = x0 * sin_t + x1 * cos_t;
+        }
+    }
+
+    // ── K: bias + RoPE + cache append | V: bias + cache append ──
+    if (idx < kv_dim) {
+        unsigned int kv_head = idx / head_dim;
+        unsigned int d = idx % head_dim;
+        unsigned int pair = d % half_d;
+
+        // K: bias + RoPE
+        float freq = 1.0f / powf(rope_base, 2.0f * (float)pair / (float)head_dim);
+        float theta = (float)pos * freq;
+        float cos_t = cosf(theta);
+        float sin_t = sinf(theta);
+
+        unsigned int kv_base = kv_head * head_dim;
+        float k0 = k_in[kv_base + pair];
+        float k1 = k_in[kv_base + pair + half_d];
+        if (has_bias) {
+            k0 += bk[kv_base + pair];
+            k1 += bk[kv_base + pair + half_d];
+        }
+
+        float k_roped;
+        if (d < half_d) {
+            k_roped = k0 * cos_t - k1 * sin_t;
+        } else {
+            k_roped = k0 * sin_t + k1 * cos_t;
+        }
+        k_out[idx] = k_roped;
+
+        // Append K to cache
+        if (pos < max_seq) {
+            k_cache[pos * kv_dim + idx] = k_roped;
+        }
+
+        // V: bias + cache append (no RoPE needed for V)
+        float vval = v_in[idx];
+        if (has_bias) {
+            vval += bv[idx];
+        }
+        if (pos < max_seq) {
+            v_cache[pos * kv_dim + idx] = vval;
+        }
+    }
+}
+"#;
+
+/// Fused bias + RoPE + KV cache append.
+///
+/// Replaces 6 separate kernel launches with 1:
+///   3x broadcast_add (Q/K/V biases) + 2x RoPE (Q/K) + 1x KV append
+///
+/// For models without biases (e.g. LLaMA), pass `has_bias=false` and the
+/// bias pointers are ignored (pass any valid buffer — they won't be read).
+///
+/// The KV cache position is updated externally (caller must increment
+/// `LayerKVCache::len` after this call).
+pub fn fused_bias_rope_append(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    q_in: &GpuTensor<f32>,        // [num_heads * head_dim]
+    k_in: &GpuTensor<f32>,        // [kv_dim]
+    v_in: &GpuTensor<f32>,        // [kv_dim]
+    q_out: &mut GpuTensor<f32>,   // [num_heads * head_dim]
+    k_out: &mut GpuTensor<f32>,   // [kv_dim]
+    bq: &GpuTensor<f32>,          // Q bias (ignored if !has_bias)
+    bk: &GpuTensor<f32>,          // K bias
+    bv: &GpuTensor<f32>,          // V bias
+    k_cache: &mut GpuTensor<f32>, // [max_seq, kv_dim]
+    v_cache: &mut GpuTensor<f32>, // [max_seq, kv_dim]
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    kv_dim: u32,
+    pos: u32,
+    max_seq: u32,
+    rope_base: f32,
+    has_bias: bool,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, FUSED_BIAS_ROPE_APPEND_SRC, "warp_fused_bias_rope_append")?;
+    // Thread count = max(q_total, kv_dim) — kernel handles both ranges
+    let q_total = num_heads * head_dim;
+    let total = q_total.max(kv_dim);
+    let cfg = LaunchConfig::for_num_elems(total);
+    let has_bias_flag: u32 = if has_bias { 1 } else { 0 };
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut q_out.data)
+            .arg(&mut k_out.data)
+            .arg(&mut k_cache.data)
+            .arg(&mut v_cache.data)
+            .arg(&q_in.data)
+            .arg(&k_in.data)
+            .arg(&v_in.data)
+            .arg(&bq.data)
+            .arg(&bk.data)
+            .arg(&bv.data)
+            .arg(&num_heads)
+            .arg(&num_kv_heads)
+            .arg(&head_dim)
+            .arg(&kv_dim)
+            .arg(&pos)
+            .arg(&max_seq)
+            .arg(&rope_base)
+            .arg(&has_bias_flag)
+            .launch(cfg))?;
     }
     Ok(())
 }

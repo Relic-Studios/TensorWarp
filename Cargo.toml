@@ -8,6 +8,8 @@ members = [
     "crates/kernels",
     "crates/loader",
     "crates/cli",
+    "crates/server",
+    "crates/python",
 ]
 
 [package]

@@ -35,6 +35,7 @@ fn build_demo_model() -> OnnxModel {
             dtype: OnnxDType::Float,
             shape: vec![8, 3, 3, 3],
             raw_data: conv_w.iter().flat_map(|f| f.to_le_bytes()).collect(),
+            external_data: vec![],
         },
     );
 
@@ -49,6 +50,7 @@ fn build_demo_model() -> OnnxModel {
             dtype: OnnxDType::Float,
             shape: vec![8, 10],
             raw_data: fc_w.iter().flat_map(|f| f.to_le_bytes()).collect(),
+            external_data: vec![],
         },
     );
 
@@ -63,6 +65,9 @@ fn build_demo_model() -> OnnxModel {
             dtype: Some(OnnxDType::Float),
             shape: vec![1, 10],
         }],
+        graph_name: String::new(),
+        graph_doc_string: String::new(),
+        model_dir: None,
         nodes: vec![
             // Conv2D: input -> conv_out
             OnnxNode {

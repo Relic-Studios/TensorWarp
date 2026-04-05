@@ -138,11 +138,9 @@ pub fn fuse_residual_rmsnorm(graph: &mut Graph) -> usize {
 
 /// Dead code elimination — remove nodes whose outputs are never used.
 pub fn eliminate_dead_code(graph: &mut Graph) -> usize {
-    // For now, just count dead nodes. Full DCE requires node removal
-    // which needs a graph compaction pass. We'll mark them instead.
     let mut live = rustc_hash::FxHashSet::default();
 
-    // Start from graph outputs, walk backwards
+    // Start from graph outputs, walk backwards to find all live nodes
     let mut worklist: Vec<NodeId> = graph
         .graph_outputs
         .iter()
@@ -158,8 +156,22 @@ pub fn eliminate_dead_code(graph: &mut Graph) -> usize {
         }
     }
 
+    // Replace dead nodes with Identity (no-op) and clear their inputs
+    // This effectively removes them from the graph without compaction
     let total = graph.num_nodes();
-    let dead = total - live.len();
+    let mut dead = 0;
+    for i in 0..total {
+        let node_id = NodeId(i as u32);
+        if !live.contains(&node_id) {
+            // Check if this node is a graph input producer (don't kill those)
+            let is_input = graph.node(node_id).inputs.is_empty();
+            if !is_input {
+                graph.replace_op(node_id, Op::Identity);
+                graph.replace_inputs(node_id, &[]);
+                dead += 1;
+            }
+        }
+    }
     dead
 }
 

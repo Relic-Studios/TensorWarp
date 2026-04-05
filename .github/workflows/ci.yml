@@ -13,25 +13,32 @@ jobs:
   check:
     name: Check & Test
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Check compilation
-        run: cargo check --workspace --exclude cudarc --exclude warp-kernels
-      - name: Run IR + optimizer tests
-        run: cargo test -p warp-ir -p warp-optimizer
+      - name: Check full workspace compilation
+        run: cargo check --workspace --exclude cudarc
+      - name: Run IR + optimizer + loader tests
+        run: cargo test -p warp-ir -p warp-optimizer -p warp-loader
       - name: Check formatting
         run: cargo fmt --all -- --check
         continue-on-error: true
 
   gpu-test:
     name: GPU Tests
+    # Requires a self-hosted runner with:
+    #   - Labels: self-hosted, gpu
+    #   - NVIDIA GPU with CUDA 12.x drivers installed
+    #   - Rust toolchain (installed below, but CUDA SDK must be pre-installed)
     runs-on: [self-hosted, gpu]
+    timeout-minutes: 30
     if: github.event_name == 'push'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Run GPU tests
         run: cargo test --workspace --exclude cudarc
+        timeout-minutes: 20
         env:
           CUDA_VISIBLE_DEVICES: "0"

@@ -37,8 +37,10 @@ extern "C" __global__ void {name}(
     const half * __restrict__ B,
     unsigned int M, unsigned int N, unsigned int K
 ) {{
-    __shared__ float As[BK][BM];
-    __shared__ float Bs[BK][BN];
+    // TODO: keep data as half in shared memory to halve bandwidth;
+    // currently converts FP16->FP32 on load, defeating half the purpose.
+    __shared__ float As[BK][BM + 4];  // padded to avoid bank conflicts
+    __shared__ float Bs[BK][BN + 4];
 
     unsigned int bx = blockIdx.x, by = blockIdx.y;
     unsigned int tx = threadIdx.x % {threads_x};

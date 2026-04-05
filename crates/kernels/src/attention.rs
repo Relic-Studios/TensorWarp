@@ -237,6 +237,237 @@ pub fn attention_flash(
     Ok(())
 }
 
+/// Flash Attention v2 — tiled Q×K with online softmax.
+///
+/// This is the real deal: processes queries in BLOCK_M tiles, keys/values in
+/// BLOCK_N tiles, using shared memory for K tiles so every thread in the block
+/// benefits from the cached KV data. Online softmax (Milakov-Gimelshein) means
+/// we never materialize the full N×N attention matrix.
+///
+/// Architecture:
+/// - Each thread block handles BLOCK_M queries for one batch*head
+/// - One thread per query row (threadIdx.x = query within tile)
+/// - K tile loaded cooperatively into shared memory
+/// - Each thread computes full dot products Q[qi] . K[j] over HEAD_DIM
+/// - Online softmax: running max + sum correction across KV tiles
+/// - V accumulation in registers, corrected each tile
+///
+/// HEAD_DIM is baked in via JIT (#define) for maximum performance.
+fn flash_attn_v2_src(head_dim: u32) -> String {
+    format!(r#"
+#define HEAD_DIM {head_dim}
+#define BLOCK_M 64
+#define BLOCK_N 64
+
+extern "C" __global__ void warp_flash_attn_v2(
+    float *out,        // [B*H, N, D]
+    const float *Q,    // [B*H, N, D]
+    const float *K,    // [B*H, N, D]
+    const float *V,    // [B*H, N, D]
+    unsigned int N,    // sequence length
+    unsigned int D,    // head dimension (== HEAD_DIM)
+    float scale,       // 1/sqrt(D)
+    unsigned int causal
+) {{
+    // blockIdx.x = which batch*head
+    // blockIdx.y = which query tile (query_start = blockIdx.y * BLOCK_M)
+    unsigned int bh = blockIdx.x;
+    unsigned int q_start = blockIdx.y * BLOCK_M;
+    unsigned int tid = threadIdx.x;  // 0..BLOCK_M-1, one thread per query row
+
+    unsigned int qi = q_start + tid;  // global query index
+
+    // Pointers for this batch*head
+    const float *Q_bh = Q + bh * N * D;
+    const float *K_bh = K + bh * N * D;
+    const float *V_bh = V + bh * N * D;
+    float *O_bh = out + bh * N * D;
+
+    // Shared memory: K and V tiles [BLOCK_N][HEAD_DIM] each
+    extern __shared__ float smem[];  // (2 * BLOCK_N * HEAD_DIM) floats
+    float *K_smem = smem;
+    float *V_smem = smem + BLOCK_N * HEAD_DIM;
+
+    // Load this thread's query row into registers
+    float q_reg[HEAD_DIM];
+    if (qi < N) {{
+        for (unsigned int d = 0; d < HEAD_DIM; d++) {{
+            q_reg[d] = Q_bh[qi * D + d];
+        }}
+    }}
+
+    // Per-query accumulators
+    float m_i = -1e30f;   // running max
+    float l_i = 0.0f;     // running sum of exp
+    float O_acc[HEAD_DIM]; // output accumulator
+    for (unsigned int d = 0; d < HEAD_DIM; d++) {{
+        O_acc[d] = 0.0f;
+    }}
+
+    // Number of KV tiles
+    unsigned int kv_end = (causal && qi < N) ? (qi + 1) : N;
+    unsigned int num_kv_tiles = (N + BLOCK_N - 1) / BLOCK_N;  // iterate all, mask per-query
+
+    for (unsigned int kv_tile = 0; kv_tile < num_kv_tiles; kv_tile++) {{
+        unsigned int k_start = kv_tile * BLOCK_N;
+
+        // Early exit: if causal and entire tile is past our query position
+        if (causal && qi < N && k_start > qi) {{
+            __syncthreads();  // still need to sync for other threads
+            continue;
+        }}
+
+        // Cooperative load of K tile into shared memory
+        // BLOCK_M threads load BLOCK_N * HEAD_DIM elements
+        unsigned int total_k_elems = BLOCK_N * HEAD_DIM;
+        for (unsigned int idx = tid; idx < total_k_elems; idx += BLOCK_M) {{
+            unsigned int row = idx / HEAD_DIM;
+            unsigned int col = idx % HEAD_DIM;
+            unsigned int gk = k_start + row;
+            K_smem[row * HEAD_DIM + col] = (gk < N) ? K_bh[gk * D + col] : 0.0f;
+            V_smem[row * HEAD_DIM + col] = (gk < N) ? V_bh[gk * D + col] : 0.0f;
+        }}
+        __syncthreads();
+
+        if (qi < N) {{
+            // Compute scores and online softmax for this KV tile
+            float tile_max = -1e30f;
+            float scores[BLOCK_N];
+
+            // Compute Q[qi] . K[j] for all j in this tile
+            for (unsigned int j = 0; j < BLOCK_N; j++) {{
+                unsigned int gk = k_start + j;
+                if (gk < N && (!causal || gk <= qi)) {{
+                    float dot = 0.0f;
+                    for (unsigned int d = 0; d < HEAD_DIM; d++) {{
+                        dot += q_reg[d] * K_smem[j * HEAD_DIM + d];
+                    }}
+                    scores[j] = dot * scale;
+                    if (scores[j] > tile_max) tile_max = scores[j];
+                }} else {{
+                    scores[j] = -1e30f;
+                }}
+            }}
+
+            // Online softmax correction
+            float m_new = fmaxf(m_i, tile_max);
+            float correction = expf(m_i - m_new);
+
+            // Correct running state
+            l_i *= correction;
+            for (unsigned int d = 0; d < HEAD_DIM; d++) {{
+                O_acc[d] *= correction;
+            }}
+
+            // Accumulate P @ V
+            float tile_sum = 0.0f;
+            for (unsigned int j = 0; j < BLOCK_N; j++) {{
+                unsigned int gk = k_start + j;
+                float p = expf(scores[j] - m_new);
+                tile_sum += p;
+
+                if (gk < N && (!causal || gk <= qi)) {{
+                    for (unsigned int d = 0; d < HEAD_DIM; d++) {{
+                        O_acc[d] += p * V_smem[j * HEAD_DIM + d];
+                    }}
+                }}
+            }}
+
+            l_i += tile_sum;
+            m_i = m_new;
+        }}
+
+        __syncthreads();
+    }}
+
+    // Final normalization and write output
+    if (qi < N && l_i > 0.0f) {{
+        for (unsigned int d = 0; d < HEAD_DIM; d++) {{
+            O_bh[qi * D + d] = O_acc[d] / l_i;
+        }}
+    }}
+}}
+"#)
+}
+
+/// Launch Flash Attention v2 with tiled Q×K and online softmax.
+///
+/// This is the high-performance path for head_dim >= 32. Uses BLOCK_M=64 query
+/// tiles, BLOCK_N=64 KV tiles, shared memory for K tiles, and online softmax
+/// so the full N×N attention matrix is never materialized.
+///
+/// HEAD_DIM is baked in as a compile-time constant via JIT for register-level
+/// optimization of the inner dot product loops.
+pub fn flash_attention_v2(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    q: &GpuTensor<f32>,   // [B*H, N, D]
+    k: &GpuTensor<f32>,
+    v: &GpuTensor<f32>,
+    out: &mut GpuTensor<f32>,
+    batch_heads: u32,      // B * num_heads
+    seq_len: u32,
+    head_dim: u32,
+    causal: bool,
+) -> Result<(), DeviceError> {
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let causal_u32 = if causal { 1u32 } else { 0u32 };
+
+    let src = flash_attn_v2_src(head_dim);
+    let f = cache.get_or_compile(device, &src, "warp_flash_attn_v2")?;
+
+    let block_m = 64u32;
+    let block_n = 64u32;
+    let num_q_tiles = (seq_len + block_m - 1) / block_m;
+
+    // Shared memory: K + V tiles [BLOCK_N][HEAD_DIM] each
+    let smem_bytes = 2 * block_n * head_dim * 4;
+
+    let cfg = LaunchConfig {
+        grid_dim: (batch_heads, num_q_tiles, 1),
+        block_dim: (block_m, 1, 1),  // one thread per query row in tile
+        shared_mem_bytes: smem_bytes,
+    };
+
+    unsafe {
+        device.stream.launch_builder(&f)
+            .arg(&mut out.data)
+            .arg(&q.data)
+            .arg(&k.data)
+            .arg(&v.data)
+            .arg(&seq_len)
+            .arg(&head_dim)
+            .arg(&scale)
+            .arg(&causal_u32)
+            .launch(cfg)
+            .map_err(|e: cudarc::driver::result::DriverError| DeviceError::Launch(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Smart attention dispatch: picks the best kernel for the given parameters.
+///
+/// - head_dim >= 32: Flash Attention v2 (tiled, online softmax, shared memory)
+/// - head_dim < 32: Original flash attention (warp-level, single-pass)
+pub fn attention_best(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    q: &GpuTensor<f32>,
+    k: &GpuTensor<f32>,
+    v: &GpuTensor<f32>,
+    out: &mut GpuTensor<f32>,
+    batch_heads: u32,
+    seq_len: u32,
+    head_dim: u32,
+    causal: bool,
+) -> Result<(), DeviceError> {
+    if head_dim >= 32 {
+        flash_attention_v2(cache, device, q, k, v, out, batch_heads, seq_len, head_dim, causal)
+    } else {
+        attention_flash(cache, device, q, k, v, out, batch_heads, seq_len, head_dim, causal)
+    }
+}
+
 /// CPU reference attention for validation.
 pub fn cpu_attention(
     q: &[f32], k: &[f32], v: &[f32], out: &mut [f32],
@@ -493,5 +724,178 @@ mod tests {
         println!("  Naive: {:.3}ms avg", naive_time.as_secs_f64() * 1000.0 / iters as f64);
         println!("  Flash: {:.3}ms avg", flash_time.as_secs_f64() * 1000.0 / iters as f64);
         println!("  Speedup: {:.2}x", naive_time.as_secs_f64() / flash_time.as_secs_f64());
+    }
+
+    #[test]
+    fn flash_attn_v2_correctness() {
+        let (dev, cache) = match setup() {
+            Some(s) => s,
+            None => { println!("No CUDA, skipping"); return; }
+        };
+
+        // seq_len=128, head_dim=64, batch_heads=4, non-causal
+        let (bh, n, d) = (4u32, 128u32, 64u32);
+        let total = (bh * n * d) as usize;
+        let shape = Shape::from_static(&[bh as usize, n as usize, d as usize]);
+
+        let q_data: Vec<f32> = (0..total).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
+        let k_data: Vec<f32> = (0..total).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
+        let v_data: Vec<f32> = (0..total).map(|i| ((i % 7) as f32 - 3.0) * 0.05).collect();
+
+        // CPU reference
+        let mut cpu_out = vec![0.0f32; total];
+        cpu_attention(&q_data, &k_data, &v_data, &mut cpu_out, bh as usize, n as usize, d as usize, false);
+
+        // Naive GPU reference
+        let q = GpuTensor::from_host(&dev, &q_data, shape.clone(), DType::F32).unwrap();
+        let k = GpuTensor::from_host(&dev, &k_data, shape.clone(), DType::F32).unwrap();
+        let v = GpuTensor::from_host(&dev, &v_data, shape.clone(), DType::F32).unwrap();
+        let mut naive_out = GpuTensor::<f32>::zeros(&dev, shape.clone(), DType::F32).unwrap();
+        attention_naive(&cache, &dev, &q, &k, &v, &mut naive_out, bh, n, d, false).unwrap();
+        dev.synchronize().unwrap();
+        let naive_result = naive_out.to_host(&dev).unwrap();
+
+        // Flash Attention v2
+        let mut flash_out = GpuTensor::<f32>::zeros(&dev, shape.clone(), DType::F32).unwrap();
+        flash_attention_v2(&cache, &dev, &q, &k, &v, &mut flash_out, bh, n, d, false).unwrap();
+        dev.synchronize().unwrap();
+        let flash_result = flash_out.to_host(&dev).unwrap();
+
+        // Compare flash v2 vs CPU
+        let max_err_cpu: f32 = flash_result.iter().zip(cpu_out.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        println!("Flash v2 vs CPU (BH={bh} N={n} D={d} non-causal): max error = {max_err_cpu:.6}");
+        assert!(max_err_cpu < 0.01, "Flash v2 vs CPU max error {max_err_cpu} too high");
+
+        // Compare flash v2 vs naive GPU
+        let max_err_naive: f32 = flash_result.iter().zip(naive_result.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        println!("Flash v2 vs naive GPU: max error = {max_err_naive:.6}");
+        assert!(max_err_naive < 0.01, "Flash v2 vs naive max error {max_err_naive} too high");
+    }
+
+    #[test]
+    fn flash_attn_v2_causal() {
+        let (dev, cache) = match setup() {
+            Some(s) => s,
+            None => { println!("No CUDA, skipping"); return; }
+        };
+
+        let (bh, n, d) = (4u32, 128u32, 64u32);
+        let total = (bh * n * d) as usize;
+        let shape = Shape::from_static(&[bh as usize, n as usize, d as usize]);
+
+        let q_data: Vec<f32> = (0..total).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
+        let k_data: Vec<f32> = (0..total).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
+        let v_data: Vec<f32> = (0..total).map(|i| ((i % 7) as f32 - 3.0) * 0.05).collect();
+
+        // CPU reference with causal
+        let mut cpu_out = vec![0.0f32; total];
+        cpu_attention(&q_data, &k_data, &v_data, &mut cpu_out, bh as usize, n as usize, d as usize, true);
+
+        // Flash Attention v2 causal
+        let q = GpuTensor::from_host(&dev, &q_data, shape.clone(), DType::F32).unwrap();
+        let k = GpuTensor::from_host(&dev, &k_data, shape.clone(), DType::F32).unwrap();
+        let v = GpuTensor::from_host(&dev, &v_data, shape.clone(), DType::F32).unwrap();
+        let mut flash_out = GpuTensor::<f32>::zeros(&dev, shape.clone(), DType::F32).unwrap();
+        flash_attention_v2(&cache, &dev, &q, &k, &v, &mut flash_out, bh, n, d, true).unwrap();
+        dev.synchronize().unwrap();
+        let flash_result = flash_out.to_host(&dev).unwrap();
+
+        let max_err: f32 = flash_result.iter().zip(cpu_out.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        println!("Flash v2 causal (BH={bh} N={n} D={d}): max error = {max_err:.6}");
+        assert!(max_err < 0.01, "Flash v2 causal max error {max_err} too high");
+    }
+
+    #[test]
+    fn flash_attn_v2_head_dim_128() {
+        let (dev, cache) = match setup() {
+            Some(s) => s,
+            None => { println!("No CUDA, skipping"); return; }
+        };
+
+        // LLaMA-style: head_dim=128
+        let (bh, n, d) = (4u32, 128u32, 128u32);
+        let total = (bh * n * d) as usize;
+        let shape = Shape::from_static(&[bh as usize, n as usize, d as usize]);
+
+        let q_data: Vec<f32> = (0..total).map(|i| ((i % 17) as f32 - 8.0) * 0.03).collect();
+        let k_data: Vec<f32> = (0..total).map(|i| ((i % 13) as f32 - 6.0) * 0.03).collect();
+        let v_data: Vec<f32> = (0..total).map(|i| ((i % 7) as f32 - 3.0) * 0.03).collect();
+
+        // CPU reference
+        let mut cpu_out = vec![0.0f32; total];
+        cpu_attention(&q_data, &k_data, &v_data, &mut cpu_out, bh as usize, n as usize, d as usize, false);
+
+        // Flash v2
+        let q = GpuTensor::from_host(&dev, &q_data, shape.clone(), DType::F32).unwrap();
+        let k = GpuTensor::from_host(&dev, &k_data, shape.clone(), DType::F32).unwrap();
+        let v = GpuTensor::from_host(&dev, &v_data, shape.clone(), DType::F32).unwrap();
+        let mut flash_out = GpuTensor::<f32>::zeros(&dev, shape.clone(), DType::F32).unwrap();
+        flash_attention_v2(&cache, &dev, &q, &k, &v, &mut flash_out, bh, n, d, false).unwrap();
+        dev.synchronize().unwrap();
+        let flash_result = flash_out.to_host(&dev).unwrap();
+
+        let max_err: f32 = flash_result.iter().zip(cpu_out.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        println!("Flash v2 D=128 (BH={bh} N={n}): max error = {max_err:.6}");
+        assert!(max_err < 0.01, "Flash v2 D=128 max error {max_err} too high");
+
+        // Also test causal with D=128
+        let mut cpu_out_causal = vec![0.0f32; total];
+        cpu_attention(&q_data, &k_data, &v_data, &mut cpu_out_causal, bh as usize, n as usize, d as usize, true);
+
+        let mut flash_out_causal = GpuTensor::<f32>::zeros(&dev, shape.clone(), DType::F32).unwrap();
+        flash_attention_v2(&cache, &dev, &q, &k, &v, &mut flash_out_causal, bh, n, d, true).unwrap();
+        dev.synchronize().unwrap();
+        let flash_causal_result = flash_out_causal.to_host(&dev).unwrap();
+
+        let max_err_c: f32 = flash_causal_result.iter().zip(cpu_out_causal.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        println!("Flash v2 D=128 causal: max error = {max_err_c:.6}");
+        assert!(max_err_c < 0.01, "Flash v2 D=128 causal max error {max_err_c} too high");
+    }
+
+    #[test]
+    fn attention_best_dispatch() {
+        let (dev, cache) = match setup() {
+            Some(s) => s,
+            None => { println!("No CUDA, skipping"); return; }
+        };
+
+        // D=64 should use Flash v2
+        let (bh, n, d) = (2u32, 32u32, 64u32);
+        let total = (bh * n * d) as usize;
+        let shape = Shape::from_static(&[bh as usize, n as usize, d as usize]);
+
+        let q_data: Vec<f32> = (0..total).map(|i| ((i % 13) as f32 - 6.0) * 0.08).collect();
+        let k_data: Vec<f32> = (0..total).map(|i| ((i % 11) as f32 - 5.0) * 0.08).collect();
+        let v_data: Vec<f32> = (0..total).map(|i| ((i % 7) as f32 - 3.0) * 0.08).collect();
+
+        let mut cpu_out = vec![0.0f32; total];
+        cpu_attention(&q_data, &k_data, &v_data, &mut cpu_out, bh as usize, n as usize, d as usize, false);
+
+        let q = GpuTensor::from_host(&dev, &q_data, shape.clone(), DType::F32).unwrap();
+        let k = GpuTensor::from_host(&dev, &k_data, shape.clone(), DType::F32).unwrap();
+        let v = GpuTensor::from_host(&dev, &v_data, shape.clone(), DType::F32).unwrap();
+        let mut out = GpuTensor::<f32>::zeros(&dev, shape, DType::F32).unwrap();
+
+        attention_best(&cache, &dev, &q, &k, &v, &mut out, bh, n, d, false).unwrap();
+        dev.synchronize().unwrap();
+        let result = out.to_host(&dev).unwrap();
+
+        let max_err: f32 = result.iter().zip(cpu_out.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        println!("attention_best D=64: max error = {max_err:.6}");
+        assert!(max_err < 0.01, "attention_best D=64 max error {max_err} too high");
+        assert!(result.iter().all(|v| v.is_finite()));
+        println!("attention_best D=64: dispatched to Flash v2");
     }
 }

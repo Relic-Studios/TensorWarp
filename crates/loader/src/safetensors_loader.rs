@@ -110,6 +110,72 @@ impl SafeTensorsLoader {
         Ok(tensor)
     }
 
+    /// Load a 2D weight tensor as F32, transposed from [out, in] to [in, out].
+    ///
+    /// HuggingFace stores linear weights as [out_features, in_features] (row-major).
+    /// PyTorch's F.linear(x, W) computes x @ W^T internally.
+    /// Our GEMM computes x @ B directly, so we need B = W^T = [in, out].
+    pub fn load_f32_transposed(
+        &self,
+        name: &str,
+        device: &WarpDevice,
+    ) -> Result<GpuTensor<f32>, LoaderError> {
+        let st = SafeTensors::deserialize(&self.mmap)
+            .map_err(|e| LoaderError::Parse(e.to_string()))?;
+        let view = st.tensor(name)
+            .map_err(|e| LoaderError::TensorNotFound(name.to_string(), e.to_string()))?;
+
+        let shape: Vec<usize> = view.shape().to_vec();
+        if shape.len() != 2 {
+            // Not a 2D weight — load without transposition
+            return self.load_f32(name, device);
+        }
+
+        let rows = shape[0]; // out_features
+        let cols = shape[1]; // in_features
+        let data = view.data();
+        let file_dtype = view.dtype();
+
+        // Convert to f32
+        let f32_data: Vec<f32> = match file_dtype {
+            safetensors::Dtype::F32 => {
+                let ptr = data.as_ptr() as *const f32;
+                let len = data.len() / 4;
+                unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
+            }
+            safetensors::Dtype::F16 => {
+                let ptr = data.as_ptr() as *const half::f16;
+                let len = data.len() / 2;
+                let f16_slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+                f16_slice.iter().map(|v| v.to_f32()).collect()
+            }
+            safetensors::Dtype::BF16 => {
+                let ptr = data.as_ptr() as *const half::bf16;
+                let len = data.len() / 2;
+                let bf16_slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+                bf16_slice.iter().map(|v| v.to_f32()).collect()
+            }
+            other => {
+                return Err(LoaderError::UnsupportedDtype(format!("{other:?}")));
+            }
+        };
+
+        // Transpose [rows, cols] → [cols, rows]
+        let mut transposed = vec![0.0f32; rows * cols];
+        for r in 0..rows {
+            for c in 0..cols {
+                transposed[c * rows + r] = f32_data[r * cols + c];
+            }
+        }
+
+        // Transposed shape: [in_features, out_features]
+        let warp_shape = Shape::from_static(&[cols, rows]);
+        let tensor = GpuTensor::from_host(device, &transposed, warp_shape, DType::F32)
+            .map_err(|e| LoaderError::Device(e.to_string()))?;
+
+        Ok(tensor)
+    }
+
     /// Load a tensor as F16 onto GPU.
     pub fn load_f16(
         &self,
@@ -150,6 +216,71 @@ impl SafeTensorsLoader {
 
         let warp_shape = Shape::from_static(&shape);
         let tensor = GpuTensor::from_host(device, &f16_data, warp_shape, DType::F16)
+            .map_err(|e| LoaderError::Device(e.to_string()))?;
+
+        Ok(tensor)
+    }
+
+    /// Load a 2D weight tensor as F16, transposed from [out, in] to [in, out].
+    ///
+    /// Same as `load_f32_transposed` but outputs F16 — halves memory bandwidth
+    /// for weight GEMMs during decode. Converts from any file dtype (F32/F16/BF16).
+    pub fn load_f16_transposed(
+        &self,
+        name: &str,
+        device: &WarpDevice,
+    ) -> Result<GpuTensor<half::f16>, LoaderError> {
+        let st = SafeTensors::deserialize(&self.mmap)
+            .map_err(|e| LoaderError::Parse(e.to_string()))?;
+        let view = st.tensor(name)
+            .map_err(|e| LoaderError::TensorNotFound(name.to_string(), e.to_string()))?;
+
+        let shape: Vec<usize> = view.shape().to_vec();
+        if shape.len() != 2 {
+            // Not a 2D weight — load without transposition
+            return self.load_f16(name, device);
+        }
+
+        let rows = shape[0]; // out_features
+        let cols = shape[1]; // in_features
+        let data = view.data();
+        let file_dtype = view.dtype();
+
+        // Convert to f16
+        let f16_data: Vec<half::f16> = match file_dtype {
+            safetensors::Dtype::F16 => {
+                let ptr = data.as_ptr() as *const half::f16;
+                let len = data.len() / 2;
+                unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
+            }
+            safetensors::Dtype::F32 => {
+                let ptr = data.as_ptr() as *const f32;
+                let len = data.len() / 4;
+                let f32_slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+                f32_slice.iter().map(|v| half::f16::from_f32(*v)).collect()
+            }
+            safetensors::Dtype::BF16 => {
+                let ptr = data.as_ptr() as *const half::bf16;
+                let len = data.len() / 2;
+                let bf16_slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+                bf16_slice.iter().map(|v| half::f16::from_f32(v.to_f32())).collect()
+            }
+            other => {
+                return Err(LoaderError::UnsupportedDtype(format!("{other:?}")));
+            }
+        };
+
+        // Transpose [rows, cols] → [cols, rows]
+        let mut transposed = vec![half::f16::from_f32(0.0); rows * cols];
+        for r in 0..rows {
+            for c in 0..cols {
+                transposed[c * rows + r] = f16_data[r * cols + c];
+            }
+        }
+
+        // Transposed shape: [in_features, out_features]
+        let warp_shape = Shape::from_static(&[cols, rows]);
+        let tensor = GpuTensor::from_host(device, &transposed, warp_shape, DType::F16)
             .map_err(|e| LoaderError::Device(e.to_string()))?;
 
         Ok(tensor)
@@ -232,6 +363,84 @@ pub enum LoaderError {
     Device(String),
     #[error("Config error: {0}")]
     Config(String),
+}
+
+/// Loader that searches across multiple sharded SafeTensors files.
+/// Used for large models (7B+) that split weights across multiple files.
+pub struct ShardedSafeTensorsLoader {
+    shards: Vec<SafeTensorsLoader>,
+}
+
+impl ShardedSafeTensorsLoader {
+    /// Open multiple SafeTensors shard files.
+    pub fn open(paths: &[impl AsRef<Path>]) -> Result<Self, LoaderError> {
+        let mut shards = Vec::new();
+        for path in paths {
+            shards.push(SafeTensorsLoader::open(path)?);
+        }
+        Ok(Self { shards })
+    }
+
+    /// Open all shard files in a directory (matching model-*.safetensors pattern).
+    pub fn open_dir(dir: impl AsRef<Path>) -> Result<Self, LoaderError> {
+        let dir = dir.as_ref();
+        let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .map_err(|e| LoaderError::Io(format!("{}: {e}", dir.display())))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension().map_or(false, |ext| ext == "safetensors")
+            })
+            .collect();
+        paths.sort();
+
+        if paths.is_empty() {
+            return Err(LoaderError::Io(format!("no .safetensors files in {}", dir.display())));
+        }
+
+        Self::open(&paths)
+    }
+
+    /// Load a tensor as F32, searching across all shards.
+    pub fn load_f32(&self, name: &str, device: &WarpDevice) -> Result<GpuTensor<f32>, LoaderError> {
+        for shard in &self.shards {
+            match shard.load_f32(name, device) {
+                Ok(t) => return Ok(t),
+                Err(LoaderError::TensorNotFound(_, _)) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(LoaderError::TensorNotFound(name.to_string(), "not found in any shard".to_string()))
+    }
+
+    /// Load a tensor as F32, transposed from [out, in] to [in, out].
+    pub fn load_f32_transposed(&self, name: &str, device: &WarpDevice) -> Result<GpuTensor<f32>, LoaderError> {
+        for shard in &self.shards {
+            match shard.load_f32_transposed(name, device) {
+                Ok(t) => return Ok(t),
+                Err(LoaderError::TensorNotFound(_, _)) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(LoaderError::TensorNotFound(name.to_string(), "not found in any shard".to_string()))
+    }
+
+    /// Load a tensor as F16, transposed.
+    pub fn load_f16_transposed(&self, name: &str, device: &WarpDevice) -> Result<GpuTensor<half::f16>, LoaderError> {
+        for shard in &self.shards {
+            match shard.load_f16_transposed(name, device) {
+                Ok(t) => return Ok(t),
+                Err(LoaderError::TensorNotFound(_, _)) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(LoaderError::TensorNotFound(name.to_string(), "not found in any shard".to_string()))
+    }
+
+    /// Number of shards.
+    pub fn num_shards(&self) -> usize {
+        self.shards.len()
+    }
 }
 
 #[cfg(test)]

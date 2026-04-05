@@ -124,6 +124,9 @@ pub enum Op {
     /// Constant tensor baked into the graph.
     Constant { data: ConstantData },
 
+    /// Identity (no-op, pass-through). Used by optimizer for dead code elimination.
+    Identity,
+
     // === Core compute ===
     /// Matrix multiplication. Inputs: [A, B]. Output: A @ B.
     /// transpose_a/b happen before the multiply.
@@ -327,6 +330,15 @@ pub enum Op {
     /// Inputs: [X, gate_weight, up_weight, down_weight].
     FusedSwiGLU,
 
+    /// Auto-fused elementwise chain. Created by the autofuse optimizer pass.
+    /// Contains the generated CUDA kernel source and the chain name.
+    /// Inputs: [external inputs to the chain, in order].
+    AutoFused {
+        kernel_name: String,
+        kernel_src: String,
+        num_inputs: usize,
+    },
+
     // === Speculative decoding ===
     /// Verify draft tokens against target model logits.
     /// Inputs: [draft_tokens, draft_probs, target_probs].
@@ -381,12 +393,15 @@ impl Op {
 
             Op::QuantizedMatMul { .. } => Some(3), // activations, weights, scales (+ optional zeros)
             Op::FusedSwiGLU => Some(4), // X, gate_w, up_w, down_w
+            Op::AutoFused { num_inputs, .. } => Some(*num_inputs),
 
             Op::MoeGate { .. } => Some(2),
             Op::SpeculativeVerify { .. } => Some(3),
 
             Op::Reduce { .. } => Some(1),
             Op::Slice { .. } => Some(1),
+
+            Op::Identity => Some(0),
 
             // Variable inputs
             Op::Concat { .. } | Op::Split { .. } | Op::MoeExpert { .. } => None,
@@ -401,6 +416,7 @@ impl Op {
                 | Op::FusedMatMulBiasAct { .. }
                 | Op::FusedResidualRmsNorm { .. }
                 | Op::FusedSwiGLU
+                | Op::AutoFused { .. }
         )
     }
 

@@ -54,8 +54,8 @@ pub struct OnnxExecutor {
 pub enum ExecError {
     #[error("Device error: {0}")]
     Device(#[from] DeviceError),
-    #[error("Missing tensor: {0}")]
-    MissingTensor(String),
+    #[error("Missing tensor '{name}' in op '{op}'")]
+    MissingTensor { name: String, op: String },
     #[error("Unsupported op: {0}")]
     UnsupportedOp(String),
     #[error("Shape error: {0}")]
@@ -158,6 +158,7 @@ impl OnnxExecutor {
     /// Resolve a tensor name to a GPU tensor reference.
     fn resolve<'a>(
         name: &str,
+        op: &str,
         inputs: &HashMap<&str, &'a GpuTensor<f32>>,
         owned: &'a HashMap<String, GpuTensor<f32>>,
         weights: &'a HashMap<String, GpuTensor<f32>>,
@@ -165,9 +166,10 @@ impl OnnxExecutor {
         if let Some(t) = inputs.get(name) { return Ok(t); }
         if let Some(t) = owned.get(name) { return Ok(t); }
         if let Some(t) = weights.get(name) { return Ok(t); }
-        // Empty string = optional input not provided
-        if name.is_empty() { return Err(ExecError::MissingTensor("(empty)".into())); }
-        Err(ExecError::MissingTensor(name.to_string()))
+        Err(ExecError::MissingTensor {
+            name: if name.is_empty() { "(empty)".into() } else { name.to_string() },
+            op: op.to_string(),
+        })
     }
 
     fn execute_node(
@@ -179,13 +181,18 @@ impl OnnxExecutor {
     ) -> Result<(), ExecError> {
         let get = |idx: usize| -> Result<&GpuTensor<f32>, ExecError> {
             let name = node.inputs.get(idx)
-                .ok_or_else(|| ExecError::MissingTensor(format!("input {} of {}", idx, node.op_type)))?;
-            Self::resolve(name, inputs, owned, &self.weights)
+                .ok_or_else(|| ExecError::MissingTensor {
+                    name: format!("input[{}]", idx),
+                    op: node.op_type.clone(),
+                })?;
+            Self::resolve(name, &node.op_type, inputs, owned, &self.weights)
         };
 
         let out_name = node.outputs.first()
             .cloned()
-            .unwrap_or_default();
+            .ok_or_else(|| ExecError::Shape(
+                format!("{} node '{}' has no output names", node.op_type, node.name)
+            ))?;
 
         match node.op_type.as_str() {
             // ── Activations ────────────────────────────────────
@@ -246,9 +253,18 @@ impl OnnxExecutor {
                 // Infer M, N, K from shapes
                 let a_dims = &a.shape.dims();
                 let b_dims = &b.shape.dims();
-                let m = if a_dims.len() >= 2 { a_dims[a_dims.len() - 2].static_val().unwrap_or(1) as u32 } else { 1 };
-                let k = if a_dims.len() >= 1 { a_dims[a_dims.len() - 1].static_val().unwrap_or(1) as u32 } else { 1 };
-                let n = if b_dims.len() >= 1 { b_dims[b_dims.len() - 1].static_val().unwrap_or(1) as u32 } else { 1 };
+                let m = if a_dims.len() >= 2 {
+                    a_dims[a_dims.len() - 2].static_val()
+                        .ok_or_else(|| ExecError::Shape(format!("MatMul: dynamic M dim in A{:?}", a_dims)))? as u32
+                } else { 1 };
+                let k = if a_dims.len() >= 1 {
+                    a_dims[a_dims.len() - 1].static_val()
+                        .ok_or_else(|| ExecError::Shape(format!("MatMul: dynamic K dim in A{:?}", a_dims)))? as u32
+                } else { 1 };
+                let n = if b_dims.len() >= 1 {
+                    b_dims[b_dims.len() - 1].static_val()
+                        .ok_or_else(|| ExecError::Shape(format!("MatMul: dynamic N dim in B{:?}", b_dims)))? as u32
+                } else { 1 };
 
                 let mut out = GpuTensor::<f32>::zeros(device,
                     Shape::from_static(&[m as usize, n as usize]), DType::F32)?;
@@ -294,12 +310,16 @@ impl OnnxExecutor {
 
                 // Infer spatial dims from input shape [N, C, H, W]
                 let in_dims = &input.shape.dims();
-                let h = in_dims.get(2).and_then(|d| d.static_val()).unwrap_or(1) as u32;
-                let w = in_dims.get(3).and_then(|d| d.static_val()).unwrap_or(1) as u32;
+                let h = in_dims.get(2).and_then(|d| d.static_val())
+                    .ok_or_else(|| ExecError::Shape("Conv: missing H dim in input".into()))? as u32;
+                let w = in_dims.get(3).and_then(|d| d.static_val())
+                    .ok_or_else(|| ExecError::Shape("Conv: missing W dim in input".into()))? as u32;
 
                 let w_dims = &weight.shape.dims();
-                let c_out = w_dims.first().and_then(|d| d.static_val()).unwrap_or(1) as u32;
-                let c_in = in_dims.get(1).and_then(|d| d.static_val()).unwrap_or(1) as u32;
+                let c_out = w_dims.first().and_then(|d| d.static_val())
+                    .ok_or_else(|| ExecError::Shape("Conv: missing C_out dim in weight".into()))? as u32;
+                let c_in = in_dims.get(1).and_then(|d| d.static_val())
+                    .ok_or_else(|| ExecError::Shape("Conv: missing C_in dim in input".into()))? as u32;
 
                 let params = warp_kernels::conv::Conv2dParams {
                     in_channels: c_in, out_channels: c_out,
@@ -330,9 +350,12 @@ impl OnnxExecutor {
                 let eps = node.get_float("epsilon", 1e-5);
 
                 let dims = &input.shape.dims();
-                let c = dims.get(1).and_then(|d| d.static_val()).unwrap_or(1) as u32;
-                let h = dims.get(2).and_then(|d| d.static_val()).unwrap_or(1) as u32;
-                let w = dims.get(3).and_then(|d| d.static_val()).unwrap_or(1) as u32;
+                let c = dims.get(1).and_then(|d| d.static_val())
+                    .ok_or_else(|| ExecError::Shape("BatchNorm: missing C dim".into()))? as u32;
+                let h = dims.get(2).and_then(|d| d.static_val())
+                    .ok_or_else(|| ExecError::Shape("BatchNorm: missing H dim".into()))? as u32;
+                let w = dims.get(3).and_then(|d| d.static_val())
+                    .ok_or_else(|| ExecError::Shape("BatchNorm: missing W dim".into()))? as u32;
 
                 let mut out = GpuTensor::<f32>::zeros(device, input.shape.clone(), DType::F32)?;
                 warp_kernels::conv::batchnorm2d(&self.cache, device, input, scale, bias, mean, var,
@@ -355,9 +378,12 @@ impl OnnxExecutor {
                 let pw = *pads.get(1).unwrap_or(&0) as u32;
 
                 let dims = &input.shape.dims();
-                let c = dims.get(1).and_then(|d| d.static_val()).unwrap_or(1) as u32;
-                let h = dims.get(2).and_then(|d| d.static_val()).unwrap_or(1) as u32;
-                let w = dims.get(3).and_then(|d| d.static_val()).unwrap_or(1) as u32;
+                let c = dims.get(1).and_then(|d| d.static_val())
+                    .ok_or_else(|| ExecError::Shape("MaxPool: missing C dim".into()))? as u32;
+                let h = dims.get(2).and_then(|d| d.static_val())
+                    .ok_or_else(|| ExecError::Shape("MaxPool: missing H dim".into()))? as u32;
+                let w = dims.get(3).and_then(|d| d.static_val())
+                    .ok_or_else(|| ExecError::Shape("MaxPool: missing W dim".into()))? as u32;
 
                 let out_h = warp_kernels::conv::conv_output_size(h, kh, sh, ph, 1);
                 let out_w = warp_kernels::conv::conv_output_size(w, kw, sw, pw, 1);
@@ -382,9 +408,12 @@ impl OnnxExecutor {
                 let pw = *pads.get(1).unwrap_or(&0) as u32;
 
                 let dims = &input.shape.dims();
-                let c = dims.get(1).and_then(|d| d.static_val()).unwrap_or(1) as u32;
-                let h = dims.get(2).and_then(|d| d.static_val()).unwrap_or(1) as u32;
-                let w = dims.get(3).and_then(|d| d.static_val()).unwrap_or(1) as u32;
+                let c = dims.get(1).and_then(|d| d.static_val())
+                    .ok_or_else(|| ExecError::Shape("AvgPool: missing C dim".into()))? as u32;
+                let h = dims.get(2).and_then(|d| d.static_val())
+                    .ok_or_else(|| ExecError::Shape("AvgPool: missing H dim".into()))? as u32;
+                let w = dims.get(3).and_then(|d| d.static_val())
+                    .ok_or_else(|| ExecError::Shape("AvgPool: missing W dim".into()))? as u32;
 
                 let out_h = warp_kernels::conv::conv_output_size(h, kh, sh, ph, 1);
                 let out_w = warp_kernels::conv::conv_output_size(w, kw, sw, pw, 1);
@@ -398,9 +427,12 @@ impl OnnxExecutor {
             "GlobalAveragePool" => {
                 let input = get(0)?;
                 let dims = &input.shape.dims();
-                let c = dims.get(1).and_then(|d| d.static_val()).unwrap_or(1) as u32;
-                let h = dims.get(2).and_then(|d| d.static_val()).unwrap_or(1) as u32;
-                let w = dims.get(3).and_then(|d| d.static_val()).unwrap_or(1) as u32;
+                let c = dims.get(1).and_then(|d| d.static_val())
+                    .ok_or_else(|| ExecError::Shape("GlobalAvgPool: missing C dim".into()))? as u32;
+                let h = dims.get(2).and_then(|d| d.static_val())
+                    .ok_or_else(|| ExecError::Shape("GlobalAvgPool: missing H dim".into()))? as u32;
+                let w = dims.get(3).and_then(|d| d.static_val())
+                    .ok_or_else(|| ExecError::Shape("GlobalAvgPool: missing W dim".into()))? as u32;
                 let batch = input.numel / (c * h * w) as usize;
 
                 let mut out = GpuTensor::<f32>::zeros(device,
@@ -414,8 +446,10 @@ impl OnnxExecutor {
                 let x = get(0)?;
                 let dims = x.shape.dims();
                 if dims.len() == 2 {
-                    let m = dims[0].static_val().unwrap_or(1) as u32;
-                    let n = dims[1].static_val().unwrap_or(1) as u32;
+                    let m = dims[0].static_val()
+                        .ok_or_else(|| ExecError::Shape("Transpose: dynamic dim 0".into()))? as u32;
+                    let n = dims[1].static_val()
+                        .ok_or_else(|| ExecError::Shape("Transpose: dynamic dim 1".into()))? as u32;
                     let mut out = GpuTensor::<f32>::zeros(device,
                         Shape::from_static(&[n as usize, m as usize]), DType::F32)?;
                     warp_kernels::ops::transpose_2d(&self.cache, device, x, &mut out, m, n)?;
@@ -441,8 +475,10 @@ impl OnnxExecutor {
 
                 if axis == 1 && a_dims.len() >= 2 {
                     // Channel concat
-                    let c_a = a_dims[1].static_val().unwrap_or(1) as u32;
-                    let c_b = b_dims[1].static_val().unwrap_or(1) as u32;
+                    let c_a = a_dims[1].static_val()
+                        .ok_or_else(|| ExecError::Shape("Concat: dynamic C dim in A".into()))? as u32;
+                    let c_b = b_dims[1].static_val()
+                        .ok_or_else(|| ExecError::Shape("Concat: dynamic C dim in B".into()))? as u32;
                     let spatial: u32 = a_dims[2..].iter()
                         .map(|d| d.static_val().unwrap_or(1) as u32)
                         .product();
@@ -492,9 +528,12 @@ impl OnnxExecutor {
             "Resize" | "Upsample" => {
                 let input = get(0)?;
                 let dims = input.shape.dims();
-                let c = dims.get(1).and_then(|d| d.static_val()).unwrap_or(1) as u32;
-                let h = dims.get(2).and_then(|d| d.static_val()).unwrap_or(1) as u32;
-                let w = dims.get(3).and_then(|d| d.static_val()).unwrap_or(1) as u32;
+                let c = dims.get(1).and_then(|d| d.static_val())
+                    .ok_or_else(|| ExecError::Shape("Resize: missing C dim".into()))? as u32;
+                let h = dims.get(2).and_then(|d| d.static_val())
+                    .ok_or_else(|| ExecError::Shape("Resize: missing H dim".into()))? as u32;
+                let w = dims.get(3).and_then(|d| d.static_val())
+                    .ok_or_else(|| ExecError::Shape("Resize: missing W dim".into()))? as u32;
                 let batch = input.numel / (c * h * w) as usize;
 
                 // Try to get output size from scales input (input 2 or 3)
@@ -541,12 +580,16 @@ impl OnnxExecutor {
                 let pw = *pads.get(1).unwrap_or(&0) as u32;
 
                 let in_dims = input.shape.dims();
-                let h = in_dims.get(2).and_then(|d| d.static_val()).unwrap_or(1) as u32;
-                let w = in_dims.get(3).and_then(|d| d.static_val()).unwrap_or(1) as u32;
+                let h = in_dims.get(2).and_then(|d| d.static_val())
+                    .ok_or_else(|| ExecError::Shape("ConvTranspose: missing H dim".into()))? as u32;
+                let w = in_dims.get(3).and_then(|d| d.static_val())
+                    .ok_or_else(|| ExecError::Shape("ConvTranspose: missing W dim".into()))? as u32;
 
                 let w_dims = weight.shape.dims();
-                let c_in = w_dims.first().and_then(|d| d.static_val()).unwrap_or(1) as u32;
-                let c_out = w_dims.get(1).and_then(|d| d.static_val()).unwrap_or(1) as u32;
+                let c_in = w_dims.first().and_then(|d| d.static_val())
+                    .ok_or_else(|| ExecError::Shape("ConvTranspose: missing C_in dim".into()))? as u32;
+                let c_out = w_dims.get(1).and_then(|d| d.static_val())
+                    .ok_or_else(|| ExecError::Shape("ConvTranspose: missing C_out dim".into()))? as u32;
 
                 let params = warp_kernels::conv::ConvTranspose2dParams::new(c_in, c_out, kh)
                     .stride(sh).padding(ph);
@@ -635,9 +678,14 @@ impl OnnxExecutor {
                 let b = get(1)?;
                 let a_dims = a.shape.dims();
                 let b_dims = b.shape.dims();
-                let m = if a_dims.len() >= 2 { a_dims[a_dims.len()-2].static_val().unwrap_or(1) as u32 } else { 1 };
-                let k = a_dims.last().and_then(|d| d.static_val()).unwrap_or(1) as u32;
-                let n = b_dims.last().and_then(|d| d.static_val()).unwrap_or(1) as u32;
+                let m = if a_dims.len() >= 2 {
+                    a_dims[a_dims.len()-2].static_val()
+                        .ok_or_else(|| ExecError::Shape("Einsum: dynamic M dim".into()))? as u32
+                } else { 1 };
+                let k = a_dims.last().and_then(|d| d.static_val())
+                    .ok_or_else(|| ExecError::Shape("Einsum: dynamic K dim".into()))? as u32;
+                let n = b_dims.last().and_then(|d| d.static_val())
+                    .ok_or_else(|| ExecError::Shape("Einsum: dynamic N dim".into()))? as u32;
                 let mut out = GpuTensor::<f32>::zeros(device,
                     Shape::from_static(&[m as usize, n as usize]), DType::F32)?;
                 warp_kernels::missing_ops::einsum_matmul(&self.cache, device, a, b, &mut out, m, n, k)?;
@@ -727,9 +775,12 @@ impl OnnxExecutor {
                 let x = get(0)?;
                 let block_size = node.get_int("blocksize", 2) as u32;
                 let dims = x.shape.dims();
-                let c = dims.get(1).and_then(|d| d.static_val()).unwrap_or(1) as u32;
-                let h = dims.get(2).and_then(|d| d.static_val()).unwrap_or(1) as u32;
-                let w = dims.get(3).and_then(|d| d.static_val()).unwrap_or(1) as u32;
+                let c = dims.get(1).and_then(|d| d.static_val())
+                    .ok_or_else(|| ExecError::Shape("DepthToSpace: missing C dim".into()))? as u32;
+                let h = dims.get(2).and_then(|d| d.static_val())
+                    .ok_or_else(|| ExecError::Shape("DepthToSpace: missing H dim".into()))? as u32;
+                let w = dims.get(3).and_then(|d| d.static_val())
+                    .ok_or_else(|| ExecError::Shape("DepthToSpace: missing W dim".into()))? as u32;
                 let c_out = c / (block_size * block_size);
                 let h_out = h * block_size;
                 let w_out = w * block_size;
@@ -965,6 +1016,465 @@ impl OnnxExecutor {
                 }
             }
 
+            // ── Floor / Ceil / Round (CPU fallback) ─────────
+            "Floor" | "Ceil" | "Round" => {
+                let x = get(0)?;
+                let data = x.to_host(device)?;
+                let result: Vec<f32> = match node.op_type.as_str() {
+                    "Floor" => data.iter().map(|v| v.floor()).collect(),
+                    "Ceil"  => data.iter().map(|v| v.ceil()).collect(),
+                    "Round" => data.iter().map(|v| v.round()).collect(),
+                    _ => unreachable!(),
+                };
+                let out = GpuTensor::from_host(device, &result, x.shape.clone(), DType::F32)?;
+                owned.insert(out_name, out);
+            }
+
+            // ── Equal / Greater / Less (CPU fallback) ────────
+            "Equal" | "Greater" | "Less" => {
+                let a = get(0)?;
+                let b = get(1)?;
+                let a_data = a.to_host(device)?;
+                let b_data = b.to_host(device)?;
+                let len = a_data.len().min(b_data.len());
+                let result: Vec<f32> = (0..len).map(|i| {
+                    let av = a_data[i];
+                    let bv = if i < b_data.len() { b_data[i] } else { 0.0 };
+                    match node.op_type.as_str() {
+                        "Equal"   => if (av - bv).abs() < f32::EPSILON { 1.0 } else { 0.0 },
+                        "Greater" => if av > bv { 1.0 } else { 0.0 },
+                        "Less"    => if av < bv { 1.0 } else { 0.0 },
+                        _ => 0.0,
+                    }
+                }).collect();
+                let out = GpuTensor::from_host(device, &result,
+                    Shape::from_static(&[len]), DType::F32)?;
+                owned.insert(out_name, out);
+            }
+
+            // ── Not (unary logical, CPU fallback) ────────────
+            "Not" => {
+                let x = get(0)?;
+                let data = x.to_host(device)?;
+                let result: Vec<f32> = data.iter().map(|&v| {
+                    if v == 0.0 { 1.0 } else { 0.0 }
+                }).collect();
+                let out = GpuTensor::from_host(device, &result, x.shape.clone(), DType::F32)?;
+                owned.insert(out_name, out);
+            }
+
+            // ── And / Or (binary logical, CPU fallback) ──────
+            "And" | "Or" => {
+                let a = get(0)?;
+                let b = get(1)?;
+                let a_data = a.to_host(device)?;
+                let b_data = b.to_host(device)?;
+                let len = a_data.len().min(b_data.len());
+                let result: Vec<f32> = (0..len).map(|i| {
+                    let a_bool = a_data[i] != 0.0;
+                    let b_bool = if i < b_data.len() { b_data[i] != 0.0 } else { false };
+                    let r = match node.op_type.as_str() {
+                        "And" => a_bool && b_bool,
+                        "Or"  => a_bool || b_bool,
+                        _ => false,
+                    };
+                    if r { 1.0 } else { 0.0 }
+                }).collect();
+                let out = GpuTensor::from_host(device, &result,
+                    Shape::from_static(&[len]), DType::F32)?;
+                owned.insert(out_name, out);
+            }
+
+            // ── LSTM (CPU fallback using extended_ops::lstm_cell) ─
+            "LSTM" => {
+                // ONNX LSTM inputs: X[seq_len, batch, input_size], W[1, 4*hidden, input],
+                //                   R[1, 4*hidden, hidden], B[1, 8*hidden]
+                let x_tensor = get(0)?;
+                let w_tensor = get(1)?;
+                let r_tensor = get(2)?;
+
+                let x_data = x_tensor.to_host(device)?;
+                let w_data = w_tensor.to_host(device)?;
+                let r_data = r_tensor.to_host(device)?;
+
+                // Parse dimensions from W shape: [num_directions, 4*hidden_size, input_size]
+                let w_dims = w_tensor.shape.dims();
+                let four_hidden = w_dims.get(1).and_then(|d| d.static_val()).unwrap_or(4) as usize;
+                let input_size = w_dims.get(2).and_then(|d| d.static_val()).unwrap_or(1) as usize;
+                let hidden_size = four_hidden / 4;
+
+                let x_dims = x_tensor.shape.dims();
+                let seq_len = x_dims.get(0).and_then(|d| d.static_val()).unwrap_or(1);
+                let batch = x_dims.get(1).and_then(|d| d.static_val()).unwrap_or(1);
+
+                // Bias: split into b_ih [4*hidden] and b_hh [4*hidden]
+                let b_data = if node.inputs.len() >= 4 && !node.inputs[3].is_empty() {
+                    get(3).ok().and_then(|t| t.to_host(device).ok()).unwrap_or_default()
+                } else {
+                    vec![0.0f32; 8 * hidden_size]
+                };
+                let b_ih = if b_data.len() >= 4 * hidden_size { &b_data[..4 * hidden_size] }
+                           else { &vec![0.0f32; 4 * hidden_size] };
+                let b_hh = if b_data.len() >= 8 * hidden_size { &b_data[4 * hidden_size..8 * hidden_size] }
+                           else { &vec![0.0f32; 4 * hidden_size] };
+
+                let mut h = vec![0.0f32; batch * hidden_size];
+                let mut c = vec![0.0f32; batch * hidden_size];
+
+                // Run LSTM cell for each timestep
+                let mut all_h = Vec::with_capacity(seq_len * batch * hidden_size);
+                for t in 0..seq_len {
+                    let x_t = &x_data[t * batch * input_size..(t + 1) * batch * input_size];
+                    let (h_new, c_new) = warp_kernels::extended_ops::lstm_cell(
+                        x_t, &h, &c, &w_data, &r_data, b_ih, b_hh,
+                        batch, input_size, hidden_size,
+                    );
+                    h = h_new;
+                    c = c_new;
+                    all_h.extend_from_slice(&h);
+                }
+
+                // Output Y: [seq_len, num_directions=1, batch, hidden_size]
+                let y_out = GpuTensor::from_host(device, &all_h,
+                    Shape::from_static(&[seq_len, 1, batch, hidden_size]), DType::F32)?;
+                owned.insert(out_name.clone(), y_out);
+
+                // Y_h (final hidden state)
+                if node.outputs.len() >= 2 && !node.outputs[1].is_empty() {
+                    let yh_out = GpuTensor::from_host(device, &h,
+                        Shape::from_static(&[1, batch, hidden_size]), DType::F32)?;
+                    owned.insert(node.outputs[1].clone(), yh_out);
+                }
+                // Y_c (final cell state)
+                if node.outputs.len() >= 3 && !node.outputs[2].is_empty() {
+                    let yc_out = GpuTensor::from_host(device, &c,
+                        Shape::from_static(&[1, batch, hidden_size]), DType::F32)?;
+                    owned.insert(node.outputs[2].clone(), yc_out);
+                }
+            }
+
+            // ── GRU (CPU fallback using extended_ops::gru_cell) ───
+            "GRU" => {
+                let x_tensor = get(0)?;
+                let w_tensor = get(1)?;
+                let r_tensor = get(2)?;
+
+                let x_data = x_tensor.to_host(device)?;
+                let w_data = w_tensor.to_host(device)?;
+                let r_data = r_tensor.to_host(device)?;
+
+                let w_dims = w_tensor.shape.dims();
+                let three_hidden = w_dims.get(1).and_then(|d| d.static_val()).unwrap_or(3) as usize;
+                let input_size = w_dims.get(2).and_then(|d| d.static_val()).unwrap_or(1) as usize;
+                let hidden_size = three_hidden / 3;
+
+                let x_dims = x_tensor.shape.dims();
+                let seq_len = x_dims.get(0).and_then(|d| d.static_val()).unwrap_or(1);
+                let batch = x_dims.get(1).and_then(|d| d.static_val()).unwrap_or(1);
+
+                let b_data = if node.inputs.len() >= 4 && !node.inputs[3].is_empty() {
+                    get(3).ok().and_then(|t| t.to_host(device).ok()).unwrap_or_default()
+                } else {
+                    vec![0.0f32; 6 * hidden_size]
+                };
+                let b_ih = if b_data.len() >= 3 * hidden_size { &b_data[..3 * hidden_size] }
+                           else { &vec![0.0f32; 3 * hidden_size] };
+                let b_hh = if b_data.len() >= 6 * hidden_size { &b_data[3 * hidden_size..6 * hidden_size] }
+                           else { &vec![0.0f32; 3 * hidden_size] };
+
+                let mut h = vec![0.0f32; batch * hidden_size];
+                let mut all_h = Vec::with_capacity(seq_len * batch * hidden_size);
+
+                for t in 0..seq_len {
+                    let x_t = &x_data[t * batch * input_size..(t + 1) * batch * input_size];
+                    h = warp_kernels::extended_ops::gru_cell(
+                        x_t, &h, &w_data, &r_data, b_ih, b_hh,
+                        batch, input_size, hidden_size,
+                    );
+                    all_h.extend_from_slice(&h);
+                }
+
+                let y_out = GpuTensor::from_host(device, &all_h,
+                    Shape::from_static(&[seq_len, 1, batch, hidden_size]), DType::F32)?;
+                owned.insert(out_name.clone(), y_out);
+
+                if node.outputs.len() >= 2 && !node.outputs[1].is_empty() {
+                    let yh_out = GpuTensor::from_host(device, &h,
+                        Shape::from_static(&[1, batch, hidden_size]), DType::F32)?;
+                    owned.insert(node.outputs[1].clone(), yh_out);
+                }
+            }
+
+            // ── QuantizeLinear (CPU fallback) ────────────────
+            "QuantizeLinear" => {
+                // output = clamp(round(input / scale) + zero_point, qmin, qmax)
+                let x = get(0)?;
+                let scale_t = get(1)?;
+                let x_data = x.to_host(device)?;
+                let scale_data = scale_t.to_host(device)?;
+                let scale = scale_data.first().copied().unwrap_or(1.0);
+                let zp = if node.inputs.len() >= 3 && !node.inputs[2].is_empty() {
+                    get(2).ok().and_then(|t| t.to_host(device).ok())
+                        .and_then(|v| v.first().copied()).unwrap_or(0.0)
+                } else { 0.0 };
+                let qmin = -128.0f32;
+                let qmax = 127.0f32;
+                let result: Vec<f32> = x_data.iter().map(|&v| {
+                    (v / scale).round().clamp(qmin - zp, qmax - zp) + zp
+                }).map(|v| v.clamp(qmin, qmax)).collect();
+                let out = GpuTensor::from_host(device, &result, x.shape.clone(), DType::F32)?;
+                owned.insert(out_name, out);
+            }
+
+            // ── DequantizeLinear (CPU fallback) ──────────────
+            "DequantizeLinear" => {
+                // output = (input - zero_point) * scale
+                let x = get(0)?;
+                let scale_t = get(1)?;
+                let x_data = x.to_host(device)?;
+                let scale_data = scale_t.to_host(device)?;
+                let scale = scale_data.first().copied().unwrap_or(1.0);
+                let zp = if node.inputs.len() >= 3 && !node.inputs[2].is_empty() {
+                    get(2).ok().and_then(|t| t.to_host(device).ok())
+                        .and_then(|v| v.first().copied()).unwrap_or(0.0)
+                } else { 0.0 };
+                let result: Vec<f32> = x_data.iter().map(|&v| {
+                    (v - zp) * scale
+                }).collect();
+                let out = GpuTensor::from_host(device, &result, x.shape.clone(), DType::F32)?;
+                owned.insert(out_name, out);
+            }
+
+            // ── Trilu (GPU kernel from extended_ops) ─────────
+            "Trilu" => {
+                let x = get(0)?;
+                let dims = x.shape.dims();
+                let cols = dims.last().and_then(|d| d.static_val()).unwrap_or(1) as u32;
+                let rows = (x.numel / cols as usize) as u32;
+                let k = if node.inputs.len() >= 2 && !node.inputs[1].is_empty() {
+                    get(1).ok().and_then(|t| t.to_host(device).ok())
+                        .and_then(|v| v.first().copied()).unwrap_or(0.0) as i32
+                } else { 0 };
+                let upper = node.get_int("upper", 1) != 0;
+                let mut out = GpuTensor::<f32>::zeros(device, x.shape.clone(), DType::F32)?;
+                warp_kernels::extended_ops::trilu(&self.cache, device, x, &mut out, rows, cols, k, upper)?;
+                owned.insert(out_name, out);
+            }
+
+            // ── Fused ops (created by optimizer) ─────────────
+            "FusedMatMulBias" => {
+                let a = get(0)?;
+                let b = get(1)?;
+                let bias = get(2)?;
+                let a_dims = &a.shape.dims();
+                let b_dims = &b.shape.dims();
+                let m = if a_dims.len() >= 2 {
+                    a_dims[a_dims.len() - 2].static_val()
+                        .ok_or_else(|| ExecError::Shape("FusedMatMulBias: dynamic M dim".into()))? as u32
+                } else { 1 };
+                let k = if a_dims.len() >= 1 {
+                    a_dims[a_dims.len() - 1].static_val()
+                        .ok_or_else(|| ExecError::Shape("FusedMatMulBias: dynamic K dim".into()))? as u32
+                } else { 1 };
+                let n = if b_dims.len() >= 1 {
+                    b_dims[b_dims.len() - 1].static_val()
+                        .ok_or_else(|| ExecError::Shape("FusedMatMulBias: dynamic N dim".into()))? as u32
+                } else { 1 };
+
+                let mut mm_out = GpuTensor::<f32>::zeros(device,
+                    Shape::from_static(&[m as usize, n as usize]), DType::F32)?;
+                warp_kernels::ops::gemm(&self.cache, device, a, b, &mut mm_out, m, n, k)?;
+
+                let mut out = GpuTensor::<f32>::zeros(device,
+                    Shape::from_static(&[m as usize, n as usize]), DType::F32)?;
+                warp_kernels::ops::add(&self.cache, device, &mm_out, bias, &mut out)?;
+                owned.insert(out_name, out);
+            }
+
+            "FusedMatMulBiasAct" => {
+                let a = get(0)?;
+                let b = get(1)?;
+                let bias = get(2)?;
+                let a_dims = &a.shape.dims();
+                let b_dims = &b.shape.dims();
+                let m = if a_dims.len() >= 2 {
+                    a_dims[a_dims.len() - 2].static_val()
+                        .ok_or_else(|| ExecError::Shape("FusedMatMulBiasAct: dynamic M dim".into()))? as u32
+                } else { 1 };
+                let k = if a_dims.len() >= 1 {
+                    a_dims[a_dims.len() - 1].static_val()
+                        .ok_or_else(|| ExecError::Shape("FusedMatMulBiasAct: dynamic K dim".into()))? as u32
+                } else { 1 };
+                let n = if b_dims.len() >= 1 {
+                    b_dims[b_dims.len() - 1].static_val()
+                        .ok_or_else(|| ExecError::Shape("FusedMatMulBiasAct: dynamic N dim".into()))? as u32
+                } else { 1 };
+
+                let mut mm_out = GpuTensor::<f32>::zeros(device,
+                    Shape::from_static(&[m as usize, n as usize]), DType::F32)?;
+                warp_kernels::ops::gemm(&self.cache, device, a, b, &mut mm_out, m, n, k)?;
+
+                let mut biased = GpuTensor::<f32>::zeros(device,
+                    Shape::from_static(&[m as usize, n as usize]), DType::F32)?;
+                warp_kernels::ops::add(&self.cache, device, &mm_out, bias, &mut biased)?;
+
+                // Apply activation based on node attribute
+                let act = node.get_string("activation").unwrap_or("relu");
+                let mut out = GpuTensor::<f32>::zeros(device, biased.shape.clone(), DType::F32)?;
+                match act {
+                    "gelu" | "Gelu" => warp_kernels::ops::gelu(&self.cache, device, &biased, &mut out)?,
+                    "silu" | "Silu" | "swish" | "Swish" => warp_kernels::ops::silu(&self.cache, device, &biased, &mut out)?,
+                    _ => warp_kernels::ops::relu(&self.cache, device, &biased, &mut out)?,
+                }
+                owned.insert(out_name, out);
+            }
+
+            "FusedResidualRmsNorm" => {
+                let residual = get(0)?;
+                let x = get(1)?;
+                let gamma = get(2)?;
+                let eps = node.get_float("eps", 1e-5);
+                let hidden_size = x.shape.dims().last()
+                    .and_then(|d| d.static_val())
+                    .unwrap_or(1) as u32;
+
+                let mut norm_out = GpuTensor::<f32>::zeros(device, x.shape.clone(), DType::F32)?;
+                let mut residual_out = GpuTensor::<f32>::zeros(device, x.shape.clone(), DType::F32)?;
+                warp_kernels::ops::fused_residual_rmsnorm(
+                    &self.cache, device, x, residual, gamma,
+                    &mut norm_out, &mut residual_out, hidden_size, eps,
+                )?;
+
+                // Primary output is the normalized result
+                owned.insert(out_name.clone(), norm_out);
+                // If there's a second output name, store the residual
+                if let Some(res_name) = node.outputs.get(1) {
+                    owned.insert(res_name.clone(), residual_out);
+                }
+            }
+
+            "FusedSwiGLU" => {
+                let x = get(0)?;
+                let gate_weight = get(1)?;
+                let up_weight = get(2)?;
+                let down_weight = get(3)?;
+
+                let x_dims = &x.shape.dims();
+                let gw_dims = &gate_weight.shape.dims();
+                let dw_dims = &down_weight.shape.dims();
+
+                let m = if x_dims.len() >= 2 {
+                    x_dims[x_dims.len() - 2].static_val()
+                        .ok_or_else(|| ExecError::Shape("FusedSwiGLU: dynamic M dim".into()))? as u32
+                } else { 1 };
+                let k_in = if x_dims.len() >= 1 {
+                    x_dims[x_dims.len() - 1].static_val()
+                        .ok_or_else(|| ExecError::Shape("FusedSwiGLU: dynamic K dim".into()))? as u32
+                } else { 1 };
+                let intermediate = if gw_dims.len() >= 1 {
+                    gw_dims[gw_dims.len() - 1].static_val()
+                        .ok_or_else(|| ExecError::Shape("FusedSwiGLU: dynamic intermediate dim".into()))? as u32
+                } else { 1 };
+                let n_out = if dw_dims.len() >= 1 {
+                    dw_dims[dw_dims.len() - 1].static_val()
+                        .ok_or_else(|| ExecError::Shape("FusedSwiGLU: dynamic output dim".into()))? as u32
+                } else { 1 };
+
+                // gate_proj = X @ gate_weight
+                let mut gate_proj = GpuTensor::<f32>::zeros(device,
+                    Shape::from_static(&[m as usize, intermediate as usize]), DType::F32)?;
+                warp_kernels::ops::gemm(&self.cache, device, x, gate_weight, &mut gate_proj, m, intermediate, k_in)?;
+
+                // up_proj = X @ up_weight
+                let mut up_proj = GpuTensor::<f32>::zeros(device,
+                    Shape::from_static(&[m as usize, intermediate as usize]), DType::F32)?;
+                warp_kernels::ops::gemm(&self.cache, device, x, up_weight, &mut up_proj, m, intermediate, k_in)?;
+
+                // fused_silu_mul: out = silu(gate_proj) * up_proj
+                let mut silu_out = GpuTensor::<f32>::zeros(device,
+                    Shape::from_static(&[m as usize, intermediate as usize]), DType::F32)?;
+                warp_kernels::ops::fused_silu_mul(&self.cache, device, &gate_proj, &up_proj, &mut silu_out)?;
+
+                // down_proj = silu_out @ down_weight
+                let mut out = GpuTensor::<f32>::zeros(device,
+                    Shape::from_static(&[m as usize, n_out as usize]), DType::F32)?;
+                warp_kernels::ops::gemm(&self.cache, device, &silu_out, down_weight, &mut out, m, n_out, intermediate)?;
+                owned.insert(out_name, out);
+            }
+
+            "AutoFused" => {
+                let kernel_name = node.get_string("kernel_name")
+                    .ok_or_else(|| ExecError::UnsupportedOp(
+                        "AutoFused node missing 'kernel_name' attribute".to_string()))?
+                    .to_string();
+                let kernel_src = node.get_string("kernel_src")
+                    .ok_or_else(|| ExecError::UnsupportedOp(
+                        "AutoFused node missing 'kernel_src' attribute".to_string()))?
+                    .to_string();
+
+                // Gather all input tensors
+                let mut input_tensors: Vec<&GpuTensor<f32>> = Vec::new();
+                for i in 0..node.inputs.len() {
+                    if !node.inputs[i].is_empty() {
+                        input_tensors.push(get(i)?);
+                    }
+                }
+
+                if input_tensors.is_empty() {
+                    return Err(ExecError::MissingTensor {
+                        name: "(no inputs)".into(),
+                        op: "AutoFused".into(),
+                    });
+                }
+
+                let n = input_tensors[0].numel;
+                let mut output = GpuTensor::<f32>::zeros(device,
+                    input_tensors[0].shape.clone(), DType::F32)?;
+
+                let f = self.cache.get_or_compile(device, &kernel_src, &kernel_name)
+                    .map_err(ExecError::Device)?;
+                let cfg = cudarc::driver::LaunchConfig::for_num_elems(n as u32);
+
+                // Launch with variable number of inputs (same pattern as execute_fusion)
+                match input_tensors.len() {
+                    1 => unsafe {
+                        use cudarc::driver::PushKernelArg;
+                        device.stream.launch_builder(&f)
+                            .arg(&mut output.data).arg(&input_tensors[0].data).arg(&n)
+                            .launch(cfg).map_err(|e: cudarc::driver::result::DriverError|
+                                ExecError::Device(DeviceError::Launch(e.to_string())))?;
+                    },
+                    2 => unsafe {
+                        use cudarc::driver::PushKernelArg;
+                        device.stream.launch_builder(&f)
+                            .arg(&mut output.data).arg(&input_tensors[0].data)
+                            .arg(&input_tensors[1].data).arg(&n)
+                            .launch(cfg).map_err(|e: cudarc::driver::result::DriverError|
+                                ExecError::Device(DeviceError::Launch(e.to_string())))?;
+                    },
+                    3 => unsafe {
+                        use cudarc::driver::PushKernelArg;
+                        device.stream.launch_builder(&f)
+                            .arg(&mut output.data).arg(&input_tensors[0].data)
+                            .arg(&input_tensors[1].data).arg(&input_tensors[2].data).arg(&n)
+                            .launch(cfg).map_err(|e: cudarc::driver::result::DriverError|
+                                ExecError::Device(DeviceError::Launch(e.to_string())))?;
+                    },
+                    4 => unsafe {
+                        use cudarc::driver::PushKernelArg;
+                        device.stream.launch_builder(&f)
+                            .arg(&mut output.data).arg(&input_tensors[0].data)
+                            .arg(&input_tensors[1].data).arg(&input_tensors[2].data)
+                            .arg(&input_tensors[3].data).arg(&n)
+                            .launch(cfg).map_err(|e: cudarc::driver::result::DriverError|
+                                ExecError::Device(DeviceError::Launch(e.to_string())))?;
+                    },
+                    other => return Err(ExecError::UnsupportedOp(
+                        format!("AutoFused kernel with {} inputs not supported (max 4)", other))),
+                }
+                owned.insert(out_name, output);
+            }
+
             // ── HARD ERROR for truly unsupported ops ──────────
             other => {
                 return Err(ExecError::UnsupportedOp(format!(
@@ -972,7 +1482,8 @@ impl OnnxExecutor {
                      TensorWarp supports: Add, Sub, Mul, Div, MatMul, Gemm, Conv, ConvTranspose, \
                      BatchNorm, InstanceNorm, LayerNorm, GroupNorm, MaxPool, AvgPool, GlobalAvgPool, \
                      Relu, Sigmoid, Tanh, Gelu, Silu, LeakyRelu, Clip, Softmax, \
-                     Reshape, Flatten, Transpose, Concat, Reduce*, Resize, Identity, Dropout",
+                     Reshape, Flatten, Transpose, Concat, Reduce*, Resize, Identity, Dropout, \
+                     FusedMatMulBias, FusedMatMulBiasAct, FusedResidualRmsNorm, FusedSwiGLU, AutoFused",
                     other, node.name
                 )));
             }
@@ -991,7 +1502,7 @@ impl OnnxExecutor {
     ) -> Result<(), ExecError> {
         // Compile the fused kernel
         let f = self.cache.get_or_compile(device, &fusion.kernel_src, &fusion.kernel_name)
-            .map_err(|e| ExecError::Device(e))?;
+            .map_err(ExecError::Device)?;
 
         // Gather inputs: the first input of the first node in the chain,
         // plus additional inputs for binary ops within the chain
@@ -1000,7 +1511,7 @@ impl OnnxExecutor {
         // First input: main data flowing through the chain
         let first_node = &self.nodes[fusion.node_indices[0]];
         let first_input_name = &first_node.inputs[0];
-        let first_input = Self::resolve(first_input_name, inputs, owned, &self.weights)?;
+        let first_input = Self::resolve(first_input_name, &fusion.kernel_name, inputs, owned, &self.weights)?;
         input_tensors.push(first_input);
 
         // Additional inputs: second operands of binary ops in the chain
@@ -1009,7 +1520,7 @@ impl OnnxExecutor {
             if node.inputs.len() >= 2 {
                 // Binary op — need the second input
                 let second_name = &node.inputs[1];
-                let second = Self::resolve(second_name, inputs, owned, &self.weights)?;
+                let second = Self::resolve(second_name, &fusion.kernel_name, inputs, owned, &self.weights)?;
                 input_tensors.push(second);
             }
         }
@@ -1218,21 +1729,17 @@ mod tests {
 
         // Conv weight: [8, 3, 3, 3]
         let conv_w: Vec<f32> = (0..8*3*3*3).map(|i| ((i * 7 + 3) % 200) as f32 * 0.01 - 1.0).collect();
-        initializers.insert("conv.weight".to_string(), OnnxTensor {
-            name: "conv.weight".to_string(),
-            dtype: OnnxDType::Float,
-            shape: vec![8, 3, 3, 3],
-            raw_data: conv_w.iter().flat_map(|f| f.to_le_bytes()).collect(),
-        });
+        initializers.insert("conv.weight".to_string(), OnnxTensor::new(
+            "conv.weight", OnnxDType::Float,
+            vec![8, 3, 3, 3], conv_w.iter().flat_map(|f| f.to_le_bytes()).collect(),
+        ));
 
         // FC weight: [8, 10]
         let fc_w: Vec<f32> = (0..8*10).map(|i| ((i * 11 + 5) % 200) as f32 * 0.01 - 1.0).collect();
-        initializers.insert("fc.weight".to_string(), OnnxTensor {
-            name: "fc.weight".to_string(),
-            dtype: OnnxDType::Float,
-            shape: vec![8, 10],
-            raw_data: fc_w.iter().flat_map(|f| f.to_le_bytes()).collect(),
-        });
+        initializers.insert("fc.weight".to_string(), OnnxTensor::new(
+            "fc.weight", OnnxDType::Float,
+            vec![8, 10], fc_w.iter().flat_map(|f| f.to_le_bytes()).collect(),
+        ));
 
         OnnxModel {
             inputs: vec![OnnxIO {
@@ -1290,6 +1797,9 @@ mod tests {
             ir_version: 8,
             opset_version: 17,
             producer: "test".to_string(),
+            model_dir: None,
+            graph_name: String::new(),
+            graph_doc_string: String::new(),
         }
     }
 

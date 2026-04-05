@@ -22,10 +22,12 @@ pub fn build_mlp_model() -> OnnxModel {
     inits.insert("w1".into(), OnnxTensor {
         name: "w1".into(), dtype: OnnxDType::Float,
         shape: vec![4, 8], raw_data: w1.iter().flat_map(|f| f.to_le_bytes()).collect(),
+        external_data: vec![],
     });
     inits.insert("b1".into(), OnnxTensor {
         name: "b1".into(), dtype: OnnxDType::Float,
         shape: vec![8], raw_data: b1.iter().flat_map(|f| f.to_le_bytes()).collect(),
+        external_data: vec![],
     });
 
     // W2: [8, 3], B2: [3]
@@ -34,10 +36,12 @@ pub fn build_mlp_model() -> OnnxModel {
     inits.insert("w2".into(), OnnxTensor {
         name: "w2".into(), dtype: OnnxDType::Float,
         shape: vec![8, 3], raw_data: w2.iter().flat_map(|f| f.to_le_bytes()).collect(),
+        external_data: vec![],
     });
     inits.insert("b2".into(), OnnxTensor {
         name: "b2".into(), dtype: OnnxDType::Float,
         shape: vec![3], raw_data: b2.iter().flat_map(|f| f.to_le_bytes()).collect(),
+        external_data: vec![],
     });
 
     OnnxModel {
@@ -56,6 +60,7 @@ pub fn build_mlp_model() -> OnnxModel {
         ],
         initializers: inits,
         ir_version: 8, opset_version: 17, producer: "test".into(),
+        model_dir: None, graph_name: String::new(), graph_doc_string: String::new(),
     }
 }
 
@@ -146,6 +151,7 @@ mod tests {
         inits.insert("conv_w".into(), OnnxTensor {
             name: "conv_w".into(), dtype: OnnxDType::Float,
             shape: vec![2, 1, 3, 3], raw_data: conv_w.iter().flat_map(|f| f.to_le_bytes()).collect(),
+            external_data: vec![],
         });
 
         let model = OnnxModel {
@@ -166,6 +172,7 @@ mod tests {
             ],
             initializers: inits,
             ir_version: 8, opset_version: 17, producer: "test".into(),
+            model_dir: None, graph_name: String::new(), graph_doc_string: String::new(),
         };
 
         let exec = OnnxExecutor::new(&dev, &model).unwrap();
@@ -215,6 +222,7 @@ mod tests {
             ],
             initializers: HashMap::new(),
             ir_version: 8, opset_version: 17, producer: "test".into(),
+            model_dir: None, graph_name: String::new(), graph_doc_string: String::new(),
         };
 
         let exec = OnnxExecutor::new(&dev, &model).unwrap();
@@ -262,6 +270,7 @@ mod tests {
             name: "embed".into(), dtype: OnnxDType::Float,
             shape: vec![5, 4], // 5 tokens, dim 4
             raw_data: embed_table.iter().flat_map(|f| f.to_le_bytes()).collect(),
+            external_data: vec![],
         });
 
         let model = OnnxModel {
@@ -274,6 +283,7 @@ mod tests {
             ],
             initializers: inits,
             ir_version: 8, opset_version: 17, producer: "test".into(),
+            model_dir: None, graph_name: String::new(), graph_doc_string: String::new(),
         };
 
         let exec = OnnxExecutor::new(&dev, &model).unwrap();
@@ -314,9 +324,11 @@ mod tests {
         let conv1_w: Vec<f32> = (0..8*8*3*3).map(|i| ((i*7+3) % 200) as f32 * 0.005 - 0.5).collect();
         let conv2_w: Vec<f32> = (0..8*8*3*3).map(|i| ((i*11+5) % 200) as f32 * 0.005 - 0.5).collect();
         inits.insert("conv1_w".into(), OnnxTensor { name: "conv1_w".into(), dtype: OnnxDType::Float,
-            shape: vec![8,8,3,3], raw_data: conv1_w.iter().flat_map(|f| f.to_le_bytes()).collect() });
+            shape: vec![8,8,3,3], raw_data: conv1_w.iter().flat_map(|f| f.to_le_bytes()).collect(),
+            external_data: vec![] });
         inits.insert("conv2_w".into(), OnnxTensor { name: "conv2_w".into(), dtype: OnnxDType::Float,
-            shape: vec![8,8,3,3], raw_data: conv2_w.iter().flat_map(|f| f.to_le_bytes()).collect() });
+            shape: vec![8,8,3,3], raw_data: conv2_w.iter().flat_map(|f| f.to_le_bytes()).collect(),
+            external_data: vec![] });
 
         let model = OnnxModel {
             inputs: vec![OnnxIO { name: "input".into(), dtype: Some(OnnxDType::Float), shape: vec![1,8,16,16] }],
@@ -342,6 +354,7 @@ mod tests {
             ],
             initializers: inits,
             ir_version: 8, opset_version: 17, producer: "test".into(),
+            model_dir: None, graph_name: String::new(), graph_doc_string: String::new(),
         };
 
         let exec = OnnxExecutor::new(&dev, &model).unwrap();
@@ -381,9 +394,11 @@ mod tests {
         let wq: Vec<f32> = (0..h*h).map(|i| ((i*7+3) % 200) as f32 * 0.01 - 1.0).collect();
         let wk: Vec<f32> = (0..h*h).map(|i| ((i*11+5) % 200) as f32 * 0.01 - 1.0).collect();
         inits.insert("wq".into(), OnnxTensor { name: "wq".into(), dtype: OnnxDType::Float,
-            shape: vec![h as i64, h as i64], raw_data: wq.iter().flat_map(|f| f.to_le_bytes()).collect() });
+            shape: vec![h as i64, h as i64], raw_data: wq.iter().flat_map(|f| f.to_le_bytes()).collect(),
+            external_data: vec![] });
         inits.insert("wk".into(), OnnxTensor { name: "wk".into(), dtype: OnnxDType::Float,
-            shape: vec![h as i64, h as i64], raw_data: wk.iter().flat_map(|f| f.to_le_bytes()).collect() });
+            shape: vec![h as i64, h as i64], raw_data: wk.iter().flat_map(|f| f.to_le_bytes()).collect(),
+            external_data: vec![] });
 
         let model = OnnxModel {
             inputs: vec![OnnxIO { name: "x".into(), dtype: Some(OnnxDType::Float), shape: vec![4, h as i64] }],
@@ -398,6 +413,7 @@ mod tests {
             ],
             initializers: inits,
             ir_version: 8, opset_version: 17, producer: "test".into(),
+            model_dir: None, graph_name: String::new(), graph_doc_string: String::new(),
         };
 
         let exec = OnnxExecutor::new(&dev, &model).unwrap();

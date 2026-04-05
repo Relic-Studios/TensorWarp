@@ -6,6 +6,7 @@
 //! - Device memory allocation
 //! - Device info queries
 
+use cudarc::cublas::CudaBlas;
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream, LaunchConfig, sys};
 use cudarc::driver::result::DriverError;
 use cudarc::nvrtc;
@@ -23,6 +24,9 @@ pub struct WarpDevice {
     pub compute_capability: (u32, u32),
     /// SM version as single number (e.g., 89).
     pub sm_version: u32,
+    /// cuBLAS handle for high-performance GEMM.
+    /// Created eagerly on device init — cuBLAS is always available.
+    pub blas: CudaBlas,
 }
 
 impl WarpDevice {
@@ -41,13 +45,22 @@ impl WarpDevice {
             as u32;
         let sm_version = major * 10 + minor;
 
+        let blas = CudaBlas::new(stream.clone())
+            .map_err(|e| DeviceError::Init(format!("cuBLAS init: {e}")))?;
+
         Ok(Self {
             ctx,
             stream,
             ordinal,
             compute_capability: (major, minor),
             sm_version,
+            blas,
         })
+    }
+
+    /// Get a reference to the cuBLAS handle.
+    pub fn cublas(&self) -> Result<&CudaBlas, DeviceError> {
+        Ok(&self.blas)
     }
 
     /// Compile CUDA C source to PTX and load it as a module.
@@ -124,6 +137,18 @@ impl WarpDevice {
             .map_err(|e| DeviceError::Memory(e.to_string()))
     }
 
+    /// Copy host data into an existing device buffer (no new allocation).
+    /// The source must have exactly `dst.len()` elements.
+    pub fn htod_copy<T: cudarc::driver::DeviceRepr + Clone>(
+        &self,
+        src: &[T],
+        dst: &mut cudarc::driver::CudaSlice<T>,
+    ) -> Result<(), DeviceError> {
+        self.stream
+            .memcpy_htod(src, dst)
+            .map_err(|e| DeviceError::Memory(e.to_string()))
+    }
+
     /// Allocate zeroed device memory.
     pub fn alloc_zeros<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits>(
         &self,
@@ -168,13 +193,17 @@ impl WarpDevice {
 
     /// Create a clone of this device pointing to a different stream.
     /// Used for CUDA graph capture — the capture stream records kernel launches.
+    /// Creates a new cuBLAS handle bound to the given stream.
     pub fn with_stream(&self, stream: std::sync::Arc<CudaStream>) -> Self {
+        let blas = CudaBlas::new(stream.clone())
+            .expect("cuBLAS init failed for new stream");
         Self {
             ctx: self.ctx.clone(),
             stream,
             ordinal: self.ordinal,
             compute_capability: self.compute_capability,
             sm_version: self.sm_version,
+            blas,
         }
     }
 

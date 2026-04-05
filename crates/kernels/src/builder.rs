@@ -250,13 +250,29 @@ impl ModelBuilder {
             (0..n).map(|i| ((i * 7 + seed) % 200) as f32 * 0.01 - 1.0).collect()
         };
 
-        // Initialize weights for each layer that needs them
+        // Track output shapes through the graph for proper weight sizing.
+        // shape_map[TensorId] = [N, C, H, W] or [N, features]
+        let mut shape_map: HashMap<usize, Vec<usize>> = HashMap::new();
         let mut weight_seed = 42;
+
         for (i, layer) in self.layers.iter().enumerate() {
             match layer {
-                Layer::Conv2d { out_channels, kernel, .. } => {
-                    // Assume in_channels from previous layer (simplified)
-                    let in_c = 3u32; // default, would be inferred from graph
+                Layer::Input { shape, .. } => {
+                    shape_map.insert(i, shape.clone());
+                }
+                Layer::Conv2d { input, out_channels, kernel, stride, padding } => {
+                    let in_shape = shape_map.get(&input.0).cloned().unwrap_or(vec![1, 3, 1, 1]);
+                    let in_c = in_shape.get(1).copied().unwrap_or(3) as u32;
+                    let h = in_shape.get(2).copied().unwrap_or(1) as u32;
+                    let w_dim = in_shape.get(3).copied().unwrap_or(1) as u32;
+                    let batch = in_shape.first().copied().unwrap_or(1);
+
+                    let params = crate::conv::Conv2dParams::new(in_c, *out_channels, *kernel)
+                        .stride(*stride).padding(*padding);
+                    let out_h = params.output_h(h) as usize;
+                    let out_w = params.output_w(w_dim) as usize;
+                    shape_map.insert(i, vec![batch, *out_channels as usize, out_h, out_w]);
+
                     let w_size = (*out_channels * in_c * kernel * kernel) as usize;
                     let w_data = rand_vec(w_size, weight_seed);
                     weight_seed += 1;
@@ -265,19 +281,10 @@ impl ModelBuilder {
                         DType::F32)?;
                     weights.insert(format!("layer{i}_weight"), w);
                 }
-                Layer::Linear { out_features, .. } => {
-                    let in_f = 256u32; // default
-                    let w_size = (in_f * *out_features) as usize;
-                    let w_data = rand_vec(w_size, weight_seed);
-                    weight_seed += 1;
-                    let w = GpuTensor::from_host(device, &w_data,
-                        Shape::from_static(&[in_f as usize, *out_features as usize]),
-                        DType::F32)?;
-                    weights.insert(format!("layer{i}_weight"), w);
-                }
-                Layer::BatchNorm { .. } => {
-                    // BN params initialized to identity transform
-                    let c = 64usize; // default
+                Layer::BatchNorm { input } => {
+                    let in_shape = shape_map.get(&input.0).cloned().unwrap_or(vec![1, 64, 1, 1]);
+                    shape_map.insert(i, in_shape.clone());
+                    let c = in_shape.get(1).copied().unwrap_or(64);
                     weights.insert(format!("layer{i}_scale"),
                         GpuTensor::from_host(device, &vec![1.0f32; c], Shape::from_static(&[c]), DType::F32)?);
                     weights.insert(format!("layer{i}_bias"),
@@ -286,6 +293,48 @@ impl ModelBuilder {
                         GpuTensor::from_host(device, &vec![0.0f32; c], Shape::from_static(&[c]), DType::F32)?);
                     weights.insert(format!("layer{i}_var"),
                         GpuTensor::from_host(device, &vec![1.0f32; c], Shape::from_static(&[c]), DType::F32)?);
+                }
+                Layer::MaxPool { input, kernel, stride, padding } => {
+                    let in_shape = shape_map.get(&input.0).cloned().unwrap_or(vec![1, 64, 1, 1]);
+                    let c = in_shape.get(1).copied().unwrap_or(64);
+                    let h = in_shape.get(2).copied().unwrap_or(1) as u32;
+                    let w_dim = in_shape.get(3).copied().unwrap_or(1) as u32;
+                    let batch = in_shape.first().copied().unwrap_or(1);
+                    let out_h = crate::conv::conv_output_size(h, *kernel, *stride, *padding, 1) as usize;
+                    let out_w = crate::conv::conv_output_size(w_dim, *kernel, *stride, *padding, 1) as usize;
+                    shape_map.insert(i, vec![batch, c, out_h, out_w]);
+                }
+                Layer::Relu { input } | Layer::Sigmoid { input } |
+                Layer::Gelu { input } | Layer::Silu { input } |
+                Layer::Softmax { input } => {
+                    if let Some(s) = shape_map.get(&input.0) {
+                        shape_map.insert(i, s.clone());
+                    }
+                }
+                Layer::GlobalAvgPool { input } => {
+                    let in_shape = shape_map.get(&input.0).cloned().unwrap_or(vec![1, 64, 1, 1]);
+                    let batch = in_shape.first().copied().unwrap_or(1);
+                    let c = in_shape.get(1).copied().unwrap_or(64);
+                    shape_map.insert(i, vec![batch, c]);
+                }
+                Layer::Linear { input, out_features } => {
+                    let in_shape = shape_map.get(&input.0).cloned().unwrap_or(vec![1, 256]);
+                    let in_f = in_shape.last().copied().unwrap_or(256) as u32;
+                    let batch = if in_shape.len() > 1 { in_shape[0] } else { 1 };
+                    shape_map.insert(i, vec![batch, *out_features as usize]);
+
+                    let w_size = (in_f * *out_features) as usize;
+                    let w_data = rand_vec(w_size, weight_seed);
+                    weight_seed += 1;
+                    let w = GpuTensor::from_host(device, &w_data,
+                        Shape::from_static(&[in_f as usize, *out_features as usize]),
+                        DType::F32)?;
+                    weights.insert(format!("layer{i}_weight"), w);
+                }
+                Layer::Add { a, .. } => {
+                    if let Some(s) = shape_map.get(&a.0) {
+                        shape_map.insert(i, s.clone());
+                    }
                 }
                 _ => {}
             }
@@ -404,9 +453,84 @@ impl CompiledModel {
                 Layer::Output { input: inp, .. } => {
                     last_output = Some(*inp);
                 }
+                Layer::Conv2d { input: inp, out_channels, kernel, stride, padding } => {
+                    let x = tensors.get(inp).ok_or(DeviceError::Memory("missing input".into()))?;
+                    let x_dims = x.shape.dims();
+                    // x: [N, C_in, H, W]
+                    let in_channels = x_dims.get(1).and_then(|d| d.static_val()).unwrap_or(3) as u32;
+                    let h = x_dims.get(2).and_then(|d| d.static_val()).unwrap_or(1) as u32;
+                    let w = x_dims.get(3).and_then(|d| d.static_val()).unwrap_or(1) as u32;
+                    let batch = x.numel / (in_channels * h * w) as usize;
+
+                    let params = crate::conv::Conv2dParams::new(in_channels, *out_channels, *kernel)
+                        .stride(*stride)
+                        .padding(*padding);
+                    let out_h = params.output_h(h);
+                    let out_w = params.output_w(w);
+
+                    // Rebuild weight with correct in_channels if the stored weight has wrong shape
+                    let w_key = format!("layer{i}_weight");
+                    let weight = if let Some(existing) = self.weights.get(&w_key) {
+                        existing
+                    } else {
+                        return Err(DeviceError::Memory(format!("missing {w_key}")));
+                    };
+
+                    let out_shape = Shape::from_static(&[batch, *out_channels as usize, out_h as usize, out_w as usize]);
+                    let mut out = GpuTensor::<f32>::zeros(device, out_shape, DType::F32)?;
+                    crate::conv::conv2d(&self.cache, device, x, weight, None, &mut out, &params, h, w)?;
+                    tensors.insert(TensorId(i), out);
+                }
+                Layer::BatchNorm { input: inp } => {
+                    let x = tensors.get(inp).ok_or(DeviceError::Memory("missing input".into()))?;
+                    let x_dims = x.shape.dims();
+                    let channels = x_dims.get(1).and_then(|d| d.static_val()).unwrap_or(x.numel) as u32;
+                    let spatial: u32 = if x_dims.len() > 2 {
+                        x_dims[2..].iter().map(|d| d.static_val().unwrap_or(1) as u32).product()
+                    } else {
+                        1
+                    };
+
+                    let scale_key = format!("layer{i}_scale");
+                    let bias_key = format!("layer{i}_bias");
+                    let mean_key = format!("layer{i}_mean");
+                    let var_key = format!("layer{i}_var");
+
+                    let scale = self.weights.get(&scale_key).ok_or(DeviceError::Memory(format!("missing {scale_key}")))?;
+                    let bias = self.weights.get(&bias_key).ok_or(DeviceError::Memory(format!("missing {bias_key}")))?;
+                    let mean = self.weights.get(&mean_key).ok_or(DeviceError::Memory(format!("missing {mean_key}")))?;
+                    let var = self.weights.get(&var_key).ok_or(DeviceError::Memory(format!("missing {var_key}")))?;
+
+                    let mut out = GpuTensor::<f32>::zeros(device, x.shape.clone(), DType::F32)?;
+                    crate::conv::batchnorm2d(
+                        &self.cache, device, x, scale, bias, mean, var,
+                        &mut out, channels, spatial, 1e-5,
+                    )?;
+                    tensors.insert(TensorId(i), out);
+                }
+                Layer::MaxPool { input: inp, kernel, stride, padding } => {
+                    let x = tensors.get(inp).ok_or(DeviceError::Memory("missing input".into()))?;
+                    let x_dims = x.shape.dims();
+                    let channels = x_dims.get(1).and_then(|d| d.static_val()).unwrap_or(x.numel) as u32;
+                    let h = x_dims.get(2).and_then(|d| d.static_val()).unwrap_or(1) as u32;
+                    let w = x_dims.get(3).and_then(|d| d.static_val()).unwrap_or(1) as u32;
+                    let batch = x.numel / (channels * h * w) as usize;
+                    let out_h = crate::conv::conv_output_size(h, *kernel, *stride, *padding, 1);
+                    let out_w = crate::conv::conv_output_size(w, *kernel, *stride, *padding, 1);
+
+                    let out_shape = Shape::from_static(&[batch, channels as usize, out_h as usize, out_w as usize]);
+                    let mut out = GpuTensor::<f32>::zeros(device, out_shape, DType::F32)?;
+                    crate::conv::maxpool2d(
+                        &self.cache, device, x, &mut out,
+                        channels, h, w,
+                        *kernel, *kernel,
+                        *stride, *stride,
+                        *padding, *padding,
+                    )?;
+                    tensors.insert(TensorId(i), out);
+                }
                 _ => {
-                    // Conv2D, BatchNorm, MaxPool etc need more shape tracking
-                    // For now, pass through from previous layer
+                    // Concat, Reshape — pass through from previous layer
                 }
             }
         }

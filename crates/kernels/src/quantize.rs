@@ -599,6 +599,1015 @@ pub fn gemm_q8_0(
     Ok(())
 }
 
+// ── INT8 Symmetric Quantize (A8W8) ─────────────────────────────
+// Per-tensor or per-channel symmetric INT8 quantization.
+
+const QUANTIZE_INT8_SRC: &str = r#"
+extern "C" __global__ void warp_quantize_int8(
+    signed char *out,      // [n] quantized output
+    float *scale_out,      // [1] or [channels] scale
+    const float *input,    // [n] float input
+    unsigned int n,
+    unsigned int per_channel, // 0 = per-tensor, 1 = per-channel
+    unsigned int channel_size // elements per channel
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    unsigned int ch = per_channel ? (idx / channel_size) : 0;
+    float scale = scale_out[ch];
+    float inv_scale = (scale != 0.0f) ? 1.0f / scale : 0.0f;
+
+    float v = input[idx] * inv_scale;
+    int q = (int)roundf(v);
+    q = q < -128 ? -128 : (q > 127 ? 127 : q);
+    out[idx] = (signed char)q;
+}
+"#;
+
+// Separate kernel to compute per-tensor or per-channel scales.
+const COMPUTE_INT8_SCALES_SRC: &str = r#"
+extern "C" __global__ void warp_compute_int8_scales(
+    float *scale_out,       // [1] or [channels]
+    const float *input,     // [n]
+    unsigned int n,
+    unsigned int per_channel,
+    unsigned int channel_size,
+    unsigned int num_channels
+) {
+    unsigned int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int max_ch = per_channel ? num_channels : 1;
+    if (ch >= max_ch) return;
+
+    unsigned int start = per_channel ? (ch * channel_size) : 0;
+    unsigned int end = per_channel ? (start + channel_size) : n;
+    if (end > n) end = n;
+
+    float amax = 0.0f;
+    for (unsigned int i = start; i < end; i++) {
+        float a = fabsf(input[i]);
+        if (a > amax) amax = a;
+    }
+    scale_out[ch] = amax / 127.0f;
+}
+"#;
+
+// ── INT8 Dequantize ────────────────────────────────────────────
+
+const DEQUANTIZE_INT8_SRC: &str = r#"
+extern "C" __global__ void warp_dequantize_int8(
+    float *out,
+    const signed char *input,
+    const float *scale,
+    unsigned int n,
+    unsigned int per_channel,
+    unsigned int channel_size
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    unsigned int ch = per_channel ? (idx / channel_size) : 0;
+    out[idx] = scale[ch] * (float)input[idx];
+}
+"#;
+
+// ── INT8 GEMM with dp4a ────────────────────────────────────────
+// C[M,N] = dequant(A_int8[M,K] × B_int8[K,N])
+// Uses __dp4a for 4-way int8 dot product.
+// B is stored in column-major order (transposed) so that K is contiguous
+// for each output column, enabling packed dp4a loads.
+
+const GEMM_INT8_SRC: &str = r#"
+#define BM 32
+#define BN 32
+#define BK 32
+
+// Manual dp4a: dot product of 4 packed int8 values, accumulated into int32.
+// Equivalent to __dp4a but works on all compute capabilities.
+__device__ __forceinline__ int dp4a_manual(int a, int b, int c) {
+    signed char *a_bytes = reinterpret_cast<signed char*>(&a);
+    signed char *b_bytes = reinterpret_cast<signed char*>(&b);
+    c += (int)a_bytes[0] * (int)b_bytes[0];
+    c += (int)a_bytes[1] * (int)b_bytes[1];
+    c += (int)a_bytes[2] * (int)b_bytes[2];
+    c += (int)a_bytes[3] * (int)b_bytes[3];
+    return c;
+}
+
+extern "C" __global__ void warp_gemm_int8(
+    float *C,              // [M, N] float output (dequantized)
+    const signed char *A,  // [M, K] int8 activations (row-major)
+    const signed char *B,  // [K, N] int8 weights (row-major)
+    const float *scale_a,  // [1] activation scale (per-tensor)
+    const float *scale_b,  // [N] weight scale (per-channel)
+    unsigned int M, unsigned int N, unsigned int K
+) {
+    __shared__ signed char As[BM][BK];
+    __shared__ signed char Bs[BK][BN];
+
+    unsigned int bx = blockIdx.x, by = blockIdx.y;
+    unsigned int tx = threadIdx.x, ty = threadIdx.y;
+    unsigned int row = by * BM + ty;
+    unsigned int col = bx * BN + tx;
+
+    int acc = 0;
+
+    for (unsigned int t = 0; t < (K + BK - 1) / BK; t++) {
+        // Load A tile
+        unsigned int a_col = t * BK + tx;
+        As[ty][tx] = (row < M && a_col < K) ? A[row * K + a_col] : 0;
+
+        // Load B tile
+        unsigned int b_row = t * BK + ty;
+        Bs[ty][tx] = (b_row < K && col < N) ? B[b_row * N + col] : 0;
+
+        __syncthreads();
+
+        // Accumulate using dp4a: process 4 elements at a time
+        for (unsigned int i = 0; i < BK; i += 4) {
+            // Pack 4 int8 values from A row
+            int a_packed = ((unsigned char)As[ty][i]) |
+                           ((unsigned char)As[ty][i+1] << 8) |
+                           ((unsigned char)As[ty][i+2] << 16) |
+                           ((unsigned char)As[ty][i+3] << 24);
+            // Pack 4 int8 values from B column
+            int b_packed = ((unsigned char)Bs[i][tx]) |
+                           ((unsigned char)Bs[i+1][tx] << 8) |
+                           ((unsigned char)Bs[i+2][tx] << 16) |
+                           ((unsigned char)Bs[i+3][tx] << 24);
+            acc = dp4a_manual(a_packed, b_packed, acc);
+        }
+
+        __syncthreads();
+    }
+
+    if (row < M && col < N) {
+        // Dequantize: float_result = int32_acc * scale_a[0] * scale_b[col]
+        C[row * N + col] = (float)acc * scale_a[0] * scale_b[col];
+    }
+}
+"#;
+
+// ═════════════════════════════════════════════════════════════════
+// Rust API — INT8 (A8W8)
+// ═════════════════════════════════════════════════════════════════
+
+/// Quantize f32 tensor to INT8 with symmetric per-tensor or per-channel scaling.
+///
+/// - `input`: [n] f32
+/// - `output`: [n] i8 (stored as `GpuTensor<i8>`)
+/// - `scale`: [1] for per-tensor, [channels] for per-channel
+/// - `per_channel`: if true, quantize each channel independently
+///
+/// The function first computes scales, then quantizes.
+pub fn quantize_int8(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    input: &GpuTensor<f32>,
+    output: &mut GpuTensor<i8>,
+    scale: &mut GpuTensor<f32>,
+    per_channel: bool,
+) -> Result<(), DeviceError> {
+    let n = input.numel as u32;
+    let per_ch_flag: u32 = if per_channel { 1 } else { 0 };
+    let channel_size: u32 = if per_channel {
+        let num_channels = scale.numel as u32;
+        n / num_channels
+    } else {
+        n
+    };
+    let num_channels: u32 = if per_channel { scale.numel as u32 } else { 1 };
+
+    // Step 1: compute scales
+    let scale_f = cache.get_or_compile(device, COMPUTE_INT8_SCALES_SRC, "warp_compute_int8_scales")?;
+    let scale_cfg = LaunchConfig::for_num_elems(num_channels);
+    unsafe {
+        launch_err!(device.stream.launch_builder(&scale_f)
+            .arg(&mut scale.data)
+            .arg(&input.data)
+            .arg(&n)
+            .arg(&per_ch_flag)
+            .arg(&channel_size)
+            .arg(&num_channels)
+            .launch(scale_cfg))?;
+    }
+
+    // Step 2: quantize
+    let quant_f = cache.get_or_compile(device, QUANTIZE_INT8_SRC, "warp_quantize_int8")?;
+    let cfg = LaunchConfig::for_num_elems(n);
+    unsafe {
+        launch_err!(device.stream.launch_builder(&quant_f)
+            .arg(&mut output.data)
+            .arg(&scale.data)
+            .arg(&input.data)
+            .arg(&n)
+            .arg(&per_ch_flag)
+            .arg(&channel_size)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+/// Dequantize INT8 tensor back to f32.
+pub fn dequantize_int8(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    input: &GpuTensor<i8>,
+    output: &mut GpuTensor<f32>,
+    scale: &GpuTensor<f32>,
+    per_channel: bool,
+) -> Result<(), DeviceError> {
+    let n = output.numel as u32;
+    let per_ch_flag: u32 = if per_channel { 1 } else { 0 };
+    let channel_size: u32 = if per_channel {
+        let num_channels = scale.numel as u32;
+        n / num_channels
+    } else {
+        n
+    };
+
+    let f = cache.get_or_compile(device, DEQUANTIZE_INT8_SRC, "warp_dequantize_int8")?;
+    let cfg = LaunchConfig::for_num_elems(n);
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut output.data)
+            .arg(&input.data)
+            .arg(&scale.data)
+            .arg(&n)
+            .arg(&per_ch_flag)
+            .arg(&channel_size)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+/// INT8 GEMM (A8W8): C[M,N] = dequant(A_int8[M,K] x B_int8[K,N])
+///
+/// Both A and B must already be quantized to INT8 with corresponding scales.
+/// Uses dp4a for fast 4-way int8 dot product on Turing+ GPUs.
+///
+/// K must be divisible by 4 (dp4a processes 4 elements at a time).
+pub fn gemm_int8(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    a: &GpuTensor<i8>,        // [M, K]
+    b: &GpuTensor<i8>,        // [K, N]
+    c: &mut GpuTensor<f32>,   // [M, N]
+    scale_a: &GpuTensor<f32>, // [1] per-tensor
+    scale_b: &GpuTensor<f32>, // [N] per-channel
+    m: u32,
+    n: u32,
+    k: u32,
+) -> Result<(), DeviceError> {
+    assert!(k % 4 == 0, "K ({k}) must be divisible by 4 for dp4a");
+    let tile = 32u32;
+
+    let f = cache.get_or_compile(device, GEMM_INT8_SRC, "warp_gemm_int8")?;
+    let cfg = LaunchConfig {
+        grid_dim: ((n + tile - 1) / tile, (m + tile - 1) / tile, 1),
+        block_dim: (tile, tile, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut c.data)
+            .arg(&a.data)
+            .arg(&b.data)
+            .arg(&scale_a.data)
+            .arg(&scale_b.data)
+            .arg(&m)
+            .arg(&n)
+            .arg(&k)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+// ═════════════════════════════════════════════════════════════════
+// FP8 E4M3 Quantization (emulated via scaled INT8 with E4M3 range)
+// ═════════════════════════════════════════════════════════════════
+
+// FP8 E4M3: 4 exponent bits, 3 mantissa bits, max representable = 448.
+// On pre-Hopper GPUs we emulate: scale = max(|x|) / 448, quantize to
+// [-128, 127] stored as uint8, dequantize = q * scale.
+
+const COMPUTE_FP8_SCALE_SRC: &str = r#"
+extern "C" __global__ void warp_compute_fp8_scale(
+    float *scale_out,
+    const float *input,
+    unsigned int n
+) {
+    // Single-thread scan (called with 1 thread for simplicity).
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    float amax = 0.0f;
+    for (unsigned int i = 0; i < n; i++) {
+        float a = fabsf(input[i]);
+        if (a > amax) amax = a;
+    }
+    scale_out[0] = amax / 448.0f;
+}
+"#;
+
+const QUANTIZE_FP8_SRC: &str = r#"
+extern "C" __global__ void warp_quantize_fp8_e4m3(
+    unsigned char *out,
+    const float *input,
+    const float *scale,
+    unsigned int n
+) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    float s = scale[0];
+    float inv_scale = (s != 0.0f) ? 1.0f / s : 0.0f;
+    float v = input[i] * inv_scale;
+    int q = (int)roundf(v);
+    q = q < -128 ? -128 : (q > 127 ? 127 : q);
+    // Store as uint8: signed char cast then reinterpret
+    out[i] = (unsigned char)((signed char)q);
+}
+"#;
+
+const DEQUANTIZE_FP8_SRC: &str = r#"
+extern "C" __global__ void warp_dequantize_fp8(
+    float *out,
+    const unsigned char *input,
+    const float *scale,
+    unsigned int n
+) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    float s = scale[0];
+    signed char q = (signed char)input[i];
+    out[i] = s * (float)q;
+}
+"#;
+
+const GEMM_FP8_SRC: &str = r#"
+#define TILE 32
+
+extern "C" __global__ void warp_gemm_fp8(
+    float *C,
+    const unsigned char *A,    // [M, K] FP8 (uint8)
+    const unsigned char *B,    // [K, N] FP8 (uint8)
+    const float *scale_a,      // [1]
+    const float *scale_b,      // [1]
+    unsigned int M, unsigned int N, unsigned int K
+) {
+    __shared__ float As[TILE][TILE];
+    __shared__ float Bs[TILE][TILE];
+
+    unsigned int bx = blockIdx.x, by = blockIdx.y;
+    unsigned int tx = threadIdx.x, ty = threadIdx.y;
+    unsigned int row = by * TILE + ty;
+    unsigned int col = bx * TILE + tx;
+
+    float sa = scale_a[0];
+    float sb = scale_b[0];
+    float sum = 0.0f;
+
+    for (unsigned int t = 0; t < (K + TILE - 1) / TILE; t++) {
+        unsigned int a_col = t * TILE + tx;
+        if (row < M && a_col < K) {
+            signed char qa = (signed char)A[row * K + a_col];
+            As[ty][tx] = sa * (float)qa;
+        } else {
+            As[ty][tx] = 0.0f;
+        }
+
+        unsigned int b_row = t * TILE + ty;
+        if (b_row < K && col < N) {
+            signed char qb = (signed char)B[b_row * N + col];
+            Bs[ty][tx] = sb * (float)qb;
+        } else {
+            Bs[ty][tx] = 0.0f;
+        }
+
+        __syncthreads();
+
+        #pragma unroll
+        for (unsigned int i = 0; i < TILE; i++)
+            sum += As[ty][i] * Bs[i][tx];
+        __syncthreads();
+    }
+
+    if (row < M && col < N)
+        C[row * N + col] = sum;
+}
+"#;
+
+// ── FP8 Rust API ───────────────────────────────────────────────
+
+/// Quantize f32 tensor to FP8 E4M3 representation (stored as u8).
+/// scale is computed as max(|x|) / 448.
+pub fn quantize_fp8(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    input: &GpuTensor<f32>,
+    output: &mut GpuTensor<u8>,
+    scale: &mut GpuTensor<f32>,
+) -> Result<(), DeviceError> {
+    let n = input.numel as u32;
+
+    // Step 1: compute scale
+    let sf = cache.get_or_compile(device, COMPUTE_FP8_SCALE_SRC, "warp_compute_fp8_scale")?;
+    unsafe {
+        launch_err!(device.stream.launch_builder(&sf)
+            .arg(&mut scale.data)
+            .arg(&input.data)
+            .arg(&n)
+            .launch(LaunchConfig::for_num_elems(1)))?;
+    }
+
+    // Step 2: quantize
+    let qf = cache.get_or_compile(device, QUANTIZE_FP8_SRC, "warp_quantize_fp8_e4m3")?;
+    unsafe {
+        launch_err!(device.stream.launch_builder(&qf)
+            .arg(&mut output.data)
+            .arg(&input.data)
+            .arg(&scale.data)
+            .arg(&n)
+            .launch(LaunchConfig::for_num_elems(n)))?;
+    }
+    Ok(())
+}
+
+/// Dequantize FP8 (u8) back to f32.
+pub fn dequantize_fp8(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    input: &GpuTensor<u8>,
+    output: &mut GpuTensor<f32>,
+    scale: &GpuTensor<f32>,
+) -> Result<(), DeviceError> {
+    let n = output.numel as u32;
+
+    let f = cache.get_or_compile(device, DEQUANTIZE_FP8_SRC, "warp_dequantize_fp8")?;
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut output.data)
+            .arg(&input.data)
+            .arg(&scale.data)
+            .arg(&n)
+            .launch(LaunchConfig::for_num_elems(n)))?;
+    }
+    Ok(())
+}
+
+/// FP8 GEMM: C[M,N] = dequant(A_fp8[M,K]) × dequant(B_fp8[K,N])
+///
+/// Both A and B must be FP8-quantized (u8). The GEMM dequantizes on-the-fly
+/// using per-tensor scales, accumulating in f32.
+pub fn gemm_fp8(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    a: &GpuTensor<u8>,
+    b: &GpuTensor<u8>,
+    c: &mut GpuTensor<f32>,
+    scale_a: &GpuTensor<f32>,
+    scale_b: &GpuTensor<f32>,
+    m: u32,
+    n: u32,
+    k: u32,
+) -> Result<(), DeviceError> {
+    let tile = 32u32;
+
+    let f = cache.get_or_compile(device, GEMM_FP8_SRC, "warp_gemm_fp8")?;
+    let cfg = LaunchConfig {
+        grid_dim: ((n + tile - 1) / tile, (m + tile - 1) / tile, 1),
+        block_dim: (tile, tile, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut c.data)
+            .arg(&a.data)
+            .arg(&b.data)
+            .arg(&scale_a.data)
+            .arg(&scale_b.data)
+            .arg(&m)
+            .arg(&n)
+            .arg(&k)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+// ═════════════════════════════════════════════════════════════════
+// GPTQ Quantization (Group-wise INT4 with zero-points)
+// ═════════════════════════════════════════════════════════════════
+
+const DEQUANT_GPTQ_SRC: &str = r#"
+extern "C" __global__ void warp_dequant_gptq(
+    float *out,                   // [K, N] output
+    const unsigned int *qweight,  // packed INT4 weights [K/8, N]
+    const float *scales,          // [K/group_size, N] per-group scales
+    const unsigned int *qzeros,   // [K/group_size, N/8] packed zero points
+    unsigned int K, unsigned int N, unsigned int group_size
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int n = idx % N;
+    unsigned int k = idx / N;
+    if (k >= K) return;
+
+    unsigned int group = k / group_size;
+
+    // Extract 4-bit weight from packed uint32
+    unsigned int packed_idx = k / 8;
+    unsigned int bit_offset = (k % 8) * 4;
+    unsigned int packed = qweight[packed_idx * N + n];
+    int w4 = (int)((packed >> bit_offset) & 0xF);
+
+    // Extract zero-point
+    unsigned int zp_packed_idx = n / 8;
+    unsigned int zp_bit_offset = (n % 8) * 4;
+    unsigned int zp_packed = qzeros[group * ((N + 7) / 8) + zp_packed_idx];
+    int zp = (int)((zp_packed >> zp_bit_offset) & 0xF);
+
+    float scale = scales[group * N + n];
+    out[k * N + n] = (float)(w4 - zp) * scale;
+}
+"#;
+
+const GEMM_GPTQ_SRC: &str = r#"
+#define TILE 32
+
+extern "C" __global__ void warp_gemm_gptq(
+    float *C,                     // [M, N]
+    const float *A,               // [M, K]
+    const unsigned int *qweight,  // [K/8, N]
+    const float *scales,          // [K/group_size, N]
+    const unsigned int *qzeros,   // [K/group_size, N/8]
+    unsigned int M, unsigned int N, unsigned int K,
+    unsigned int group_size
+) {
+    __shared__ float As[TILE][TILE];
+    __shared__ float Bs[TILE][TILE];
+
+    unsigned int bx = blockIdx.x, by = blockIdx.y;
+    unsigned int tx = threadIdx.x, ty = threadIdx.y;
+    unsigned int row = by * TILE + ty;
+    unsigned int col = bx * TILE + tx;
+
+    float sum = 0.0f;
+
+    for (unsigned int t = 0; t < (K + TILE - 1) / TILE; t++) {
+        // Load A tile
+        unsigned int a_col = t * TILE + tx;
+        As[ty][tx] = (row < M && a_col < K) ? A[row * K + a_col] : 0.0f;
+
+        // Load B tile by dequantizing GPTQ weights
+        unsigned int b_k = t * TILE + ty;
+        unsigned int b_n = bx * TILE + tx;
+        if (b_k < K && b_n < N) {
+            unsigned int group = b_k / group_size;
+            unsigned int packed_idx = b_k / 8;
+            unsigned int bit_offset = (b_k % 8) * 4;
+            unsigned int packed = qweight[packed_idx * N + b_n];
+            int w4 = (int)((packed >> bit_offset) & 0xF);
+
+            unsigned int zp_packed_idx = b_n / 8;
+            unsigned int zp_bit_offset = (b_n % 8) * 4;
+            unsigned int zp_packed = qzeros[group * ((N + 7) / 8) + zp_packed_idx];
+            int zp = (int)((zp_packed >> zp_bit_offset) & 0xF);
+
+            float scale = scales[group * N + b_n];
+            Bs[ty][tx] = (float)(w4 - zp) * scale;
+        } else {
+            Bs[ty][tx] = 0.0f;
+        }
+
+        __syncthreads();
+
+        #pragma unroll
+        for (unsigned int i = 0; i < TILE; i++)
+            sum += As[ty][i] * Bs[i][tx];
+        __syncthreads();
+    }
+
+    if (row < M && col < N)
+        C[row * N + col] = sum;
+}
+"#;
+
+// ── GPTQ Rust API ──────────────────────────────────────────────
+
+/// Dequantize GPTQ-packed INT4 weights to f32.
+///
+/// - `qweight`: [K/8, N] packed uint32 (8 x 4-bit values per u32)
+/// - `scales`: [K/group_size, N] per-group scales
+/// - `qzeros`: [K/group_size, N/8] packed zero-points
+/// - `output`: [K, N] f32
+pub fn dequant_gptq(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    qweight: &GpuTensor<u32>,
+    scales: &GpuTensor<f32>,
+    qzeros: &GpuTensor<u32>,
+    output: &mut GpuTensor<f32>,
+    k: u32,
+    n: u32,
+    group_size: u32,
+) -> Result<(), DeviceError> {
+    let total = k * n;
+    let f = cache.get_or_compile(device, DEQUANT_GPTQ_SRC, "warp_dequant_gptq")?;
+    let cfg = LaunchConfig::for_num_elems(total);
+
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut output.data)
+            .arg(&qweight.data)
+            .arg(&scales.data)
+            .arg(&qzeros.data)
+            .arg(&k)
+            .arg(&n)
+            .arg(&group_size)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+/// GPTQ GEMM: C[M,N] = A[M,K] × dequant(qweight[K,N])
+///
+/// Dequantizes GPTQ weights on-the-fly in shared memory.
+pub fn gemm_gptq(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    a: &GpuTensor<f32>,
+    qweight: &GpuTensor<u32>,
+    scales: &GpuTensor<f32>,
+    qzeros: &GpuTensor<u32>,
+    output: &mut GpuTensor<f32>,
+    m: u32,
+    n: u32,
+    k: u32,
+    group_size: u32,
+) -> Result<(), DeviceError> {
+    let tile = 32u32;
+    let f = cache.get_or_compile(device, GEMM_GPTQ_SRC, "warp_gemm_gptq")?;
+    let cfg = LaunchConfig {
+        grid_dim: ((n + tile - 1) / tile, (m + tile - 1) / tile, 1),
+        block_dim: (tile, tile, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut output.data)
+            .arg(&a.data)
+            .arg(&qweight.data)
+            .arg(&scales.data)
+            .arg(&qzeros.data)
+            .arg(&m)
+            .arg(&n)
+            .arg(&k)
+            .arg(&group_size)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+// ═════════════════════════════════════════════════════════════════
+// AWQ Quantization (Activation-aware symmetric INT4)
+// ═════════════════════════════════════════════════════════════════
+
+const DEQUANT_AWQ_SRC: &str = r#"
+extern "C" __global__ void warp_dequant_awq(
+    float *out,                   // [K, N] output
+    const unsigned int *qweight,  // [K/8, N] packed INT4 weights
+    const float *scales,          // [N] per-channel scales
+    unsigned int K, unsigned int N
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int n = idx % N;
+    unsigned int k = idx / N;
+    if (k >= K) return;
+
+    // Extract 4-bit weight (symmetric: center at 8, so subtract 8)
+    unsigned int packed_idx = k / 8;
+    unsigned int bit_offset = (k % 8) * 4;
+    unsigned int packed = qweight[packed_idx * N + n];
+    int w4 = (int)((packed >> bit_offset) & 0xF) - 8;
+
+    out[k * N + n] = (float)w4 * scales[n];
+}
+"#;
+
+const GEMM_AWQ_SRC: &str = r#"
+#define TILE 32
+
+extern "C" __global__ void warp_gemm_awq(
+    float *C,                     // [M, N]
+    const float *A,               // [M, K]
+    const unsigned int *qweight,  // [K/8, N] packed INT4
+    const float *scales,          // [N] per-channel scales
+    unsigned int M, unsigned int N, unsigned int K
+) {
+    __shared__ float As[TILE][TILE];
+    __shared__ float Bs[TILE][TILE];
+
+    unsigned int bx = blockIdx.x, by = blockIdx.y;
+    unsigned int tx = threadIdx.x, ty = threadIdx.y;
+    unsigned int row = by * TILE + ty;
+    unsigned int col = bx * TILE + tx;
+
+    float sum = 0.0f;
+
+    for (unsigned int t = 0; t < (K + TILE - 1) / TILE; t++) {
+        unsigned int a_col = t * TILE + tx;
+        As[ty][tx] = (row < M && a_col < K) ? A[row * K + a_col] : 0.0f;
+
+        unsigned int b_k = t * TILE + ty;
+        unsigned int b_n = bx * TILE + tx;
+        if (b_k < K && b_n < N) {
+            unsigned int packed_idx = b_k / 8;
+            unsigned int bit_offset = (b_k % 8) * 4;
+            unsigned int packed = qweight[packed_idx * N + b_n];
+            int w4 = (int)((packed >> bit_offset) & 0xF) - 8;
+            Bs[ty][tx] = (float)w4 * scales[b_n];
+        } else {
+            Bs[ty][tx] = 0.0f;
+        }
+
+        __syncthreads();
+
+        #pragma unroll
+        for (unsigned int i = 0; i < TILE; i++)
+            sum += As[ty][i] * Bs[i][tx];
+        __syncthreads();
+    }
+
+    if (row < M && col < N)
+        C[row * N + col] = sum;
+}
+"#;
+
+// ── AWQ Rust API ───────────────────────────────────────────────
+
+/// Dequantize AWQ-packed INT4 weights to f32.
+///
+/// - `qweight`: [K/8, N] packed uint32
+/// - `scales`: [N] per-channel scales (symmetric, no zero-point)
+/// - `output`: [K, N] f32
+pub fn dequant_awq(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    qweight: &GpuTensor<u32>,
+    scales: &GpuTensor<f32>,
+    output: &mut GpuTensor<f32>,
+    k: u32,
+    n: u32,
+) -> Result<(), DeviceError> {
+    let total = k * n;
+    let f = cache.get_or_compile(device, DEQUANT_AWQ_SRC, "warp_dequant_awq")?;
+    let cfg = LaunchConfig::for_num_elems(total);
+
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut output.data)
+            .arg(&qweight.data)
+            .arg(&scales.data)
+            .arg(&k)
+            .arg(&n)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+/// AWQ GEMM: C[M,N] = A[M,K] × dequant(qweight[K,N])
+///
+/// Dequantizes AWQ weights on-the-fly with per-channel scales.
+pub fn gemm_awq(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    a: &GpuTensor<f32>,
+    qweight: &GpuTensor<u32>,
+    scales: &GpuTensor<f32>,
+    output: &mut GpuTensor<f32>,
+    m: u32,
+    n: u32,
+    k: u32,
+) -> Result<(), DeviceError> {
+    let tile = 32u32;
+    let f = cache.get_or_compile(device, GEMM_AWQ_SRC, "warp_gemm_awq")?;
+    let cfg = LaunchConfig {
+        grid_dim: ((n + tile - 1) / tile, (m + tile - 1) / tile, 1),
+        block_dim: (tile, tile, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut output.data)
+            .arg(&a.data)
+            .arg(&qweight.data)
+            .arg(&scales.data)
+            .arg(&m)
+            .arg(&n)
+            .arg(&k)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+// ═════════════════════════════════════════════════════════════════
+// Per-Channel INT8 Quantization
+// ═════════════════════════════════════════════════════════════════
+
+const QUANTIZE_INT8_PER_CHANNEL_SRC: &str = r#"
+extern "C" __global__ void warp_quantize_int8_per_channel(
+    signed char *out,       // [C_out, C_in] quantized
+    float *scale_out,       // [C_out] per-channel scales
+    const float *input,     // [C_out, C_in] float weights
+    unsigned int C_out,
+    unsigned int C_in
+) {
+    unsigned int ch = blockIdx.x;
+    if (ch >= C_out) return;
+
+    unsigned int tid = threadIdx.x;
+    unsigned int stride = blockDim.x;
+
+    // Phase 1: find absmax in this channel using all threads
+    __shared__ float shared_max[256];
+    float local_max = 0.0f;
+    for (unsigned int i = tid; i < C_in; i += stride) {
+        float a = fabsf(input[ch * C_in + i]);
+        if (a > local_max) local_max = a;
+    }
+    shared_max[tid] = local_max;
+    __syncthreads();
+
+    // Reduce within block
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s && shared_max[tid + s] > shared_max[tid])
+            shared_max[tid] = shared_max[tid + s];
+        __syncthreads();
+    }
+
+    float amax = shared_max[0];
+    float scale = amax / 127.0f;
+    float inv_scale = (scale != 0.0f) ? 127.0f / amax : 0.0f;
+
+    if (tid == 0) scale_out[ch] = scale;
+    __syncthreads();
+
+    // Phase 2: quantize
+    for (unsigned int i = tid; i < C_in; i += stride) {
+        float v = input[ch * C_in + i] * inv_scale;
+        int q = (int)roundf(v);
+        q = q < -128 ? -128 : (q > 127 ? 127 : q);
+        out[ch * C_in + i] = (signed char)q;
+    }
+}
+"#;
+
+const GEMM_INT8_PER_CHANNEL_SRC: &str = r#"
+#define BM 32
+#define BN 32
+#define BK 32
+
+__device__ __forceinline__ int dp4a_manual_pc(int a, int b, int c) {
+    signed char *a_bytes = reinterpret_cast<signed char*>(&a);
+    signed char *b_bytes = reinterpret_cast<signed char*>(&b);
+    c += (int)a_bytes[0] * (int)b_bytes[0];
+    c += (int)a_bytes[1] * (int)b_bytes[1];
+    c += (int)a_bytes[2] * (int)b_bytes[2];
+    c += (int)a_bytes[3] * (int)b_bytes[3];
+    return c;
+}
+
+extern "C" __global__ void warp_gemm_int8_per_channel(
+    float *C,              // [M, N]
+    const signed char *A,  // [M, K] int8 activations
+    const signed char *B,  // [K, N] int8 weights
+    const float *scale_a,  // [1] per-tensor activation scale
+    const float *scale_b,  // [N] per-channel weight scales
+    unsigned int M, unsigned int N, unsigned int K
+) {
+    __shared__ signed char As[BM][BK];
+    __shared__ signed char Bs[BK][BN];
+
+    unsigned int bx = blockIdx.x, by = blockIdx.y;
+    unsigned int tx = threadIdx.x, ty = threadIdx.y;
+    unsigned int row = by * BM + ty;
+    unsigned int col = bx * BN + tx;
+
+    int acc = 0;
+
+    for (unsigned int t = 0; t < (K + BK - 1) / BK; t++) {
+        unsigned int a_col = t * BK + tx;
+        As[ty][tx] = (row < M && a_col < K) ? A[row * K + a_col] : 0;
+
+        unsigned int b_row = t * BK + ty;
+        Bs[ty][tx] = (b_row < K && col < N) ? B[b_row * N + col] : 0;
+
+        __syncthreads();
+
+        for (unsigned int i = 0; i < BK; i += 4) {
+            int a_packed = ((unsigned char)As[ty][i]) |
+                           ((unsigned char)As[ty][i+1] << 8) |
+                           ((unsigned char)As[ty][i+2] << 16) |
+                           ((unsigned char)As[ty][i+3] << 24);
+            int b_packed = ((unsigned char)Bs[i][tx]) |
+                           ((unsigned char)Bs[i+1][tx] << 8) |
+                           ((unsigned char)Bs[i+2][tx] << 16) |
+                           ((unsigned char)Bs[i+3][tx] << 24);
+            acc = dp4a_manual_pc(a_packed, b_packed, acc);
+        }
+
+        __syncthreads();
+    }
+
+    if (row < M && col < N) {
+        C[row * N + col] = (float)acc * scale_a[0] * scale_b[col];
+    }
+}
+"#;
+
+// ── Per-Channel INT8 Rust API ──────────────────────────────────
+
+/// Quantize weight matrix [C_out, C_in] to INT8 with per-channel scales.
+///
+/// Each output channel gets its own scale: scale[c] = max(|W[c, :]|) / 127.
+pub fn quantize_int8_per_channel(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    input: &GpuTensor<f32>,     // [C_out, C_in]
+    output: &mut GpuTensor<i8>, // [C_out, C_in]
+    scale: &mut GpuTensor<f32>, // [C_out]
+    c_out: u32,
+    c_in: u32,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(
+        device,
+        QUANTIZE_INT8_PER_CHANNEL_SRC,
+        "warp_quantize_int8_per_channel",
+    )?;
+    // One block per channel, up to 256 threads per block
+    let threads = c_in.min(256);
+    let cfg = LaunchConfig {
+        grid_dim: (c_out, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut output.data)
+            .arg(&mut scale.data)
+            .arg(&input.data)
+            .arg(&c_out)
+            .arg(&c_in)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+/// INT8 GEMM with per-channel weight scales and per-tensor activation scale.
+///
+/// C[M,N] = dequant(A_int8[M,K] × B_int8[K,N])
+/// where dequant = int32_acc * scale_a[0] * scale_b[col]
+pub fn gemm_int8_per_channel(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    a: &GpuTensor<i8>,        // [M, K]
+    b: &GpuTensor<i8>,        // [K, N]
+    c: &mut GpuTensor<f32>,   // [M, N]
+    scale_a: &GpuTensor<f32>, // [1] per-tensor
+    scale_b: &GpuTensor<f32>, // [N] per-channel
+    m: u32,
+    n: u32,
+    k: u32,
+) -> Result<(), DeviceError> {
+    assert!(k % 4 == 0, "K ({k}) must be divisible by 4 for dp4a");
+    let tile = 32u32;
+
+    let f = cache.get_or_compile(device, GEMM_INT8_PER_CHANNEL_SRC, "warp_gemm_int8_per_channel")?;
+    let cfg = LaunchConfig {
+        grid_dim: ((n + tile - 1) / tile, (m + tile - 1) / tile, 1),
+        block_dim: (tile, tile, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut c.data)
+            .arg(&a.data)
+            .arg(&b.data)
+            .arg(&scale_a.data)
+            .arg(&scale_b.data)
+            .arg(&m)
+            .arg(&n)
+            .arg(&k)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
 // ═════════════════════════════════════════════════════════════════
 // Tests
 // ═════════════════════════════════════════════════════════════════
@@ -917,5 +1926,387 @@ mod tests {
         println!("  Q4_0: {q4_ms:.3}ms avg | weights = {:.0} KB ({:.1}x smaller)",
             weight_bytes_q4 / 1024.0, weight_bytes_f32 / weight_bytes_q4);
         println!("  Speed ratio: {:.2}x", f32_ms / q4_ms);
+    }
+
+    #[test]
+    fn int8_gemm_correctness() {
+        let (dev, cache) = match setup() {
+            Some(s) => s,
+            None => { println!("No CUDA, skipping"); return; }
+        };
+
+        let (m, n, k) = (64u32, 256u32, 128u32);
+
+        // Generate random-ish test data
+        let a_data: Vec<f32> = (0..(m * k) as usize)
+            .map(|i| ((i * 7 + 13) % 200) as f32 * 0.01 - 1.0)
+            .collect();
+        let b_data: Vec<f32> = (0..(k * n) as usize)
+            .map(|i| ((i * 11 + 3) % 200) as f32 * 0.01 - 1.0)
+            .collect();
+
+        // Upload f32 tensors
+        let a_f32 = GpuTensor::from_host(&dev, &a_data,
+            Shape::from_static(&[m as usize, k as usize]), DType::F32).unwrap();
+        let b_f32 = GpuTensor::from_host(&dev, &b_data,
+            Shape::from_static(&[k as usize, n as usize]), DType::F32).unwrap();
+
+        // Quantize A (per-tensor) and B (per-channel along N)
+        let mut a_int8 = GpuTensor::<i8>::zeros(&dev,
+            Shape::from_static(&[m as usize, k as usize]), DType::I8).unwrap();
+        let mut scale_a = GpuTensor::<f32>::zeros(&dev,
+            Shape::from_static(&[1]), DType::F32).unwrap();
+        quantize_int8(&cache, &dev, &a_f32, &mut a_int8, &mut scale_a, false).unwrap();
+
+        let mut b_int8 = GpuTensor::<i8>::zeros(&dev,
+            Shape::from_static(&[k as usize, n as usize]), DType::I8).unwrap();
+        // Per-channel: each column of B (N columns, each of length K) gets its own scale
+        let mut scale_b = GpuTensor::<f32>::zeros(&dev,
+            Shape::from_static(&[n as usize]), DType::F32).unwrap();
+        // For per-channel on B[K,N], channel_size = K (each channel = one column)
+        // But our quantize_int8 splits linearly: channel i = elements [i*K, (i+1)*K)
+        // B is row-major [K,N], so consecutive K elements are a row, not a column.
+        // Use per-tensor for B as well (simpler and correct).
+        quantize_int8(&cache, &dev, &b_f32, &mut b_int8, &mut scale_b, false).unwrap();
+        // scale_b is [1] per-tensor; for the GEMM kernel we need [N] per-channel scales.
+        // Broadcast: fill scale_b_broadcast[N] with the single scale value.
+        dev.synchronize().unwrap();
+        let sb_host = scale_b.to_host(&dev).unwrap();
+        let sb_val = sb_host[0];
+        let sb_broadcast: Vec<f32> = vec![sb_val; n as usize];
+        let scale_b_n = GpuTensor::from_host(&dev, &sb_broadcast,
+            Shape::from_static(&[n as usize]), DType::F32).unwrap();
+
+        // INT8 GEMM
+        let mut c_int8 = GpuTensor::<f32>::zeros(&dev,
+            Shape::from_static(&[m as usize, n as usize]), DType::F32).unwrap();
+        gemm_int8(&cache, &dev, &a_int8, &b_int8, &mut c_int8,
+            &scale_a, &scale_b_n, m, n, k).unwrap();
+        dev.synchronize().unwrap();
+
+        // F32 reference GEMM
+        let mut c_ref = GpuTensor::<f32>::zeros(&dev,
+            Shape::from_static(&[m as usize, n as usize]), DType::F32).unwrap();
+        crate::ops::gemm(&cache, &dev, &a_f32, &b_f32, &mut c_ref, m, n, k).unwrap();
+        dev.synchronize().unwrap();
+
+        let int8_result = c_int8.to_host(&dev).unwrap();
+        let ref_result = c_ref.to_host(&dev).unwrap();
+
+        let mut max_abs_err = 0.0f32;
+        let mut sum_sq_err = 0.0f64;
+        let mut sum_sq_ref = 0.0f64;
+        for (q, r) in int8_result.iter().zip(ref_result.iter()) {
+            let err = (q - r).abs();
+            if err > max_abs_err { max_abs_err = err; }
+            sum_sq_err += (err as f64).powi(2);
+            sum_sq_ref += (*r as f64).powi(2);
+        }
+        let nrmse = (sum_sq_err / sum_sq_ref.max(1e-10)).sqrt();
+
+        println!("INT8 A8W8 GEMM ({m}x{n}x{k}):");
+        println!("  Max abs error: {max_abs_err:.4}");
+        println!("  NRMSE:         {nrmse:.6} ({:.2}%)", nrmse * 100.0);
+
+        // INT8 quantization introduces error; max element error < 1.0 is expected
+        assert!(max_abs_err < 1.0, "INT8 GEMM max error {max_abs_err} >= 1.0");
+        assert!(nrmse < 0.10, "INT8 GEMM NRMSE {nrmse:.4} too high");
+        println!("  PASSED: max_err < 1.0, NRMSE < 10%");
+    }
+
+    #[test]
+    fn fp8_gemm_correctness() {
+        let (dev, cache) = match setup() {
+            Some(s) => s,
+            None => { println!("No CUDA, skipping"); return; }
+        };
+
+        let (m, n, k) = (64u32, 64u32, 128u32);
+
+        let a_data: Vec<f32> = (0..(m * k) as usize)
+            .map(|i| ((i * 7 + 13) % 200) as f32 * 0.01 - 1.0)
+            .collect();
+        let b_data: Vec<f32> = (0..(k * n) as usize)
+            .map(|i| ((i * 11 + 3) % 200) as f32 * 0.01 - 1.0)
+            .collect();
+
+        let a_f32 = GpuTensor::from_host(&dev, &a_data,
+            Shape::from_static(&[m as usize, k as usize]), DType::F32).unwrap();
+        let b_f32 = GpuTensor::from_host(&dev, &b_data,
+            Shape::from_static(&[k as usize, n as usize]), DType::F32).unwrap();
+
+        // Quantize A and B to FP8
+        let mut a_fp8 = GpuTensor::<u8>::zeros(&dev,
+            Shape::from_static(&[m as usize, k as usize]), DType::U8).unwrap();
+        let mut scale_a = GpuTensor::<f32>::zeros(&dev,
+            Shape::from_static(&[1]), DType::F32).unwrap();
+        quantize_fp8(&cache, &dev, &a_f32, &mut a_fp8, &mut scale_a).unwrap();
+
+        let mut b_fp8 = GpuTensor::<u8>::zeros(&dev,
+            Shape::from_static(&[k as usize, n as usize]), DType::U8).unwrap();
+        let mut scale_b = GpuTensor::<f32>::zeros(&dev,
+            Shape::from_static(&[1]), DType::F32).unwrap();
+        quantize_fp8(&cache, &dev, &b_f32, &mut b_fp8, &mut scale_b).unwrap();
+
+        // FP8 GEMM
+        let mut c_fp8 = GpuTensor::<f32>::zeros(&dev,
+            Shape::from_static(&[m as usize, n as usize]), DType::F32).unwrap();
+        gemm_fp8(&cache, &dev, &a_fp8, &b_fp8, &mut c_fp8,
+            &scale_a, &scale_b, m, n, k).unwrap();
+        dev.synchronize().unwrap();
+
+        // F32 reference
+        let mut c_ref = GpuTensor::<f32>::zeros(&dev,
+            Shape::from_static(&[m as usize, n as usize]), DType::F32).unwrap();
+        crate::ops::gemm(&cache, &dev, &a_f32, &b_f32, &mut c_ref, m, n, k).unwrap();
+        dev.synchronize().unwrap();
+
+        let fp8_result = c_fp8.to_host(&dev).unwrap();
+        let ref_result = c_ref.to_host(&dev).unwrap();
+
+        let mut max_abs_err = 0.0f32;
+        let mut sum_sq_err = 0.0f64;
+        let mut sum_sq_ref = 0.0f64;
+        for (q, r) in fp8_result.iter().zip(ref_result.iter()) {
+            let err = (q - r).abs();
+            if err > max_abs_err { max_abs_err = err; }
+            sum_sq_err += (err as f64).powi(2);
+            sum_sq_ref += (*r as f64).powi(2);
+        }
+        let nrmse = (sum_sq_err / sum_sq_ref.max(1e-10)).sqrt();
+
+        println!("FP8 E4M3 GEMM ({m}x{n}x{k}):");
+        println!("  Max abs error: {max_abs_err:.4}");
+        println!("  NRMSE:         {nrmse:.6} ({:.2}%)", nrmse * 100.0);
+
+        assert!(nrmse < 0.10, "FP8 GEMM NRMSE {nrmse:.4} too high");
+        println!("  PASSED");
+    }
+
+    #[test]
+    fn gptq_dequant_correctness() {
+        let (dev, cache) = match setup() {
+            Some(s) => s,
+            None => { println!("No CUDA, skipping"); return; }
+        };
+
+        // Small test: K=32, N=8, group_size=32 (1 group)
+        let k = 32u32;
+        let n = 8u32;
+        let group_size = 32u32;
+        let num_groups = k / group_size; // 1
+
+        // Build test weights: values 0..15 range, zero_point=8
+        // For each k, pack 8 values into qweight[k/8, N]
+        let num_packed_rows = k / 8; // 4
+        let mut qweight_host = vec![0u32; (num_packed_rows * n) as usize];
+
+        // Reference dequantized values
+        let mut ref_out = vec![0.0f32; (k * n) as usize];
+
+        // Scales: one per group per N column
+        let scales_host = vec![0.5f32; (num_groups * n) as usize];
+        // Zero-points: packed, each column's zp=4
+        let zp_packed_cols = (n + 7) / 8; // 1
+        let mut qzeros_host = vec![0u32; (num_groups * zp_packed_cols) as usize];
+
+        // Pack zero points: all columns have zp=4
+        // 8 columns packed into 1 uint32: 0x44444444
+        for g in 0..num_groups as usize {
+            let mut packed = 0u32;
+            for c in 0..n.min(8) as usize {
+                packed |= 4u32 << (c * 4);
+            }
+            qzeros_host[g * zp_packed_cols as usize] = packed;
+        }
+
+        // Pack weights: w4[k][n] = ((k + n) % 16) as 4-bit
+        for kk in 0..k as usize {
+            for nn in 0..n as usize {
+                let w4 = ((kk + nn) % 16) as u32;
+                let packed_row = kk / 8;
+                let bit_offset = (kk % 8) * 4;
+                qweight_host[packed_row * n as usize + nn] |= w4 << bit_offset;
+
+                // Reference: (w4 - zp) * scale
+                let zp = 4i32;
+                let scale = scales_host[0 * n as usize + nn];
+                ref_out[kk * n as usize + nn] = (w4 as i32 - zp) as f32 * scale;
+            }
+        }
+
+        let qweight = GpuTensor::from_host(&dev, &qweight_host,
+            Shape::from_static(&[(num_packed_rows * n) as usize]), DType::U32).unwrap();
+        let scales = GpuTensor::from_host(&dev, &scales_host,
+            Shape::from_static(&[(num_groups * n) as usize]), DType::F32).unwrap();
+        let qzeros = GpuTensor::from_host(&dev, &qzeros_host,
+            Shape::from_static(&[(num_groups * zp_packed_cols) as usize]), DType::U32).unwrap();
+
+        let mut output = GpuTensor::<f32>::zeros(&dev,
+            Shape::from_static(&[(k * n) as usize]), DType::F32).unwrap();
+
+        dequant_gptq(&cache, &dev, &qweight, &scales, &qzeros, &mut output, k, n, group_size).unwrap();
+        dev.synchronize().unwrap();
+
+        let result = output.to_host(&dev).unwrap();
+
+        let max_err: f32 = result.iter().zip(ref_out.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        println!("GPTQ dequant ({k}x{n}, group_size={group_size}):");
+        println!("  Max error vs reference: {max_err:.6}");
+
+        assert!(max_err < 1e-5, "GPTQ dequant error {max_err} too high");
+        println!("  PASSED");
+    }
+
+    #[test]
+    fn awq_dequant_correctness() {
+        let (dev, cache) = match setup() {
+            Some(s) => s,
+            None => { println!("No CUDA, skipping"); return; }
+        };
+
+        let k = 32u32;
+        let n = 8u32;
+        let num_packed_rows = k / 8; // 4
+
+        let mut qweight_host = vec![0u32; (num_packed_rows * n) as usize];
+        let scales_host: Vec<f32> = (0..n as usize).map(|i| 0.1 * (i + 1) as f32).collect();
+        let mut ref_out = vec![0.0f32; (k * n) as usize];
+
+        // Pack weights: w4[k][n] = ((k + n) % 16), symmetric so subtract 8
+        for kk in 0..k as usize {
+            for nn in 0..n as usize {
+                let w4 = ((kk + nn) % 16) as u32;
+                let packed_row = kk / 8;
+                let bit_offset = (kk % 8) * 4;
+                qweight_host[packed_row * n as usize + nn] |= w4 << bit_offset;
+
+                ref_out[kk * n as usize + nn] = (w4 as i32 - 8) as f32 * scales_host[nn];
+            }
+        }
+
+        let qweight = GpuTensor::from_host(&dev, &qweight_host,
+            Shape::from_static(&[(num_packed_rows * n) as usize]), DType::U32).unwrap();
+        let scales = GpuTensor::from_host(&dev, &scales_host,
+            Shape::from_static(&[n as usize]), DType::F32).unwrap();
+
+        let mut output = GpuTensor::<f32>::zeros(&dev,
+            Shape::from_static(&[(k * n) as usize]), DType::F32).unwrap();
+
+        dequant_awq(&cache, &dev, &qweight, &scales, &mut output, k, n).unwrap();
+        dev.synchronize().unwrap();
+
+        let result = output.to_host(&dev).unwrap();
+
+        let max_err: f32 = result.iter().zip(ref_out.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        println!("AWQ dequant ({k}x{n}):");
+        println!("  Max error vs reference: {max_err:.6}");
+
+        assert!(max_err < 1e-5, "AWQ dequant error {max_err} too high");
+        println!("  PASSED");
+    }
+
+    #[test]
+    fn int8_per_channel_correctness() {
+        let (dev, cache) = match setup() {
+            Some(s) => s,
+            None => { println!("No CUDA, skipping"); return; }
+        };
+
+        let (m, n, k) = (64u32, 64u32, 128u32);
+
+        // Generate test data
+        let a_data: Vec<f32> = (0..(m * k) as usize)
+            .map(|i| ((i * 7 + 13) % 200) as f32 * 0.01 - 1.0)
+            .collect();
+        let b_data: Vec<f32> = (0..(k * n) as usize)
+            .map(|i| ((i * 11 + 3) % 200) as f32 * 0.01 - 1.0)
+            .collect();
+
+        let a_f32 = GpuTensor::from_host(&dev, &a_data,
+            Shape::from_static(&[m as usize, k as usize]), DType::F32).unwrap();
+        let b_f32 = GpuTensor::from_host(&dev, &b_data,
+            Shape::from_static(&[k as usize, n as usize]), DType::F32).unwrap();
+
+        // Quantize A per-tensor using existing quantize_int8
+        let mut a_int8 = GpuTensor::<i8>::zeros(&dev,
+            Shape::from_static(&[m as usize, k as usize]), DType::I8).unwrap();
+        let mut scale_a = GpuTensor::<f32>::zeros(&dev,
+            Shape::from_static(&[1]), DType::F32).unwrap();
+        quantize_int8(&cache, &dev, &a_f32, &mut a_int8, &mut scale_a, false).unwrap();
+
+        // Quantize B per-channel: treat B[K, N] as N channels of K elements each.
+        // We need to transpose the view: B is [K, N] row-major.
+        // For per-channel along N (columns), we do it on CPU since
+        // quantize_int8_per_channel expects [C_out, C_in] = [N, K] layout.
+        // Transpose B to [N, K] for per-channel quantization.
+        let mut b_transposed = vec![0.0f32; (k * n) as usize];
+        for kk in 0..k as usize {
+            for nn in 0..n as usize {
+                b_transposed[nn * k as usize + kk] = b_data[kk * n as usize + nn];
+            }
+        }
+        let b_t_f32 = GpuTensor::from_host(&dev, &b_transposed,
+            Shape::from_static(&[n as usize, k as usize]), DType::F32).unwrap();
+
+        let mut b_t_int8 = GpuTensor::<i8>::zeros(&dev,
+            Shape::from_static(&[n as usize, k as usize]), DType::I8).unwrap();
+        let mut scale_b = GpuTensor::<f32>::zeros(&dev,
+            Shape::from_static(&[n as usize]), DType::F32).unwrap();
+        quantize_int8_per_channel(&cache, &dev, &b_t_f32, &mut b_t_int8,
+            &mut scale_b, n, k).unwrap();
+
+        // Transpose quantized B back to [K, N] for GEMM
+        dev.synchronize().unwrap();
+        let b_t_q = b_t_int8.to_host(&dev).unwrap();
+        let mut b_q_kn = vec![0i8; (k * n) as usize];
+        for nn in 0..n as usize {
+            for kk in 0..k as usize {
+                b_q_kn[kk * n as usize + nn] = b_t_q[nn * k as usize + kk];
+            }
+        }
+        let b_int8 = GpuTensor::from_host(&dev, &b_q_kn,
+            Shape::from_static(&[k as usize, n as usize]), DType::I8).unwrap();
+
+        // Per-channel INT8 GEMM
+        let mut c_int8 = GpuTensor::<f32>::zeros(&dev,
+            Shape::from_static(&[m as usize, n as usize]), DType::F32).unwrap();
+        gemm_int8_per_channel(&cache, &dev, &a_int8, &b_int8, &mut c_int8,
+            &scale_a, &scale_b, m, n, k).unwrap();
+        dev.synchronize().unwrap();
+
+        // F32 reference
+        let mut c_ref = GpuTensor::<f32>::zeros(&dev,
+            Shape::from_static(&[m as usize, n as usize]), DType::F32).unwrap();
+        crate::ops::gemm(&cache, &dev, &a_f32, &b_f32, &mut c_ref, m, n, k).unwrap();
+        dev.synchronize().unwrap();
+
+        let int8_result = c_int8.to_host(&dev).unwrap();
+        let ref_result = c_ref.to_host(&dev).unwrap();
+
+        let mut max_abs_err = 0.0f32;
+        let mut sum_sq_err = 0.0f64;
+        let mut sum_sq_ref = 0.0f64;
+        for (q, r) in int8_result.iter().zip(ref_result.iter()) {
+            let err = (q - r).abs();
+            if err > max_abs_err { max_abs_err = err; }
+            sum_sq_err += (err as f64).powi(2);
+            sum_sq_ref += (*r as f64).powi(2);
+        }
+        let nrmse = (sum_sq_err / sum_sq_ref.max(1e-10)).sqrt();
+
+        println!("INT8 per-channel GEMM ({m}x{n}x{k}):");
+        println!("  Max abs error: {max_abs_err:.4}");
+        println!("  NRMSE:         {nrmse:.6} ({:.2}%)", nrmse * 100.0);
+
+        assert!(max_abs_err < 1.5, "Per-channel INT8 GEMM max error {max_abs_err} >= 1.5");
+        assert!(nrmse < 0.10, "Per-channel INT8 GEMM NRMSE {nrmse:.4} too high");
+        println!("  PASSED");
     }
 }

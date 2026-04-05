@@ -1,0 +1,15 @@
+[package]
+name = "tensorwarp-python"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "tensorwarp"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"] }
+warp-kernels = { path = "../kernels" }
+warp-loader = { path = "../loader" }
+warp-ir = { path = "../ir" }
+half = "2.4"

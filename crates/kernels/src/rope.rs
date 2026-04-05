@@ -42,12 +42,13 @@ extern "C" __global__ void warp_rope(
     float cos_t = cosf(theta);
     float sin_t = sinf(theta);
 
-    unsigned int base_idx = b * N * D + pos_in_seq * D + 2 * pair;
-    float x0 = input[base_idx];
-    float x1 = input[base_idx + 1];
+    // PyTorch rotate_half pairs (dim i, dim i+D/2), NOT (dim 2i, dim 2i+1)
+    unsigned int base_offset = b * N * D + pos_in_seq * D;
+    float x0 = input[base_offset + pair];           // dim i
+    float x1 = input[base_offset + pair + D / 2];   // dim i + D/2
 
-    out[base_idx]     = x0 * cos_t - x1 * sin_t;
-    out[base_idx + 1] = x0 * sin_t + x1 * cos_t;
+    out[base_offset + pair]         = x0 * cos_t - x1 * sin_t;
+    out[base_offset + pair + D / 2] = x0 * sin_t + x1 * cos_t;
 }
 "#;
 

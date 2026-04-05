@@ -10,8 +10,10 @@
 pub mod autofuse;
 pub mod constfold;
 pub mod fusion;
+pub mod memory_plan;
 pub mod pass;
 pub mod pattern;
 
 pub use pass::{OptimizationLevel, PassPipeline};
 pub use autofuse::{discover_fusion_chains, fusion_report, FusionChain};
+pub use memory_plan::{plan_memory, MemoryPlan, MemorySlot};

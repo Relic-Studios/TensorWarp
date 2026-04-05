@@ -1,0 +1,20 @@
+[package]
+name = "tensorwarp-server"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "tensorwarp-server"
+path = "src/main.rs"
+
+[dependencies]
+warp-kernels = { path = "../kernels" }
+warp-loader = { path = "../loader" }
+warp-ir = { path = "../ir" }
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+log.workspace = true
+env_logger.workspace = true

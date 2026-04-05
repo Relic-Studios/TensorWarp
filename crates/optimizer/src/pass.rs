@@ -6,6 +6,7 @@
 use warp_ir::Graph;
 
 use crate::autofuse;
+use crate::constfold;
 use crate::fusion;
 
 /// How aggressively to optimize.
@@ -76,16 +77,25 @@ impl PassPipeline {
         stats.passes_run += 1;
 
         if self.level as u8 >= OptimizationLevel::O2 as u8 {
-            // Auto-fusion: discover and fuse elementwise chains
+            // Auto-fusion: discover and apply elementwise chain fusions
             let chains = autofuse::discover_fusion_chains(graph);
             stats.autofuse_chains = chains.len();
             stats.autofuse_ops_fused = chains.iter().map(|c| c.ops.len()).sum();
+
+            // Actually apply the fusions to the graph
+            let applied = autofuse::apply_fusion_chains(graph, &chains);
             stats.passes_run += 1;
 
-            // Log discovered fusions
+            // Run DCE again to clean up dead nodes from autofuse
+            if applied > 0 {
+                stats.dead_nodes_found += fusion::eliminate_dead_code(graph);
+                graph.rebuild_users();
+            }
+
+            // Log applied fusions
             for chain in &chains {
-                log::info!("AutoFuse: {} ({} ops) → {}",
-                    chain.name, chain.ops.len(), chain.generate_cuda_kernel().lines().next().unwrap_or(""));
+                log::info!("AutoFuse: {} ({} ops) applied",
+                    chain.name, chain.ops.len());
             }
         }
 

@@ -1,17 +1,9 @@
 //! High-performance GEMM kernels.
 //!
-//! Strategy to beat cuBLAS:
-//! 1. Register tiling — each thread computes a TM×TN output tile
-//! 2. Double-buffered shared memory — overlap loads with compute
-//! 3. Vectorized loads — float4 reads, 4x fewer memory transactions
-//! 4. Tensor Core GEMM via wmma API — FP16 with FP32 accumulation
-//! 5. Multiple kernel variants — autotuner picks best per shape
-//!
-//! cuBLAS targets (RTX 4090, release mode):
-//!   512³:  0.97 TFLOPS FP32
-//!   1024³: 5.59 TFLOPS FP32
-//!   4096³: 5.70 TFLOPS FP32
-//!   FP16:  21.48 TFLOPS @ 4096³
+//! Register-tiled F32 GEMM with shared memory optimization.
+//! Uses 128x128 block tiles with 8x8 per-thread register tiling (BK=16).
+//! Padded shared memory layout to eliminate bank conflicts.
+//! Float4 vectorized output stores for 128-bit write coalescing.
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 
@@ -20,12 +12,13 @@ use crate::device::{DeviceError, WarpDevice};
 use crate::tensor::GpuTensor;
 
 /// Register-tiled GEMM: each thread computes TM×TN = 8×8 output elements.
-/// Block tile: BM×BN = 128×128, BK = 8.
-/// This gives 256 threads per block (16×16 threads, each doing 8×8).
+/// Block tile: BM×BN = 128×128, BK = 16 (doubled for fewer sync barriers).
+/// 256 threads per block (16×16 threads, each doing 8×8).
+/// Uses float4 vectorized stores and increased BK for better throughput.
 const GEMM_REG_TILED_SRC: &str = r#"
 #define BM 128
 #define BN 128
-#define BK 8
+#define BK 16
 #define TM 8
 #define TN 8
 
@@ -39,8 +32,8 @@ extern "C" __global__ void warp_gemm_fast(
     // Each thread computes TM×TN elements
     // Threads per block: (BM/TM) × (BN/TN) = 16×16 = 256
 
-    __shared__ float As[BK][BM];  // transposed for coalesced access
-    __shared__ float Bs[BK][BN];
+    __shared__ float As[BK][BM + 4];  // +4 padding avoids bank conflicts
+    __shared__ float Bs[BK][BN + 4];
 
     unsigned int bx = blockIdx.x;
     unsigned int by = blockIdx.y;
@@ -64,7 +57,7 @@ extern "C" __global__ void warp_gemm_fast(
     for (unsigned int k0 = 0; k0 < K; k0 += BK) {
 
         // Load A tile: A[by*BM..(by+1)*BM, k0..k0+BK] into As[BK][BM]
-        // 256 threads load BM*BK = 128*8 = 1024 elements = 4 per thread
+        // 256 threads load BM*BK = 128*16 = 2048 elements = 8 per thread
         #pragma unroll
         for (unsigned int load = 0; load < (BM * BK) / 256; load++) {
             unsigned int load_idx = tid + load * 256;
@@ -76,6 +69,7 @@ extern "C" __global__ void warp_gemm_fast(
         }
 
         // Load B tile: B[k0..k0+BK, bx*BN..(bx+1)*BN] into Bs[BK][BN]
+        // 256 threads load BK*BN = 16*128 = 2048 elements = 8 per thread
         #pragma unroll
         for (unsigned int load = 0; load < (BK * BN) / 256; load++) {
             unsigned int load_idx = tid + load * 256;
@@ -114,16 +108,26 @@ extern "C" __global__ void warp_gemm_fast(
         __syncthreads();
     }
 
-    // Store results
+    // Store results with float4 vectorized writes (2x float4 = 8 floats per row)
     #pragma unroll
     for (int i = 0; i < TM; i++) {
         unsigned int grow = row_start + i;
         if (grow >= M) continue;
-        #pragma unroll
-        for (int j = 0; j < TN; j++) {
-            unsigned int gcol = col_start + j;
-            if (gcol < N) {
-                C[grow * N + gcol] = acc[i][j];
+
+        if (col_start + 7 < N) {
+            // Fast path: full TN=8 columns fit — use two float4 stores (128-bit each)
+            *reinterpret_cast<float4*>(&C[grow * N + col_start]) =
+                make_float4(acc[i][0], acc[i][1], acc[i][2], acc[i][3]);
+            *reinterpret_cast<float4*>(&C[grow * N + col_start + 4]) =
+                make_float4(acc[i][4], acc[i][5], acc[i][6], acc[i][7]);
+        } else {
+            // Edge case: partial columns — scalar fallback
+            #pragma unroll
+            for (int j = 0; j < TN; j++) {
+                unsigned int gcol = col_start + j;
+                if (gcol < N) {
+                    C[grow * N + gcol] = acc[i][j];
+                }
             }
         }
     }

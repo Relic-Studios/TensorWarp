@@ -196,6 +196,61 @@ pub fn discover_fusion_chains(graph: &mut Graph) -> Vec<FusionChain> {
     chains
 }
 
+/// Apply discovered fusion chains to the graph.
+///
+/// For each chain, replaces the chain's nodes with a single AutoFused op.
+/// The last node in the chain becomes the fused op; all others become dead code.
+pub fn apply_fusion_chains(graph: &mut Graph, chains: &[FusionChain]) -> usize {
+    let mut applied = 0;
+
+    for chain in chains {
+        if chain.nodes.len() < 2 {
+            continue;
+        }
+
+        let kernel_src = chain.generate_cuda_kernel();
+
+        // Collect all external inputs (inputs from outside the chain)
+        let chain_set: std::collections::HashSet<NodeId> =
+            chain.nodes.iter().copied().collect();
+        let mut external_inputs = Vec::new();
+        for &nid in &chain.nodes {
+            let n = graph.node(nid);
+            for &input in &n.inputs {
+                let producer = graph.value_producer(input);
+                if !chain_set.contains(&producer) {
+                    external_inputs.push(input);
+                }
+            }
+        }
+
+        // The last node in the chain produces the output — replace it with AutoFused
+        let last_node = *chain.nodes.last().unwrap();
+        graph.replace_op(
+            last_node,
+            Op::AutoFused {
+                kernel_name: chain.name.clone(),
+                kernel_src,
+                num_inputs: external_inputs.len(),
+            },
+        );
+        graph.replace_inputs(last_node, &external_inputs);
+
+        // Mark intermediate nodes as Identity (they'll be cleaned by DCE)
+        for &nid in &chain.nodes[..chain.nodes.len() - 1] {
+            graph.replace_op(nid, Op::Identity);
+            graph.replace_inputs(nid, &[]);
+        }
+
+        applied += 1;
+    }
+
+    if applied > 0 {
+        graph.rebuild_users();
+    }
+    applied
+}
+
 /// Generate a report of all discoverable fusions.
 pub fn fusion_report(graph: &mut Graph) -> String {
     let chains = discover_fusion_chains(graph);

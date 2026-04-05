@@ -14,7 +14,7 @@
 //! ```
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// ONNX data type constants (from onnx.proto TensorProto.DataType).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -134,36 +134,64 @@ pub struct OnnxTensor {
     pub dtype: OnnxDType,
     pub shape: Vec<i64>,
     pub raw_data: Vec<u8>,
+    /// External data references (key-value pairs from TensorProto field 13).
+    /// Common keys: "location" (filename), "offset", "length".
+    pub external_data: Vec<(String, String)>,
 }
 
 impl OnnxTensor {
+    /// Create a new tensor with the given parameters and no external data.
+    pub fn new(name: impl Into<String>, dtype: OnnxDType, shape: Vec<i64>, raw_data: Vec<u8>) -> Self {
+        Self { name: name.into(), dtype, shape, raw_data, external_data: vec![] }
+    }
+
     /// Read as f32 values (converting from the stored dtype).
+    ///
+    /// Handles misaligned raw_data gracefully by truncating trailing bytes
+    /// that don't form a complete element, rather than panicking.
     pub fn to_f32(&self) -> Vec<f32> {
         match self.dtype {
             OnnxDType::Float => {
-                self.raw_data.chunks_exact(4)
+                let aligned_len = self.raw_data.len() - (self.raw_data.len() % 4);
+                self.raw_data[..aligned_len].chunks_exact(4)
                     .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                     .collect()
             }
             OnnxDType::Double => {
-                self.raw_data.chunks_exact(8)
+                let aligned_len = self.raw_data.len() - (self.raw_data.len() % 8);
+                self.raw_data[..aligned_len].chunks_exact(8)
                     .map(|b| f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32)
                     .collect()
             }
             OnnxDType::Float16 => {
-                self.raw_data.chunks_exact(2)
+                let aligned_len = self.raw_data.len() - (self.raw_data.len() % 2);
+                self.raw_data[..aligned_len].chunks_exact(2)
                     .map(|b| half::f16::from_le_bytes([b[0], b[1]]).to_f32())
                     .collect()
             }
             OnnxDType::Int64 => {
-                self.raw_data.chunks_exact(8)
+                let aligned_len = self.raw_data.len() - (self.raw_data.len() % 8);
+                self.raw_data[..aligned_len].chunks_exact(8)
                     .map(|b| i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32)
                     .collect()
             }
             OnnxDType::Int32 => {
-                self.raw_data.chunks_exact(4)
+                let aligned_len = self.raw_data.len() - (self.raw_data.len() % 4);
+                self.raw_data[..aligned_len].chunks_exact(4)
                     .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32)
                     .collect()
+            }
+            OnnxDType::Int16 | OnnxDType::Uint16 => {
+                let aligned_len = self.raw_data.len() - (self.raw_data.len() % 2);
+                self.raw_data[..aligned_len].chunks_exact(2)
+                    .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32)
+                    .collect()
+            }
+            OnnxDType::Int8 => {
+                self.raw_data.iter().map(|&b| (b as i8) as f32).collect()
+            }
+            OnnxDType::Uint8 => {
+                self.raw_data.iter().map(|&b| b as f32).collect()
             }
             _ => {
                 log::warn!("Unsupported ONNX dtype {:?} for f32 conversion", self.dtype);
@@ -174,6 +202,60 @@ impl OnnxTensor {
 
     pub fn numel(&self) -> usize {
         self.shape.iter().map(|&d| d as usize).product()
+    }
+
+    /// Resolve external data references, loading weight data from an external file.
+    ///
+    /// ONNX models >2GB store weights in separate .bin files. The `external_data`
+    /// field contains key-value pairs: "location" (filename), "offset" (byte offset),
+    /// "length" (byte count).
+    pub fn resolve_external_data(&mut self, model_dir: &Path) -> Result<(), OnnxError> {
+        if self.external_data.is_empty() {
+            return Ok(());
+        }
+
+        let mut location = None;
+        let mut offset: u64 = 0;
+        let mut length: Option<u64> = None;
+
+        for (key, value) in &self.external_data {
+            match key.as_str() {
+                "location" => location = Some(value.clone()),
+                "offset" => offset = value.parse::<u64>().unwrap_or(0),
+                "length" => length = value.parse::<u64>().ok(),
+                _ => {} // ignore unknown keys like "checksum"
+            }
+        }
+
+        let filename = location.ok_or_else(|| {
+            OnnxError::Invalid(format!(
+                "tensor '{}': external_data missing 'location' key", self.name
+            ))
+        })?;
+
+        let data_path = model_dir.join(&filename);
+        let file_data = std::fs::read(&data_path).map_err(|e| {
+            OnnxError::Io(std::io::Error::new(
+                e.kind(),
+                format!("failed to read external data '{}': {}", data_path.display(), e),
+            ))
+        })?;
+
+        let start = offset as usize;
+        let end = match length {
+            Some(len) => start + len as usize,
+            None => file_data.len(),
+        };
+
+        if end > file_data.len() || start > file_data.len() {
+            return Err(OnnxError::Invalid(format!(
+                "tensor '{}': external data range [{}..{}] exceeds file size {}",
+                self.name, start, end, file_data.len()
+            )));
+        }
+
+        self.raw_data = file_data[start..end].to_vec();
+        Ok(())
     }
 }
 
@@ -202,6 +284,12 @@ pub struct OnnxModel {
     pub opset_version: i64,
     /// Producer name.
     pub producer: String,
+    /// Directory containing the model file, for resolving external data paths.
+    pub model_dir: Option<PathBuf>,
+    /// Graph name (from GraphProto tag 2).
+    pub graph_name: String,
+    /// Graph doc string (from GraphProto tag 15).
+    pub graph_doc_string: String,
 }
 
 /// Errors during ONNX loading.
@@ -220,10 +308,56 @@ pub enum OnnxError {
 }
 
 impl OnnxModel {
+    /// Create a model for testing with default metadata fields.
+    pub fn for_test(
+        inputs: Vec<OnnxIO>, outputs: Vec<OnnxIO>,
+        nodes: Vec<OnnxNode>, initializers: HashMap<String, OnnxTensor>,
+    ) -> Self {
+        Self {
+            inputs, outputs, nodes, initializers,
+            ir_version: 8, opset_version: 17,
+            producer: "test".into(),
+            model_dir: None, graph_name: String::new(), graph_doc_string: String::new(),
+        }
+    }
+
     /// Load an ONNX model from a file.
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, OnnxError> {
+        let path = path.as_ref();
         let data = std::fs::read(path)?;
-        Self::from_bytes(&data)
+        let mut model = Self::from_bytes(&data)?;
+        model.model_dir = path.parent().map(|p| p.to_path_buf());
+        Ok(model)
+    }
+
+    /// Load an ONNX model, resolving external data references relative to the model directory.
+    ///
+    /// Large ONNX models (>2GB) store weights in external .bin files. The TensorProto
+    /// `external_data` field (tag 13 repeated key-value pairs) specifies the filename.
+    /// This method loads the model and then resolves any external data references.
+    pub fn load_with_external_data<P: AsRef<Path>>(path: P) -> Result<Self, OnnxError> {
+        let path = path.as_ref();
+        let data = std::fs::read(path)?;
+        let mut model = Self::from_bytes(&data)?;
+        let model_dir = path.parent().map(|p| p.to_path_buf());
+        model.model_dir = model_dir.clone();
+
+        // Resolve external data references for all initializers
+        if let Some(ref dir) = model_dir {
+            let mut resolved = Vec::new();
+            for (name, tensor) in &model.initializers {
+                if tensor.raw_data.is_empty() && !tensor.external_data.is_empty() {
+                    resolved.push(name.clone());
+                }
+            }
+            for name in resolved {
+                if let Some(tensor) = model.initializers.get_mut(&name) {
+                    tensor.resolve_external_data(dir)?;
+                }
+            }
+        }
+
+        Ok(model)
     }
 
     /// Parse an ONNX model from raw protobuf bytes.
@@ -239,10 +373,101 @@ impl OnnxModel {
             ir_version: 0,
             opset_version: 0,
             producer: String::new(),
+            model_dir: None,
+            graph_name: String::new(),
+            graph_doc_string: String::new(),
         };
 
         parse_model_proto(data, &mut model)?;
         Ok(model)
+    }
+
+    /// Validate opset version and return warnings about ops that changed behavior.
+    ///
+    /// This is informational only — it warns about ops whose semantics changed
+    /// between opset versions, which may affect execution correctness.
+    pub fn validate_opset(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        let opset = self.opset_version;
+
+        for node in &self.nodes {
+            match node.op_type.as_str() {
+                "Reshape" if opset >= 5 => {
+                    // Since opset 5, Reshape takes shape as a second input, not an attribute.
+                    if node.attrs.contains_key("shape") {
+                        warnings.push(format!(
+                            "Reshape node '{}': 'shape' attribute is deprecated since opset 5; \
+                             shape should be provided as the second input tensor",
+                            node.name
+                        ));
+                    }
+                }
+                "Squeeze" if opset >= 13 => {
+                    // Since opset 13, Squeeze takes axes as a second input, not an attribute.
+                    if node.attrs.contains_key("axes") {
+                        warnings.push(format!(
+                            "Squeeze node '{}': 'axes' attribute is deprecated since opset 13; \
+                             axes should be provided as the second input tensor",
+                            node.name
+                        ));
+                    }
+                }
+                "Unsqueeze" if opset >= 13 => {
+                    // Since opset 13, Unsqueeze takes axes as a second input, not an attribute.
+                    if node.attrs.contains_key("axes") {
+                        warnings.push(format!(
+                            "Unsqueeze node '{}': 'axes' attribute is deprecated since opset 13; \
+                             axes should be provided as the second input tensor",
+                            node.name
+                        ));
+                    }
+                }
+                "Softmax" if opset >= 13 => {
+                    // Since opset 13, Softmax applies to the last axis by default (was axis=1).
+                    if !node.attrs.contains_key("axis") {
+                        // No explicit axis — behavior changed between opset <13 and >=13
+                        warnings.push(format!(
+                            "Softmax node '{}': default axis changed from 1 to -1 in opset 13; \
+                             consider specifying axis explicitly",
+                            node.name
+                        ));
+                    }
+                }
+                "Flatten" if opset >= 13 => {
+                    // Since opset 13, Flatten handles negative axis.
+                    if let Some(OnnxAttr::Int(axis)) = node.attrs.get("axis") {
+                        if *axis < 0 && opset < 13 {
+                            warnings.push(format!(
+                                "Flatten node '{}': negative axis requires opset >= 13",
+                                node.name
+                            ));
+                        }
+                    }
+                }
+                "BatchNormalization" if opset >= 15 => {
+                    // Since opset 15, training mode outputs are removed.
+                    if node.outputs.len() > 1 {
+                        warnings.push(format!(
+                            "BatchNormalization node '{}': training-mode outputs \
+                             removed in opset 15",
+                            node.name
+                        ));
+                    }
+                }
+                "ReduceMean" | "ReduceSum" | "ReduceMax" if opset >= 18 => {
+                    // Since opset 18, axes moved from attribute to input.
+                    if node.attrs.contains_key("axes") {
+                        warnings.push(format!(
+                            "{} node '{}': 'axes' attribute is deprecated since opset 18; \
+                             axes should be provided as the second input tensor",
+                            node.op_type, node.name
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        warnings
     }
 
     /// Map an ONNX op_type to the corresponding warp-ir Op.
@@ -403,11 +628,12 @@ impl OnnxModel {
             "ConstantOfShape" => Ok(OnnxOpMapping::Constant),
             "Range" => Ok(OnnxOpMapping::Shape),
             "CumSum" => Ok(OnnxOpMapping::Reduce { op: "cumsum" }),
-            "Tile" => Ok(OnnxOpMapping::Identity),
+            "Tile" => Ok(OnnxOpMapping::Activation("tile")),
             "DepthToSpace" | "SpaceToDepth" => Ok(OnnxOpMapping::Reshape),
             "OneHot" => Ok(OnnxOpMapping::Constant),
             "NonZero" => Ok(OnnxOpMapping::Shape),
-            "ScatterND" | "ScatterElements" => Ok(OnnxOpMapping::Identity),
+            "ScatterND" => Ok(OnnxOpMapping::Activation("scatter_nd")),
+            "ScatterElements" => Ok(OnnxOpMapping::Activation("scatter_elements")),
 
             // Extended math
             "Erf" => Ok(OnnxOpMapping::Activation("erf")),
@@ -431,88 +657,105 @@ impl OnnxModel {
             "ThresholdedRelu" | "Selu" | "PRelu" => Ok(OnnxOpMapping::Activation("relu")),
 
             // Shape/data
-            "Trilu" => Ok(OnnxOpMapping::Identity),
+            "Trilu" => Ok(OnnxOpMapping::Activation("trilu")),
             "GatherElements" | "GatherND" => Ok(OnnxOpMapping::Gather { axis: 0 }),
-            "Compress" => Ok(OnnxOpMapping::Identity),
-            "Unique" => Ok(OnnxOpMapping::Identity),
-            "ReverseSequence" => Ok(OnnxOpMapping::Identity),
+            "Compress" => Ok(OnnxOpMapping::Activation("compress")),
+            "Unique" => Ok(OnnxOpMapping::Activation("unique")),
+            "ReverseSequence" => Ok(OnnxOpMapping::Activation("reverse_sequence")),
             "BitShift" => Ok(OnnxOpMapping::Binary("bitshift")),
 
             // Quantization
-            "QuantizeLinear" | "DequantizeLinear" | "DynamicQuantizeLinear" => Ok(OnnxOpMapping::Identity),
+            "QuantizeLinear" => Ok(OnnxOpMapping::Activation("quantize_linear")),
+            "DequantizeLinear" => Ok(OnnxOpMapping::Activation("dequantize_linear")),
+            "DynamicQuantizeLinear" => Ok(OnnxOpMapping::Activation("dynamic_quantize_linear")),
             "QLinearMatMul" | "QLinearConv" | "ConvInteger" | "MatMulInteger" => {
                 Ok(OnnxOpMapping::MatMul { trans_a: false, trans_b: false })
             }
             "MatMulNBits" => Ok(OnnxOpMapping::MatMul { trans_a: false, trans_b: false }),
 
             // RNN
-            "LSTM" | "GRU" | "RNN" => Ok(OnnxOpMapping::Identity),
+            "LSTM" => Ok(OnnxOpMapping::Activation("lstm")),
+            "GRU" => Ok(OnnxOpMapping::Activation("gru")),
+            "RNN" => Ok(OnnxOpMapping::Activation("rnn")),
             "SequenceConstruct" | "SequenceAt" | "SequenceLength" => Ok(OnnxOpMapping::Identity),
 
             // Image
-            "AffineGrid" => Ok(OnnxOpMapping::Identity),
+            "AffineGrid" => Ok(OnnxOpMapping::Activation("affine_grid")),
             "CenterCropPad" => Ok(OnnxOpMapping::Pad),
             "Col2Im" => Ok(OnnxOpMapping::Reshape),
-            "LRN" => Ok(OnnxOpMapping::Identity),
+            "LRN" => Ok(OnnxOpMapping::Activation("lrn")),
 
-            // Control flow
-            "If" | "Loop" | "Scan" => Ok(OnnxOpMapping::Identity),
-            "Optional" | "OptionalHasElement" | "OptionalGetElement" => Ok(OnnxOpMapping::Identity),
-            "Floor" | "Ceil" | "Round" => Ok(OnnxOpMapping::Identity), // rounding ops
+            // Rounding
+            "Floor" => Ok(OnnxOpMapping::Activation("floor")),
+            "Ceil" => Ok(OnnxOpMapping::Activation("ceil")),
+            "Round" => Ok(OnnxOpMapping::Activation("round")),
+
+            // Comparison
             "Min" | "Max" => Ok(OnnxOpMapping::Binary("minmax")),
-            "Equal" | "Greater" | "Less" | "Not" | "And" | "Or" => Ok(OnnxOpMapping::Identity),
-            "MatMulInteger" => Ok(OnnxOpMapping::MatMul { trans_a: false, trans_b: false }),
+            "Equal" => Ok(OnnxOpMapping::Binary("equal")),
+            "Greater" => Ok(OnnxOpMapping::Binary("greater")),
+            "Less" => Ok(OnnxOpMapping::Binary("less")),
+            "Not" => Ok(OnnxOpMapping::Activation("not")),
+            "And" => Ok(OnnxOpMapping::Binary("and")),
+            "Or" => Ok(OnnxOpMapping::Binary("or")),
+
+            // Control flow (genuinely unsupported — dynamic control flow can't be statically compiled)
+            "If" | "Loop" | "Scan" => Err(OnnxError::UnsupportedOp(
+                format!("{}: dynamic control flow is not supported in static graph compilation", node.op_type))),
 
             // Identity / no-op
-            "Identity" | "Dropout" | "Flatten" => Ok(OnnxOpMapping::Identity),
+            "Identity" | "Dropout" => Ok(OnnxOpMapping::Identity),
+            "Optional" | "OptionalHasElement" | "OptionalGetElement" => Ok(OnnxOpMapping::Identity),
 
             other => Err(OnnxError::UnsupportedOp(other.to_string())),
         }
     }
 
     /// Get the list of supported ONNX op types.
+    /// Only lists ops that have real implementations in the executor.
     pub fn supported_ops() -> Vec<&'static str> {
         vec![
+            // Core compute
             "MatMul", "Gemm",
+            // Activations
             "Relu", "Sigmoid", "Tanh", "Gelu", "Silu", "Swish", "LeakyRelu", "Clip",
-            "Add", "Sub", "Mul", "Div",
+            "Elu", "Celu", "Mish", "HardSigmoid", "HardSwish", "Softplus", "Softsign",
+            // Binary
+            "Add", "Sub", "Mul", "Div", "Pow", "Min", "Max",
+            "Equal", "Greater", "Less", "And", "Or", "Mod",
+            // Normalization
             "BatchNormalization", "LayerNormalization", "GroupNormalization", "InstanceNormalization",
+            // Convolution
             "Conv", "ConvTranspose",
+            // Pooling
             "MaxPool", "AveragePool", "GlobalAveragePool",
+            // Shape manipulation
             "Reshape", "Transpose", "Concat", "Split", "Flatten", "Squeeze", "Unsqueeze",
-            "Gather", "Slice",
+            "Expand", "Tile", "DepthToSpace", "SpaceToDepth",
+            // Data access
+            "Gather", "GatherElements", "GatherND", "Slice", "Pad",
+            "ScatterND", "ScatterElements", "Where",
+            // Resize
             "Resize", "Upsample",
-            "ReduceMean", "ReduceSum", "ReduceMax",
-            "Softmax",
-            "Constant", "Shape", "Cast", "Pad",
-            "NonMaxSuppression", "TopK",
-            "Identity", "Dropout", "Flatten",
-            "Expand", "Where", "Pow", "Sqrt", "Neg", "Abs", "Exp", "Log", "Reciprocal",
-            "Floor", "Ceil", "Round", "Min", "Max",
-            "Equal", "Greater", "Less", "Not", "And", "Or",
-            "MatMulInteger",
-            "ArgMax", "ArgMin", "Einsum", "ConstantOfShape", "Range", "CumSum",
-            "Tile", "DepthToSpace", "SpaceToDepth", "OneHot", "NonZero",
-            "ScatterND", "ScatterElements",
-            // Extended math
-            "Erf", "Mod", "Fmod", "IsNaN", "IsInf",
+            // Reduce
+            "ReduceMean", "ReduceSum", "ReduceMax", "CumSum",
+            // Other compute
+            "Softmax", "ArgMax", "ArgMin", "Einsum", "TopK",
+            // Unary math
+            "Sqrt", "Neg", "Abs", "Exp", "Log", "Reciprocal", "Not",
+            "Floor", "Ceil", "Round",
+            "Erf", "IsNaN", "IsInf",
             "Asin", "Acos", "Atan", "Sinh", "Cosh", "Atanh",
-            // Extended activations
-            "Elu", "Celu", "Mish", "HardSigmoid", "HardSwish",
-            "Softplus", "Softsign", "ThresholdedRelu", "Selu", "PRelu",
-            // Shape/data
-            "Trilu", "GatherElements", "GatherND", "Compress", "Unique",
-            "ReverseSequence", "BitShift",
+            // Recurrent
+            "LSTM", "GRU",
             // Quantization
-            "QuantizeLinear", "DequantizeLinear", "DynamicQuantizeLinear",
-            "QLinearMatMul", "QLinearConv", "ConvInteger", "MatMulNBits",
-            // RNN
-            "LSTM", "GRU", "RNN",
-            "SequenceConstruct", "SequenceAt", "SequenceLength",
-            // Image
-            "AffineGrid", "CenterCropPad", "Col2Im", "LRN",
-            // Control flow
-            "If", "Loop", "Scan", "Optional", "OptionalHasElement", "OptionalGetElement",
+            "QuantizeLinear", "DequantizeLinear",
+            "QLinearMatMul", "QLinearConv", "MatMulNBits",
+            // Constants / metadata
+            "Constant", "ConstantOfShape", "Shape", "Cast", "Range",
+            "Identity", "Dropout",
+            // Data
+            "Trilu", "NonMaxSuppression",
         ]
     }
 
@@ -521,6 +764,12 @@ impl OnnxModel {
         let mut s = String::new();
         s.push_str(&format!("ONNX Model (IR v{}, opset v{}, producer: {})\n",
             self.ir_version, self.opset_version, self.producer));
+        if !self.graph_name.is_empty() {
+            s.push_str(&format!("  Graph:   {}\n", self.graph_name));
+        }
+        if !self.graph_doc_string.is_empty() {
+            s.push_str(&format!("  Doc:     {}\n", self.graph_doc_string));
+        }
         s.push_str(&format!("  Inputs:  {}\n", self.inputs.len()));
         for inp in &self.inputs {
             s.push_str(&format!("    {} {:?}\n", inp.name, inp.shape));
@@ -703,7 +952,7 @@ fn parse_graph_proto(data: &[u8], model: &mut OnnxModel) -> Result<(), OnnxError
         } else { pb_skip(wt, &mut buf)?; }
     }
 
-    // Second pass: nodes, inputs, outputs
+    // Second pass: nodes, inputs, outputs, metadata
     let mut buf = data;
     while !buf.is_empty() {
         let (tag, wt) = pb_tag(&mut buf)?;
@@ -711,6 +960,7 @@ fn parse_graph_proto(data: &[u8], model: &mut OnnxModel) -> Result<(), OnnxError
             (1, WireType::LengthDelimited) => {
                 if let Ok(n) = parse_node_proto(pb_bytes(&mut buf)?) { model.nodes.push(n); }
             }
+            (2, WireType::LengthDelimited) => { model.graph_name = pb_string(&mut buf)?; }
             (5, WireType::LengthDelimited) => { pb_bytes(&mut buf)?; } // skip (already parsed)
             (11, WireType::LengthDelimited) => {
                 if let Ok(io) = parse_value_info(pb_bytes(&mut buf)?) {
@@ -720,6 +970,7 @@ fn parse_graph_proto(data: &[u8], model: &mut OnnxModel) -> Result<(), OnnxError
             (12, WireType::LengthDelimited) => {
                 if let Ok(io) = parse_value_info(pb_bytes(&mut buf)?) { model.outputs.push(io); }
             }
+            (15, WireType::LengthDelimited) => { model.graph_doc_string = pb_string(&mut buf)?; }
             (_, wt) => { pb_skip(wt, &mut buf)?; }
         }
     }
@@ -762,6 +1013,7 @@ fn parse_attribute(data: &[u8]) -> Result<(String, OnnxAttr), OnnxError> {
             (2, WireType::Varint) => { attr_type = pb_varint(&mut buf)? as i32; }
             (3, WireType::Varint) => { i_val = pb_varint(&mut buf)? as i64; }
             (4, WireType::Fixed32) => {
+                if buf.len() < 4 { return Err(OnnxError::Invalid("truncated attribute float".into())); }
                 f_val = f32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
                 buf = &buf[4..];
             }
@@ -771,9 +1023,11 @@ fn parse_attribute(data: &[u8]) -> Result<(String, OnnxAttr), OnnxError> {
             }
             (7, WireType::LengthDelimited) => { // packed floats
                 let d = pb_bytes(&mut buf)?;
-                for c in d.chunks_exact(4) { floats.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]])); }
+                let aligned = d.len() - (d.len() % 4);
+                for c in d[..aligned].chunks_exact(4) { floats.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]])); }
             }
             (7, WireType::Fixed32) => {
+                if buf.len() < 4 { return Err(OnnxError::Invalid("truncated attribute float".into())); }
                 floats.push(f32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]));
                 buf = &buf[4..];
             }
@@ -803,39 +1057,132 @@ fn parse_tensor_proto(data: &[u8]) -> Result<OnnxTensor, OnnxError> {
     let mut name = String::new();
     let mut dtype = 1i32;
     let mut dims = Vec::new();
-    let mut raw_data = Vec::new();
-    let mut float_data = Vec::new();
+    let mut raw_data: Vec<u8> = Vec::new();
+    let mut float_data: Vec<f32> = Vec::new();
+    let mut int32_data: Vec<i32> = Vec::new();
+    let mut double_data: Vec<f64> = Vec::new();
+    let mut int64_data: Vec<i64> = Vec::new();
+    let mut external_data: Vec<(String, String)> = Vec::new();
 
     let mut buf = data;
     while !buf.is_empty() {
         let (tag, wt) = pb_tag(&mut buf)?;
         match (tag, wt) {
-            (1, WireType::LengthDelimited) => { // packed dims
+            // field 1: dims (repeated int64)
+            (1, WireType::LengthDelimited) => {
                 let d = pb_bytes(&mut buf)?;
                 let mut db = d;
                 while !db.is_empty() { dims.push(pb_varint(&mut db)? as i64); }
             }
             (1, WireType::Varint) => { dims.push(pb_varint(&mut buf)? as i64); }
+
+            // field 2: data_type (int32)
             (2, WireType::Varint) => { dtype = pb_varint(&mut buf)? as i32; }
-            (4, WireType::LengthDelimited) => { // packed float_data
+
+            // field 4: float_data (repeated float, packed)
+            (4, WireType::LengthDelimited) => {
                 let d = pb_bytes(&mut buf)?;
-                for c in d.chunks_exact(4) { float_data.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]])); }
+                let aligned = d.len() - (d.len() % 4);
+                for c in d[..aligned].chunks_exact(4) {
+                    float_data.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+                }
             }
             (4, WireType::Fixed32) => {
-                float_data.push(f32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]));
-                buf = &buf[4..];
+                if buf.len() >= 4 {
+                    float_data.push(f32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]));
+                    buf = &buf[4..];
+                } else {
+                    return Err(OnnxError::Invalid("truncated float_data fixed32".into()));
+                }
             }
+
+            // field 5: int32_data (repeated int32, packed)
+            (5, WireType::LengthDelimited) => {
+                let d = pb_bytes(&mut buf)?;
+                let mut ib = d;
+                while !ib.is_empty() { int32_data.push(pb_varint(&mut ib)? as i32); }
+            }
+            (5, WireType::Varint) => { int32_data.push(pb_varint(&mut buf)? as i32); }
+
+            // field 6: double_data (repeated double, packed)
+            (6, WireType::LengthDelimited) => {
+                let d = pb_bytes(&mut buf)?;
+                let aligned = d.len() - (d.len() % 8);
+                for c in d[..aligned].chunks_exact(8) {
+                    double_data.push(f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]));
+                }
+            }
+            (6, WireType::Fixed64) => {
+                if buf.len() >= 8 {
+                    double_data.push(f64::from_le_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]));
+                    buf = &buf[8..];
+                } else {
+                    return Err(OnnxError::Invalid("truncated double_data fixed64".into()));
+                }
+            }
+
+            // field 7: int64_data (repeated int64, packed)
+            (7, WireType::LengthDelimited) => {
+                let d = pb_bytes(&mut buf)?;
+                let mut ib = d;
+                while !ib.is_empty() { int64_data.push(pb_varint(&mut ib)? as i64); }
+            }
+            (7, WireType::Varint) => { int64_data.push(pb_varint(&mut buf)? as i64); }
+
+            // field 8: name (string)
             (8, WireType::LengthDelimited) => { name = pb_string(&mut buf)?; }
+
+            // field 13: raw_data (bytes)
             (13, WireType::LengthDelimited) => { raw_data = pb_bytes(&mut buf)?.to_vec(); }
+
+            // field 14: external_data (repeated StringStringEntryProto)
+            (14, WireType::LengthDelimited) => {
+                let entry = pb_bytes(&mut buf)?;
+                if let Ok((k, v)) = parse_string_string_entry(entry) {
+                    external_data.push((k, v));
+                }
+            }
+
             (_, wt) => { pb_skip(wt, &mut buf)?; }
         }
     }
 
-    if raw_data.is_empty() && !float_data.is_empty() {
-        raw_data = float_data.iter().flat_map(|f| f.to_le_bytes()).collect();
+    // Priority: raw_data > float_data > int32_data > int64_data > double_data
+    if raw_data.is_empty() {
+        if !float_data.is_empty() {
+            raw_data = float_data.iter().flat_map(|f| f.to_le_bytes()).collect();
+        } else if !int32_data.is_empty() {
+            raw_data = int32_data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        } else if !int64_data.is_empty() {
+            raw_data = int64_data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        } else if !double_data.is_empty() {
+            raw_data = double_data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        }
     }
 
-    Ok(OnnxTensor { name, dtype: OnnxDType::from_i32(dtype).unwrap_or(OnnxDType::Float), shape: dims, raw_data })
+    Ok(OnnxTensor {
+        name,
+        dtype: OnnxDType::from_i32(dtype).unwrap_or(OnnxDType::Float),
+        shape: dims,
+        raw_data,
+        external_data,
+    })
+}
+
+/// Parse a StringStringEntryProto (key-value pair message used for external_data).
+fn parse_string_string_entry(data: &[u8]) -> Result<(String, String), OnnxError> {
+    let mut key = String::new();
+    let mut value = String::new();
+    let mut buf = data;
+    while !buf.is_empty() {
+        let (tag, wt) = pb_tag(&mut buf)?;
+        match (tag, wt) {
+            (1, WireType::LengthDelimited) => { key = pb_string(&mut buf)?; }
+            (2, WireType::LengthDelimited) => { value = pb_string(&mut buf)?; }
+            (_, wt) => { pb_skip(wt, &mut buf)?; }
+        }
+    }
+    Ok((key, value))
 }
 
 fn parse_value_info(data: &[u8]) -> Result<OnnxIO, OnnxError> {

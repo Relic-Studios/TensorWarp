@@ -289,6 +289,15 @@ pub fn conv2d(
         return depthwise_conv2d(cache, device, input, weight, bias, output, params, h, w);
     }
 
+    // Fast path: Winograd F(2,3) for 3x3 convolutions with stride=1, dilation=1
+    if params.kernel_h == 3 && params.kernel_w == 3
+       && params.stride_h == 1 && params.stride_w == 1
+       && params.dilation_h == 1 && params.dilation_w == 1
+       && params.groups == 1
+    {
+        return conv2d_winograd_f23(cache, device, input, weight, bias, output, params, h, w);
+    }
+
     let batch = input.numel as u32 / (params.in_channels * h * w);
     let out_h = params.output_h(h);
     let out_w = params.output_w(w);
@@ -1111,6 +1120,338 @@ pub fn depthwise_conv2d(
 }
 
 // ═════════════════════════════════════════════════════════════════
+// Winograd F(2,3) Convolution for 3x3 kernels
+// ═════════════════════════════════════════════════════════════════
+//
+// Winograd F(2,3): produces 2x2 output from a 4x4 input tile using a 3x3 filter.
+// Reduces multiplications from 36 to 16 per 2x2 output (2.25x savings).
+//
+// Transform matrices:
+//   BT (input transform):  [[1,0,-1,0],[0,1,1,0],[0,-1,1,0],[0,1,0,-1]]
+//   G  (filter transform): [[1,0,0],[0.5,0.5,0.5],[0.5,-0.5,0.5],[0,0,1]]
+//   AT (output transform):  [[1,1,1,0],[0,1,-1,-1]]
+//
+// Pipeline:
+//   1. Transform filters: U = G * g * G^T  (4x4 per C_in x C_out pair)
+//   2. Transform input tiles: V = B^T * d * B  (4x4 tiles, stride 2)
+//   3. Element-wise multiply + sum over C_in: M[i][j] = sum_c U[c_out][c][i][j] * V[c][tile][i][j]
+//   4. Inverse transform: Y = A^T * M * A  (2x2 output tile)
+
+// Kernel 1: Transform all 3x3 filters to Winograd domain
+// Input: weight [C_out, C_in, 3, 3], Output: U [C_out, C_in, 4, 4]
+const WINOGRAD_FILTER_TRANSFORM_SRC: &str = r#"
+extern "C" __global__ void warp_winograd_filter_transform(
+    float *U,              // [C_out * C_in * 16]
+    const float *weight,   // [C_out * C_in * 9]
+    unsigned int C_out,
+    unsigned int C_in
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = C_out * C_in;
+    if (idx >= total) return;
+
+    const float *g = weight + idx * 9;  // 3x3 filter
+    float *u = U + idx * 16;            // 4x4 transformed
+
+    // G = [[1,0,0],[0.5,0.5,0.5],[0.5,-0.5,0.5],[0,0,1]]
+    // Compute temp = G * g  (4x3 = 4x3 * 3x3)
+    float temp[4][3];
+    for (int j = 0; j < 3; j++) {
+        temp[0][j] = g[0*3+j];
+        temp[1][j] = 0.5f * (g[0*3+j] + g[1*3+j] + g[2*3+j]);
+        temp[2][j] = 0.5f * (g[0*3+j] - g[1*3+j] + g[2*3+j]);
+        temp[3][j] = g[2*3+j];
+    }
+
+    // Compute U = temp * G^T  (4x4 = 4x3 * 3x4)
+    // G^T = [[1,0.5,0.5,0],[0,0.5,-0.5,0],[0,0.5,0.5,1]]
+    for (int i = 0; i < 4; i++) {
+        u[i*4+0] = temp[i][0];
+        u[i*4+1] = 0.5f * (temp[i][0] + temp[i][1] + temp[i][2]);
+        u[i*4+2] = 0.5f * (temp[i][0] - temp[i][1] + temp[i][2]);
+        u[i*4+3] = temp[i][2];
+    }
+}
+"#;
+
+// Kernel 2: Transform input tiles to Winograd domain
+// Each tile is 4x4, tiles stride by 2 in both H and W directions
+// Input: [C_in, H, W], Output: V [C_in, num_tiles, 4, 4]
+const WINOGRAD_INPUT_TRANSFORM_SRC: &str = r#"
+extern "C" __global__ void warp_winograd_input_transform(
+    float *V,              // [C_in * num_tiles_h * num_tiles_w * 16]
+    const float *input,    // [C_in, H, W]
+    unsigned int C_in,
+    unsigned int H, unsigned int W,
+    unsigned int num_tiles_h, unsigned int num_tiles_w,
+    unsigned int pad_h, unsigned int pad_w
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int num_tiles = num_tiles_h * num_tiles_w;
+    unsigned int total = C_in * num_tiles;
+    if (idx >= total) return;
+
+    unsigned int tile_idx = idx % num_tiles;
+    unsigned int c = idx / num_tiles;
+    unsigned int tile_h = tile_idx / num_tiles_w;
+    unsigned int tile_w = tile_idx % num_tiles_w;
+
+    // Top-left corner of this 4x4 input tile (with padding offset)
+    int h_start = (int)(tile_h * 2) - (int)pad_h;
+    int w_start = (int)(tile_w * 2) - (int)pad_w;
+
+    // Load 4x4 input tile (with zero-padding for out-of-bounds)
+    float d[4][4];
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            int ih = h_start + i;
+            int iw = w_start + j;
+            if (ih >= 0 && ih < (int)H && iw >= 0 && iw < (int)W) {
+                d[i][j] = input[c * H * W + (unsigned int)ih * W + (unsigned int)iw];
+            } else {
+                d[i][j] = 0.0f;
+            }
+        }
+    }
+
+    // BT = [[1,0,-1,0],[0,1,1,0],[0,-1,1,0],[0,1,0,-1]]
+    // Compute temp = BT * d  (4x4)
+    float temp[4][4];
+    for (int j = 0; j < 4; j++) {
+        temp[0][j] = d[0][j] - d[2][j];
+        temp[1][j] = d[1][j] + d[2][j];
+        temp[2][j] = -d[1][j] + d[2][j];
+        temp[3][j] = d[1][j] - d[3][j];
+    }
+
+    // Compute V = temp * B  (4x4), where B = BT^T
+    // B = [[1,0,0,0],[0,1,-1,1],[−1,1,1,0],[0,0,0,-1]]
+    float *v = V + idx * 16;
+    for (int i = 0; i < 4; i++) {
+        v[i*4+0] = temp[i][0] - temp[i][2];
+        v[i*4+1] = temp[i][1] + temp[i][2];
+        v[i*4+2] = -temp[i][1] + temp[i][2];
+        v[i*4+3] = temp[i][1] - temp[i][3];
+    }
+}
+"#;
+
+// Kernel 3: Batched element-wise multiply + accumulate over C_in
+// For each (c_out, tile), compute M = sum_c_in U[c_out,c_in,:,:] * V[c_in,tile,:,:]
+// Output: M [C_out, num_tiles, 4, 4]
+const WINOGRAD_MATMUL_SRC: &str = r#"
+extern "C" __global__ void warp_winograd_matmul(
+    float *M,             // [C_out * num_tiles * 16]
+    const float *U,       // [C_out * C_in * 16]
+    const float *V,       // [C_in * num_tiles * 16]
+    unsigned int C_out,
+    unsigned int C_in,
+    unsigned int num_tiles
+) {
+    // Each thread handles one (c_out, tile, element) triple
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = C_out * num_tiles * 16;
+    if (idx >= total) return;
+
+    unsigned int elem = idx % 16;
+    unsigned int tile = (idx / 16) % num_tiles;
+    unsigned int co = idx / (16 * num_tiles);
+
+    float sum = 0.0f;
+    for (unsigned int ci = 0; ci < C_in; ci++) {
+        float u_val = U[(co * C_in + ci) * 16 + elem];
+        float v_val = V[(ci * num_tiles + tile) * 16 + elem];
+        sum += u_val * v_val;
+    }
+    M[idx] = sum;
+}
+"#;
+
+// Kernel 4: Inverse transform + write output tiles
+// Input: M [C_out, num_tiles, 4, 4]
+// Output: output [C_out, out_H, out_W]
+const WINOGRAD_OUTPUT_TRANSFORM_SRC: &str = r#"
+extern "C" __global__ void warp_winograd_output_transform(
+    float *output,         // [C_out, out_H, out_W]
+    const float *M,        // [C_out * num_tiles * 16]
+    const float *bias,     // [C_out] or NULL (0 pointer = no bias)
+    unsigned int C_out,
+    unsigned int out_H, unsigned int out_W,
+    unsigned int num_tiles_h, unsigned int num_tiles_w,
+    unsigned int has_bias
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int num_tiles = num_tiles_h * num_tiles_w;
+    unsigned int total = C_out * num_tiles;
+    if (idx >= total) return;
+
+    unsigned int tile_idx = idx % num_tiles;
+    unsigned int co = idx / num_tiles;
+    unsigned int tile_h = tile_idx / num_tiles_w;
+    unsigned int tile_w = tile_idx % num_tiles_w;
+
+    const float *m = M + idx * 16;
+
+    // Load 4x4 M tile
+    float mtile[4][4];
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++)
+            mtile[i][j] = m[i*4+j];
+
+    // AT = [[1,1,1,0],[0,1,-1,-1]]
+    // Compute temp = AT * mtile  (2x4)
+    float temp[2][4];
+    for (int j = 0; j < 4; j++) {
+        temp[0][j] = mtile[0][j] + mtile[1][j] + mtile[2][j];
+        temp[1][j] = mtile[1][j] - mtile[2][j] - mtile[3][j];
+    }
+
+    // Compute Y = temp * A  (2x2), where A = AT^T
+    float y[2][2];
+    for (int i = 0; i < 2; i++) {
+        y[i][0] = temp[i][0] + temp[i][1] + temp[i][2];
+        y[i][1] = temp[i][1] - temp[i][2] - temp[i][3];
+    }
+
+    // Write 2x2 output
+    float b = has_bias ? bias[co] : 0.0f;
+    unsigned int oh_base = tile_h * 2;
+    unsigned int ow_base = tile_w * 2;
+
+    for (int i = 0; i < 2; i++) {
+        for (int j = 0; j < 2; j++) {
+            unsigned int oh = oh_base + (unsigned int)i;
+            unsigned int ow = ow_base + (unsigned int)j;
+            if (oh < out_H && ow < out_W) {
+                output[co * out_H * out_W + oh * out_W + ow] = y[i][j] + b;
+            }
+        }
+    }
+}
+"#;
+
+/// Winograd F(2,3) convolution for 3x3 filters with stride=1, dilation=1.
+///
+/// Faster than im2col+GEMM for 3x3 convolutions by reducing the number
+/// of multiplications from 9 to 4 per output element (2.25x).
+///
+/// input:  [N, C_in, H, W]
+/// weight: [C_out, C_in, 3, 3]
+/// output: [N, C_out, out_H, out_W]
+pub fn conv2d_winograd_f23(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    input: &GpuTensor<f32>,
+    weight: &GpuTensor<f32>,
+    bias: Option<&GpuTensor<f32>>,
+    output: &mut GpuTensor<f32>,
+    params: &Conv2dParams,
+    h: u32,
+    w: u32,
+) -> Result<(), DeviceError> {
+    let c_in = params.in_channels;
+    let c_out = params.out_channels;
+    let out_h = params.output_h(h);
+    let out_w = params.output_w(w);
+    let batch = input.numel as u32 / (c_in * h * w);
+
+    // Number of 2x2 output tiles (each from a 4x4 input tile)
+    let num_tiles_h = (out_h + 1) / 2;
+    let num_tiles_w = (out_w + 1) / 2;
+    let num_tiles = num_tiles_h * num_tiles_w;
+
+    // Step 1: Transform filters — U[C_out, C_in, 4, 4]
+    let u_size = (c_out * c_in * 16) as usize;
+    let mut u_tensor = GpuTensor::<f32>::zeros(device,
+        Shape::from_static(&[u_size]), DType::F32)?;
+
+    let filter_f = cache.get_or_compile(device,
+        WINOGRAD_FILTER_TRANSFORM_SRC, "warp_winograd_filter_transform")?;
+    let filter_cfg = LaunchConfig::for_num_elems(c_out * c_in);
+    unsafe {
+        launch_err!(device.stream.launch_builder(&filter_f)
+            .arg(&mut u_tensor.data)
+            .arg(&weight.data)
+            .arg(&c_out)
+            .arg(&c_in)
+            .launch(filter_cfg))?;
+    }
+
+    // Step 2-4: Per batch
+    let input_transform_f = cache.get_or_compile(device,
+        WINOGRAD_INPUT_TRANSFORM_SRC, "warp_winograd_input_transform")?;
+    let matmul_f = cache.get_or_compile(device,
+        WINOGRAD_MATMUL_SRC, "warp_winograd_matmul")?;
+    let output_transform_f = cache.get_or_compile(device,
+        WINOGRAD_OUTPUT_TRANSFORM_SRC, "warp_winograd_output_transform")?;
+
+    let v_size = (c_in * num_tiles * 16) as usize;
+    let m_size = (c_out * num_tiles * 16) as usize;
+    let mut v_tensor = GpuTensor::<f32>::zeros(device,
+        Shape::from_static(&[v_size]), DType::F32)?;
+    let mut m_tensor = GpuTensor::<f32>::zeros(device,
+        Shape::from_static(&[m_size]), DType::F32)?;
+
+    let has_bias: u32 = if bias.is_some() { 1 } else { 0 };
+    // Use a dummy zero buffer if no bias
+    let zero_bias;
+    let bias_tensor = if let Some(b) = bias {
+        b
+    } else {
+        zero_bias = GpuTensor::<f32>::zeros(device,
+            Shape::from_static(&[c_out as usize]), DType::F32)?;
+        &zero_bias
+    };
+
+    for n in 0..batch {
+        let input_offset = (n * c_in * h * w) as usize;
+        let output_offset = (n * c_out * out_h * out_w) as usize;
+
+        // Step 2: Transform input tiles — V[C_in, num_tiles, 4, 4]
+        let v_cfg = LaunchConfig::for_num_elems(c_in * num_tiles);
+        unsafe {
+            launch_err!(device.stream.launch_builder(&input_transform_f)
+                .arg(&mut v_tensor.data)
+                .arg(&input.data.slice(input_offset..))
+                .arg(&c_in)
+                .arg(&h).arg(&w)
+                .arg(&num_tiles_h).arg(&num_tiles_w)
+                .arg(&params.padding_h).arg(&params.padding_w)
+                .launch(v_cfg))?;
+        }
+
+        // Step 3: Element-wise multiply + accumulate — M[C_out, num_tiles, 4, 4]
+        let m_cfg = LaunchConfig::for_num_elems(c_out * num_tiles * 16);
+        unsafe {
+            launch_err!(device.stream.launch_builder(&matmul_f)
+                .arg(&mut m_tensor.data)
+                .arg(&u_tensor.data)
+                .arg(&v_tensor.data)
+                .arg(&c_out)
+                .arg(&c_in)
+                .arg(&num_tiles)
+                .launch(m_cfg))?;
+        }
+
+        // Step 4: Inverse transform + write output
+        let o_cfg = LaunchConfig::for_num_elems(c_out * num_tiles);
+        unsafe {
+            launch_err!(device.stream.launch_builder(&output_transform_f)
+                .arg(&mut output.data.slice_mut(output_offset..))
+                .arg(&m_tensor.data)
+                .arg(&bias_tensor.data)
+                .arg(&c_out)
+                .arg(&out_h).arg(&out_w)
+                .arg(&num_tiles_h).arg(&num_tiles_w)
+                .arg(&has_bias)
+                .launch(o_cfg))?;
+        }
+    }
+
+    Ok(())
+}
+
+// ═════════════════════════════════════════════════════════════════
 // Tests
 // ═════════════════════════════════════════════════════════════════
 
@@ -1670,5 +2011,88 @@ extern "C" __global__ void warp_relu(float *out, const float *x, size_t n) {
             result.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
         println!("  Pipeline complete!");
         println!("{}", cache.stats());
+    }
+
+    #[test]
+    fn winograd_correctness() {
+        let (dev, cache) = match setup() {
+            Some(s) => s,
+            None => { println!("No CUDA, skipping"); return; }
+        };
+
+        let rand_vec = |n: usize, seed: usize| -> Vec<f32> {
+            (0..n).map(|i| ((i * 7 + seed) % 200) as f32 * 0.01 - 1.0).collect()
+        };
+
+        // [1, 3, 8, 8] input, [8, 3, 3, 3] weight
+        let (batch, c_in, h, w) = (1u32, 3u32, 8u32, 8u32);
+        let c_out = 8u32;
+        let params = Conv2dParams::new(c_in, c_out, 3).padding(1);
+        let out_h = params.output_h(h);
+        let out_w = params.output_w(w);
+
+        let input_data = rand_vec((batch * c_in * h * w) as usize, 42);
+        let weight_data = rand_vec((c_out * c_in * 3 * 3) as usize, 17);
+
+        let input = GpuTensor::from_host(&dev, &input_data,
+            Shape::from_static(&[batch as usize, c_in as usize, h as usize, w as usize]),
+            DType::F32).unwrap();
+        let weight = GpuTensor::from_host(&dev, &weight_data,
+            Shape::from_static(&[c_out as usize, c_in as usize, 3, 3]),
+            DType::F32).unwrap();
+
+        // Winograd path
+        let mut out_winograd = GpuTensor::<f32>::zeros(&dev,
+            Shape::from_static(&[batch as usize, c_out as usize, out_h as usize, out_w as usize]),
+            DType::F32).unwrap();
+        conv2d_winograd_f23(&cache, &dev, &input, &weight, None, &mut out_winograd,
+            &params, h, w).unwrap();
+        dev.synchronize().unwrap();
+
+        // im2col reference: use a params with stride != 1 to bypass Winograd dispatch,
+        // or call the im2col path directly. We'll compute reference on CPU instead.
+        let input_host = input_data.clone();
+        let weight_host = weight_data.clone();
+        let mut ref_output = vec![0.0f32; (batch * c_out * out_h * out_w) as usize];
+
+        // CPU conv2d reference
+        for co in 0..c_out {
+            for oh in 0..out_h {
+                for ow in 0..out_w {
+                    let mut sum = 0.0f32;
+                    for ci in 0..c_in {
+                        for kh in 0..3u32 {
+                            for kw in 0..3u32 {
+                                let ih = oh as i32 + kh as i32 - params.padding_h as i32;
+                                let iw = ow as i32 + kw as i32 - params.padding_w as i32;
+                                if ih >= 0 && ih < h as i32 && iw >= 0 && iw < w as i32 {
+                                    let in_val = input_host[
+                                        (ci * h * w + ih as u32 * w + iw as u32) as usize];
+                                    let w_val = weight_host[
+                                        (co * c_in * 9 + ci * 9 + kh * 3 + kw) as usize];
+                                    sum += in_val * w_val;
+                                }
+                            }
+                        }
+                    }
+                    ref_output[(co * out_h * out_w + oh * out_w + ow) as usize] = sum;
+                }
+            }
+        }
+
+        let winograd_result = out_winograd.to_host(&dev).unwrap();
+
+        let mut max_err = 0.0f32;
+        for (w_val, r_val) in winograd_result.iter().zip(ref_output.iter()) {
+            let err = (w_val - r_val).abs();
+            if err > max_err { max_err = err; }
+        }
+
+        println!("Winograd F(2,3) correctness ({batch}x{c_in}x{h}x{w} * {c_out}x{c_in}x3x3):");
+        println!("  Output shape: [{batch}, {c_out}, {out_h}, {out_w}]");
+        println!("  Max abs error vs CPU reference: {max_err:.6}");
+
+        assert!(max_err < 0.01, "Winograd max error {max_err} >= 0.01");
+        println!("  PASSED: max_err < 0.01");
     }
 }

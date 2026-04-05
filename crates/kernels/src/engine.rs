@@ -20,12 +20,15 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use warp_ir::{DType, Shape};
 
+use crate::autotune::{AutoTuner, DreamCycleRunner, GemmShape};
 use crate::cache::KernelCache;
+use crate::cost_model::CostModel;
 use crate::device::{DeviceError, WarpDevice};
+use crate::mem_pool::GpuMemPool;
 use crate::tensor::GpuTensor;
 
 /// Serializable tuning result.
@@ -39,19 +42,28 @@ struct TuneResult {
 pub struct Engine {
     pub device: WarpDevice,
     pub cache: KernelCache,
+    pub pool: GpuMemPool,
+    pub tuner: Arc<AutoTuner>,
+    pub cost_model: CostModel,
     tuned: Mutex<HashMap<String, TuneResult>>,
     cache_dir: Option<PathBuf>,
+    dream_cycle: Mutex<Option<DreamCycleRunner>>,
 }
 
 impl Engine {
     /// Create an engine on the given GPU device.
     pub fn new(device_ordinal: usize) -> Result<Self, DeviceError> {
         let device = WarpDevice::new(device_ordinal)?;
+        let cost_model = CostModel::from_device(&device);
         Ok(Self {
             device,
             cache: KernelCache::new(),
+            pool: GpuMemPool::new(),
+            tuner: Arc::new(AutoTuner::new()),
+            cost_model,
             tuned: Mutex::new(HashMap::new()),
             cache_dir: None,
+            dream_cycle: Mutex::new(None),
         })
     }
 
@@ -61,27 +73,40 @@ impl Engine {
         let dir = dir.into();
         let device = WarpDevice::new(device_ordinal)?;
         let cache = KernelCache::with_disk_cache(dir.join("kernels"));
+        let cost_model = CostModel::from_device(&device);
 
         let tuned = HashMap::new();
 
         Ok(Self {
             device,
             cache,
+            pool: GpuMemPool::new(),
+            tuner: Arc::new(AutoTuner::new()),
+            cost_model,
             tuned: Mutex::new(tuned),
             cache_dir: Some(dir),
+            dream_cycle: Mutex::new(None),
         })
     }
 
     /// Device summary.
     pub fn summary(&self) -> String {
         let tuned = self.tuned.lock().unwrap();
-        format!("{} | {} tuned shapes | cache: {}",
-            self.device.summary(), tuned.len(), self.cache.stats())
+        format!("{} | {} tuned shapes | cache: {} | {} | autotuner: {}",
+            self.device.summary(), tuned.len(), self.cache.stats(),
+            self.cost_model.summary(), self.tuner.report())
+    }
+
+    /// Return the autotuner's tuning report.
+    pub fn tuning_report(&self) -> String {
+        self.tuner.report()
     }
 
     // ── GEMM dispatch ─────────────────────────────────────────
 
-    /// F32 GEMM with auto-selection.
+    /// F32 GEMM with auto-selection via autotuner.
+    /// Uses the tuned kernel variant if available, otherwise falls back to a
+    /// heuristic (fast register-tiled for large sizes, tiled-32 for small).
     pub fn gemm_f32(
         &self,
         a: &GpuTensor<f32>,
@@ -89,10 +114,13 @@ impl Engine {
         c: &mut GpuTensor<f32>,
         m: u32, n: u32, k: u32,
     ) -> Result<(), DeviceError> {
-        crate::ops::gemm(&self.cache, &self.device, a, b, c, m, n, k)
+        // Shape traffic is also recorded inside tuner.gemm(), but we record here
+        // too for callers that bypass the autotuner's gemm() path.
+        self.tuner.gemm(&self.cache, &self.device, a, b, c, m, n, k)
     }
 
-    /// FP16 GEMM with tensor core dispatch.
+    /// FP16 GEMM — cuBLAS with automatic tensor core dispatch.
+    /// Uses NVIDIA's hand-tuned SASS kernels for peak FP16 throughput.
     pub fn gemm_f16(
         &self,
         a: &GpuTensor<half::f16>,
@@ -100,7 +128,7 @@ impl Engine {
         c: &mut GpuTensor<half::f16>,
         m: u32, n: u32, k: u32,
     ) -> Result<(), DeviceError> {
-        crate::gemm_tc::gemm_tensor_core(&self.cache, &self.device, a, b, c, m, n, k)
+        crate::cublas_gemm::gemm_cublas_f16(&self.device, a, b, c, m, n, k)
     }
 
     /// Quantized W4A16 GEMM.
@@ -202,9 +230,83 @@ impl Engine {
             Shape::from_static(&[256]), DType::F16)?;
         crate::fp16::cast_f32_to_f16(&self.cache, &self.device, &f32_dummy, &mut f16_dummy)?;
 
+        // Load cached tuning results from disk if available
+        let tune_cache_path = self.cache_dir.as_ref().map(|d| d.join("tuning.csv"));
+        if let Some(ref path) = tune_cache_path {
+            match self.tuner.load_from_disk(path) {
+                Ok(n) if n > 0 => log::info!("Loaded {} cached tuning results from disk", n),
+                _ => {}
+            }
+        }
+
+        // Autotune GEMM kernels for common sizes (skip already-tuned shapes)
+        log::info!("Engine warmup: autotuning GEMM kernels...");
+        let tune_shapes: Vec<(u32, u32, u32)> = vec![
+            (64, 64, 64), (128, 128, 128), (256, 256, 256),
+            (512, 512, 512), (1024, 1024, 1024), (2048, 2048, 2048),
+            // Transformer-specific shapes (hidden=4096, FFN=11008 for LLaMA-7B)
+            (1, 4096, 4096), (1, 11008, 4096), (1, 4096, 11008),
+            // Smaller models (hidden=768, 1024, 2048)
+            (1, 768, 768), (1, 3072, 768), (1, 2048, 2048),
+        ];
+        for &(m, n, k) in &tune_shapes {
+            if self.tuner.best_variant(&crate::autotune::GemmShape { m, n, k }).is_some() {
+                continue; // Already tuned (from disk cache or previous run)
+            }
+            match self.tuner.tune_gemm(&self.cache, &self.device, m, n, k, 3, 5) {
+                Ok(winner) => log::info!("  {}x{}x{}: {}", m, n, k, winner),
+                Err(e) => log::warn!("  {}x{}x{}: tune failed: {}", m, n, k, e),
+            }
+        }
+
+        // Save tuning results to disk for next startup
+        if let Some(ref path) = tune_cache_path {
+            if let Err(e) = self.tuner.save_to_disk(path) {
+                log::warn!("Failed to save tuning results: {}", e);
+            }
+        }
+
         self.device.synchronize()?;
         log::info!("Engine warmup complete: {}", self.cache.stats());
+        log::info!("{}", self.tuner.report());
+
+        // Start dream-cycle background tuner.
+        // It discovers hot shapes from inference traffic and tunes them automatically.
+        let dream = DreamCycleRunner::start(
+            self.tuner.clone(),
+            Arc::new(KernelCache::new()),
+            0, // device ordinal
+        );
+        log::info!("DreamCycle background tuner started");
+        *self.dream_cycle.lock().unwrap() = Some(dream);
+
         Ok(())
+    }
+
+    /// Stop the dream-cycle background tuner (if running) and return its stats.
+    pub fn stop_dream_cycle(&self) -> Option<String> {
+        let mut dc = self.dream_cycle.lock().unwrap();
+        if let Some(ref mut runner) = *dc {
+            let stats = runner.stats();
+            runner.stop();
+            *dc = None;
+            Some(stats)
+        } else {
+            None
+        }
+    }
+
+    /// Queue a shape for background tuning by the dream cycle.
+    pub fn queue_dream_tune(&self, m: u32, n: u32, k: u32) {
+        let dc = self.dream_cycle.lock().unwrap();
+        if let Some(ref runner) = *dc {
+            runner.queue_shape(m, n, k);
+        }
+    }
+
+    /// Get the top hot shapes from inference traffic.
+    pub fn hot_shapes(&self, top_n: usize) -> Vec<(GemmShape, u64, f64)> {
+        self.tuner.hot_shapes(top_n)
     }
 }
 

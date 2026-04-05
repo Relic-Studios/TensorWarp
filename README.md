@@ -13,7 +13,8 @@ TensorWarp is a from-scratch inference engine written in Rust + CUDA that JIT-co
 | Elementwise chain fusion | Manual | **6.43x auto-speedup** |
 | W4A16 quantized GEMM | Not native | **3.5x faster than F32** |
 | ONNX ops | ~120 ops | **130+ ops (>120% coverage)** |
-| Model families | ONNX, TF, custom | **LLaMA, SDXL, Whisper, YOLO, ViT, Mamba + more** |
+| Model formats | ONNX, TF, custom | **ONNX, SafeTensors, GGUF** |
+| Model families | Limited | **LLaMA, SDXL, Whisper, YOLO, ViT, Mamba + more** |
 | Language | C++ (closed source) | **Rust (safe, open source) + CUDA (fast)** |
 | APIs | C++ / Python | **Rust + C FFI + Python** |
 | Startup | Engine file | **Disk-cached JIT (<10ms reload)** |
@@ -51,9 +52,9 @@ Q4_0: 869 tokens/sec, 5.1x less memory
 ## Architecture
 
 ```
-                    +------------------+
-                    |   ONNX / SafeT   |  Model Loading
-                    +--------+---------+
+                    +--------------------+
+                    | ONNX/SafeT/GGUF   |  Model Loading
+                    +--------+-----------+
                              |
                     +--------v---------+
                     |     warp-ir      |  Graph IR (130+ ops)
@@ -70,11 +71,11 @@ Q4_0: 869 tokens/sec, 5.1x less memory
                     +--------+---------+
                              |
                     +--------v---------+
-                    |  warp-kernels    |  140 CUDA kernels
+                    |  warp-kernels    |  160+ CUDA kernels
                     |  - gemm_tc       |  FP16 tensor cores
-                    |  - quantize      |  Q4_0/Q8_0 W4A16
+                    |  - quantize      |  Q4/Q8/INT8/FP8
                     |  - conv/pool/bn  |  CNN foundation
-                    |  - attention     |  Flash + paged + KV
+                    |  - attention     |  Flash v2 + paged + KV
                     |  - fp16          |  Mixed precision
                     |  - autofuse JIT  |  Generated kernels
                     +--------+---------+
@@ -122,6 +123,8 @@ Q4_0: 869 tokens/sec, 5.1x less memory
 ### Quantization
 - Q8_0 (3.6x compression, 0.35% error), Q4_0 (6.4x compression)
 - W4A16 / W8A16 quantized GEMM
+- INT8/FP8 GEMM with A8W8 symmetric quantization
+- GPTQ / AWQ quantization format support
 - INT8/FP8 calibration (MinMax, Percentile, Entropy)
 
 ### Data Manipulation
@@ -194,15 +197,17 @@ let outputs = exec.run(&engine.device, &[("input", &input_tensor)])?;
 
 | Crate | Description | Lines |
 |-------|-------------|-------|
-| `warp-ir` | Graph IR with 130+ ops, shapes, dtypes | ~1.5K |
-| `warp-optimizer` | Pattern fusion + auto-fusion engine | ~1K |
-| `warp-codegen` | PTX + Metal code generation | ~0.8K |
-| `warp-runtime` | Tiered compilation, memory, scheduling | ~1.5K |
-| `warp-kernels` | 140 CUDA kernels, 45 modules | ~20K |
-| `warp-loader` | ONNX (130+ ops) + SafeTensors + HuggingFace | ~5K |
-| `warp-cli` | 7 CLI commands (info, bench, generate, onnx, compile, profile, load) | ~0.4K |
+| `warp-ir` | SSA graph IR with 130+ ops, shapes, dtypes | ~2K |
+| `warp-optimizer` | Pattern fusion, autofuse, constfold, DCE, memory planning | ~1.5K |
+| `warp-codegen` | PTX + Metal code generation | ~1K |
+| `warp-runtime` | Runtime types and scheduling | ~1.5K |
+| `warp-kernels` | 160+ CUDA kernels, 48 modules, autotuner, cost model, generation | ~22K |
+| `warp-loader` | ONNX (130+ ops) + SafeTensors + GGUF + LLaMA + tokenizer + HF Hub | ~7K |
+| `warp-cli` | 10 CLI commands (info, bench, generate, load, onnx, compile, profile, pipeline, run, serve) | ~1K |
+| `warp-python` | PyO3 bindings (Engine, Tensor, OnnxModel, GEMM, Conv, RMSNorm, Softmax, generate) | ~2K |
+| `warp-server` | OpenAI-compatible HTTP server (axum-based) | ~1K |
 
-**Total: ~31K lines of Rust + Python, 140 CUDA kernels, 211 tests**
+**Total: ~41K lines of Rust + Python, 160+ CUDA kernels, 270 tests, 9 crates**
 
 ## Key Optimizations
 
@@ -287,11 +292,17 @@ cargo test --package warp-kernels gemm_throughput_sweep -- --nocapture
 - [x] LSTM/GRU recurrent cells
 - [x] C FFI + Python API + HuggingFace loader
 - [x] Docker + CI/CD + architecture docs
-- [ ] Flash Attention v2 (tiled Q×K with online softmax)
+- [x] Flash Attention v2 (tiled Q×K with online softmax)
+- [x] GGUF model format import
+- [x] Speculative decoding (adaptive K with Thompson sampling)
+- [x] GPTQ/AWQ quantization formats
+- [x] INT8/FP8 GEMM with A8W8
+- [x] Split-K GEMM for M=1 decode
+- [x] Winograd convolution for 3x3
+- [x] OpenAI-compatible HTTP server (warp-server)
+- [x] PyO3 Python bindings (warp-python)
 - [ ] Tensor parallelism across multiple GPUs (Linux + NCCL)
 - [ ] Apple Metal runtime (codegen done, needs Apple GPU)
-- [ ] GGUF model format import
-- [ ] Speculative decoding
 
 ## License
 
