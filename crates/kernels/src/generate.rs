@@ -1514,9 +1514,9 @@ impl QuantizedGenerationEngine {
 
             // 2. Q, K, V — M=1 specialized GEMM (block-major if available)
             if let Some(ref wq_bm) = layer.wq_bm {
-                crate::quantize::gemm_q4_0_m1_blockmajor(&self.cache, device, &lb.normed, wq_bm, &mut lb.q, h, h)?;
-                crate::quantize::gemm_q4_0_m1_blockmajor(&self.cache, device, &lb.normed, layer.wk_bm.as_ref().unwrap(), &mut lb.k, kv_dim, h)?;
-                crate::quantize::gemm_q4_0_m1_blockmajor(&self.cache, device, &lb.normed, layer.wv_bm.as_ref().unwrap(), &mut lb.v, kv_dim, h)?;
+                crate::quantize::gemm_q4_0_m1_splitk(&self.cache, device, &lb.normed, wq_bm, &mut lb.q, h, h)?;
+                crate::quantize::gemm_q4_0_m1_splitk(&self.cache, device, &lb.normed, layer.wk_bm.as_ref().unwrap(), &mut lb.k, kv_dim, h)?;
+                crate::quantize::gemm_q4_0_m1_splitk(&self.cache, device, &lb.normed, layer.wv_bm.as_ref().unwrap(), &mut lb.v, kv_dim, h)?;
             } else {
                 crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.normed, &layer.wq, &mut lb.q, h, h)?;
                 crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.normed, &layer.wk, &mut lb.k, kv_dim, h)?;
@@ -1552,7 +1552,7 @@ impl QuantizedGenerationEngine {
 
             // 7. Output projection — M=1 GEMM (block-major if available)
             if let Some(ref wo_bm) = layer.wo_bm {
-                crate::quantize::gemm_q4_0_m1_blockmajor(&self.cache, device, &lb.attn_out, wo_bm,
+                crate::quantize::gemm_q4_0_m1_splitk(&self.cache, device, &lb.attn_out, wo_bm,
                     &mut lb.attn_proj, h, h)?;
             } else {
                 crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.attn_out, &layer.wo,
@@ -1566,9 +1566,9 @@ impl QuantizedGenerationEngine {
 
             // 9. Gate + Up — M=1 GEMM (block-major if available)
             if let Some(ref wg_bm) = layer.w_gate_bm {
-                crate::quantize::gemm_q4_0_m1_blockmajor(&self.cache, device, &lb.ffn_normed, wg_bm,
+                crate::quantize::gemm_q4_0_m1_splitk(&self.cache, device, &lb.ffn_normed, wg_bm,
                     &mut lb.gate, ffn, h)?;
-                crate::quantize::gemm_q4_0_m1_blockmajor(&self.cache, device, &lb.ffn_normed, layer.w_up_bm.as_ref().unwrap(),
+                crate::quantize::gemm_q4_0_m1_splitk(&self.cache, device, &lb.ffn_normed, layer.w_up_bm.as_ref().unwrap(),
                     &mut lb.up, ffn, h)?;
             } else {
                 crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.ffn_normed, &layer.w_gate,
@@ -1582,7 +1582,7 @@ impl QuantizedGenerationEngine {
 
             // 11. Down projection — M=1 GEMM (block-major if available)
             if let Some(ref wd_bm) = layer.w_down_bm {
-                crate::quantize::gemm_q4_0_m1_blockmajor(&self.cache, device, &lb.swiglu, wd_bm,
+                crate::quantize::gemm_q4_0_m1_splitk(&self.cache, device, &lb.swiglu, wd_bm,
                     &mut lb.ffn_out, h, ffn)?;
             } else {
                 crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.swiglu, &layer.w_down,
@@ -1633,9 +1633,9 @@ impl QuantizedGenerationEngine {
 
             // Q, K, V — M=1 GEMM (block-major if available)
             if let Some(ref wq_bm) = layer.wq_bm {
-                crate::quantize::gemm_q4_0_m1_blockmajor(&self.cache, device, &lb.normed, wq_bm, &mut lb.q, h, h)?;
-                crate::quantize::gemm_q4_0_m1_blockmajor(&self.cache, device, &lb.normed, layer.wk_bm.as_ref().unwrap(), &mut lb.k, kv_dim, h)?;
-                crate::quantize::gemm_q4_0_m1_blockmajor(&self.cache, device, &lb.normed, layer.wv_bm.as_ref().unwrap(), &mut lb.v, kv_dim, h)?;
+                crate::quantize::gemm_q4_0_m1_splitk(&self.cache, device, &lb.normed, wq_bm, &mut lb.q, h, h)?;
+                crate::quantize::gemm_q4_0_m1_splitk(&self.cache, device, &lb.normed, layer.wk_bm.as_ref().unwrap(), &mut lb.k, kv_dim, h)?;
+                crate::quantize::gemm_q4_0_m1_splitk(&self.cache, device, &lb.normed, layer.wv_bm.as_ref().unwrap(), &mut lb.v, kv_dim, h)?;
             } else {
                 crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.normed, &layer.wq, &mut lb.q, h, h)?;
                 crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.normed, &layer.wk, &mut lb.k, kv_dim, h)?;
@@ -1672,7 +1672,7 @@ impl QuantizedGenerationEngine {
 
             // Output projection
             if let Some(ref wo_bm) = layer.wo_bm {
-                crate::quantize::gemm_q4_0_m1_blockmajor(&self.cache, device, &lb.attn_out, wo_bm,
+                crate::quantize::gemm_q4_0_m1_splitk(&self.cache, device, &lb.attn_out, wo_bm,
                     &mut lb.attn_proj, h, h)?;
             } else {
                 crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.attn_out, &layer.wo,
@@ -1685,9 +1685,9 @@ impl QuantizedGenerationEngine {
 
             // FFN GEMMs
             if let Some(ref wg_bm) = layer.w_gate_bm {
-                crate::quantize::gemm_q4_0_m1_blockmajor(&self.cache, device, &lb.ffn_normed, wg_bm,
+                crate::quantize::gemm_q4_0_m1_splitk(&self.cache, device, &lb.ffn_normed, wg_bm,
                     &mut lb.gate, ffn, h)?;
-                crate::quantize::gemm_q4_0_m1_blockmajor(&self.cache, device, &lb.ffn_normed, layer.w_up_bm.as_ref().unwrap(),
+                crate::quantize::gemm_q4_0_m1_splitk(&self.cache, device, &lb.ffn_normed, layer.w_up_bm.as_ref().unwrap(),
                     &mut lb.up, ffn, h)?;
             } else {
                 crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.ffn_normed, &layer.w_gate,
@@ -1699,7 +1699,7 @@ impl QuantizedGenerationEngine {
             ops::fused_silu_mul(&self.cache, device, &lb.gate, &lb.up, &mut lb.swiglu)?;
 
             if let Some(ref wd_bm) = layer.w_down_bm {
-                crate::quantize::gemm_q4_0_m1_blockmajor(&self.cache, device, &lb.swiglu, wd_bm,
+                crate::quantize::gemm_q4_0_m1_splitk(&self.cache, device, &lb.swiglu, wd_bm,
                     &mut lb.ffn_out, h, ffn)?;
             } else {
                 crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.swiglu, &layer.w_down,

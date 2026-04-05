@@ -15,7 +15,7 @@
 //! tiled matrix multiply. Reads 4-bit weights from global memory (4× less bandwidth),
 //! dequantizes in shared memory, then does standard tile multiply in f32.
 
-use cudarc::driver::{LaunchConfig, PushKernelArg};
+use cudarc::driver::{DevicePtrMut, LaunchConfig, PushKernelArg};
 
 use crate::cache::KernelCache;
 use crate::device::{DeviceError, WarpDevice};
@@ -866,6 +866,131 @@ extern "C" __global__ void warp_gemm_q4_0_m1_v3(
     }
 }
 "#;
+
+// ── Split-K M=1 Q4 GEMM for maximum SM occupancy ───────────────
+//
+// The standard M=1 kernel assigns one thread per output column.
+// For small N (e.g., KV projection N=512), only 2 blocks launch —
+// 2% SM utilization on RTX 4090's 128 SMs.
+//
+// Split-K divides the K dimension across multiple blocks. Each block
+// processes K/splits K-blocks for its assigned output columns, then
+// atomicAdds partial results. This multiplies the block count by splits.
+//
+// With auto-selected splits: KV proj goes from 2% to 50%+ SM util,
+// attention Q/O from 11% to 88%, FFN from 58% to 100%.
+
+const GEMM_Q4_0_M1_SPLITK_SRC: &str = r#"
+extern "C" __global__ void warp_gemm_q4_0_m1_splitk(
+    float* __restrict__ C,
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ B_q4,
+    int K,
+    int N,
+    int num_k_blocks_total,
+    int k_blocks_per_split
+) {
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= N) return;
+
+    // blockIdx.y = split index (all splits launch in ONE kernel)
+    int k_split_id = blockIdx.y;
+    int start_b = k_split_id * k_blocks_per_split;
+    int end_b = start_b + k_blocks_per_split;
+    if (end_b > num_k_blocks_total) end_b = num_k_blocks_total;
+
+    float dot = 0.0f;
+
+    for (int b = start_b; b < end_b; b++) {
+        // Block-major layout: (b * N + n) * 20
+        const unsigned char* blk = B_q4 + ((long long)b * N + n) * 20;
+
+        float scale = *((const float*)blk);
+        const unsigned int* packed = (const unsigned int*)(blk + 4);
+        unsigned int val0 = packed[0];
+        unsigned int val1 = packed[1];
+        unsigned int val2 = packed[2];
+        unsigned int val3 = packed[3];
+
+        int k_base = b * 32;
+
+        #define SK_PROCESS(V, off) { \
+            unsigned int _v = V; \
+            for (int i = 0; i < 4; i++) { \
+                unsigned char byte = (_v >> (i * 8)) & 0xFF; \
+                int ki = k_base + (off) + i * 2; \
+                dot += __ldg(&A[ki]) * (float)((byte & 0x0F) - 8) * scale; \
+                dot += __ldg(&A[ki + 1]) * (float)(((byte >> 4) & 0x0F) - 8) * scale; \
+            } \
+        }
+
+        SK_PROCESS(val0, 0);
+        SK_PROCESS(val1, 8);
+        SK_PROCESS(val2, 16);
+        SK_PROCESS(val3, 24);
+
+        #undef SK_PROCESS
+    }
+
+    // Accumulate partial result via atomicAdd
+    atomicAdd(&C[n], dot);
+}
+"#;
+
+/// Split-K M=1 Q4_0 GEMM with block-major weights.
+/// Divides K across multiple block launches for maximum SM occupancy.
+/// Requires C to be zeroed before call (uses atomicAdd for accumulation).
+pub fn gemm_q4_0_m1_splitk(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    a: &GpuTensor<f32>,       // [1, K]
+    b_quant: &GpuTensor<u8>,  // block-major Q4_0 [K, N]
+    c: &mut GpuTensor<f32>,   // [1, N] — MUST be zeroed before call
+    n: u32,
+    k: u32,
+) -> Result<(), DeviceError> {
+    assert!(k % BLOCK_SIZE == 0, "K must be divisible by {BLOCK_SIZE}");
+    let num_k_blocks = k / BLOCK_SIZE;
+
+    // Auto-select split count to maximize SM occupancy
+    // Target: enough blocks to fill 128 SMs
+    let threads = 256u32;
+    let n_blocks = (n + threads - 1) / threads;
+    let target_blocks = 256u32; // 2x the SM count for good occupancy
+    let splits = ((target_blocks + n_blocks - 1) / n_blocks).max(1).min(num_k_blocks);
+    let k_blocks_per_split = (num_k_blocks + splits - 1) / splits;
+
+    let f = cache.get_or_compile(device, GEMM_Q4_0_M1_SPLITK_SRC, "warp_gemm_q4_0_m1_splitk")?;
+
+    // Zero the output (atomicAdd accumulates into it)
+    device.stream.memset_zeros(&mut c.data)
+        .map_err(|e| DeviceError::Memory(format!("memset zeros: {e}")))?;
+
+    let k_i = k as i32;
+    let n_i = n as i32;
+    let num_kb_i = num_k_blocks as i32;
+    let kbps_i = k_blocks_per_split as i32;
+
+    // 2D grid: x = output columns, y = K-splits. ONE launch for all splits!
+    let cfg = LaunchConfig {
+        grid_dim: (n_blocks, splits, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut c.data)
+            .arg(&a.data)
+            .arg(&b_quant.data)
+            .arg(&k_i)
+            .arg(&n_i)
+            .arg(&num_kb_i)
+            .arg(&kbps_i)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
 
 /// M=1 Q4_0 GEMM with block-major weights (coalesced reads).
 pub fn gemm_q4_0_m1_blockmajor(
