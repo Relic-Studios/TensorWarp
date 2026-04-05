@@ -953,11 +953,16 @@ pub fn gemm_q4_0_m1_splitk(
     let num_k_blocks = k / BLOCK_SIZE;
 
     // Auto-select split count to maximize SM occupancy
-    // Target: enough blocks to fill 128 SMs
+    // Only use Split-K when n_blocks alone can't fill the GPU (N < ~32K)
+    // For small models (K < 2048), Skip Split-K entirely (overhead > benefit)
     let threads = 256u32;
     let n_blocks = (n + threads - 1) / threads;
-    let target_blocks = 256u32; // 2x the SM count for good occupancy
-    let splits = ((target_blocks + n_blocks - 1) / n_blocks).max(1).min(num_k_blocks);
+    let splits = if k < 2048 || n_blocks >= 128 {
+        1 // Small K or enough N-blocks already — no split needed
+    } else {
+        let target_blocks = 256u32; // 2x the SM count for good occupancy
+        ((target_blocks + n_blocks - 1) / n_blocks).max(1).min(num_k_blocks)
+    };
     let k_blocks_per_split = (num_k_blocks + splits - 1) / splits;
 
     let f = cache.get_or_compile(device, GEMM_Q4_0_M1_SPLITK_SRC, "warp_gemm_q4_0_m1_splitk")?;
