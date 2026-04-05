@@ -280,6 +280,28 @@ fn load_layer_f16(
         w_gate: loader.load_f16_transposed(&format!("{prefix}.mlp.gate_proj.weight"), device)?,
         w_up: loader.load_f16_transposed(&format!("{prefix}.mlp.up_proj.weight"), device)?,
         w_down: loader.load_f16_transposed(&format!("{prefix}.mlp.down_proj.weight"), device)?,
+        // Pre-compute FP16 biases before moving originals into struct
+        bq_f16: if let Some(ref b) = bq {
+            let mut bf = warp_kernels::tensor::GpuTensor::<half::f16>::zeros(device, b.shape.clone(), warp_ir::DType::F16)
+                .map_err(|e| LoaderError::Device(e.to_string()))?;
+            warp_kernels::fp16::cast_f32_to_f16(&cache, device, b, &mut bf)
+                .map_err(|e| LoaderError::Device(e.to_string()))?;
+            Some(bf)
+        } else { None },
+        bk_f16: if let Some(ref b) = bk {
+            let mut bf = warp_kernels::tensor::GpuTensor::<half::f16>::zeros(device, b.shape.clone(), warp_ir::DType::F16)
+                .map_err(|e| LoaderError::Device(e.to_string()))?;
+            warp_kernels::fp16::cast_f32_to_f16(&cache, device, b, &mut bf)
+                .map_err(|e| LoaderError::Device(e.to_string()))?;
+            Some(bf)
+        } else { None },
+        bv_f16: if let Some(ref b) = bv {
+            let mut bf = warp_kernels::tensor::GpuTensor::<half::f16>::zeros(device, b.shape.clone(), warp_ir::DType::F16)
+                .map_err(|e| LoaderError::Device(e.to_string()))?;
+            warp_kernels::fp16::cast_f32_to_f16(&cache, device, b, &mut bf)
+                .map_err(|e| LoaderError::Device(e.to_string()))?;
+            Some(bf)
+        } else { None },
         bq,
         bk,
         bv,

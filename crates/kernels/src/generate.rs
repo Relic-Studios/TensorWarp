@@ -898,6 +898,7 @@ pub struct LayerDecodeBuffersF16 {
     pub v: GpuTensor<half::f16>,         // [1, kv_dim]
     pub q_rope: GpuTensor<half::f16>,    // [1, H]
     pub k_rope: GpuTensor<half::f16>,    // [1, kv_dim]
+    pub v_biased: GpuTensor<half::f16>,  // [1, kv_dim] — scratch for V bias add
     pub attn_out: GpuTensor<half::f16>,  // [1, H]
     pub attn_proj: GpuTensor<half::f16>, // [1, H]
     pub ffn_normed: GpuTensor<half::f16>,// [1, H]
@@ -941,6 +942,7 @@ impl DecodeBuffersF16 {
                 v: GpuTensor::<half::f16>::zeros(device, sk.clone(), DType::F16)?,
                 q_rope: GpuTensor::<half::f16>::zeros(device, sh.clone(), DType::F16)?,
                 k_rope: GpuTensor::<half::f16>::zeros(device, sk.clone(), DType::F16)?,
+                v_biased: GpuTensor::<half::f16>::zeros(device, sk.clone(), DType::F16)?,
                 attn_out: GpuTensor::<half::f16>::zeros(device, sh.clone(), DType::F16)?,
                 attn_proj: GpuTensor::<half::f16>::zeros(device, sh.clone(), DType::F16)?,
                 ffn_normed: GpuTensor::<half::f16>::zeros(device, sh.clone(), DType::F16)?,
@@ -1629,28 +1631,20 @@ impl GenerationEngineF16 {
                 crate::cublas_gemm::gemm_cublas_f16(device, &lb.normed, &layer.wk, &mut lb.k, bn, kv_dim, h)?;
                 crate::cublas_gemm::gemm_cublas_f16(device, &lb.normed, &layer.wv, &mut lb.v, bn, kv_dim, h)?;
 
-                // 2b. Biases (cast F32→F16 and add — small tensors, negligible cost)
-                // TODO: pre-compute FP16 biases at load time
-                if let Some(ref bq) = layer.bq {
-                    let mut bq_f16 = GpuTensor::<half::f16>::zeros(device, bq.shape.clone(), DType::F16)?;
-                    crate::fp16::cast_f32_to_f16(&self.cache, device, bq, &mut bq_f16)?;
-                    let mut qb = GpuTensor::<half::f16>::zeros(device, lb.q.shape.clone(), DType::F16)?;
-                    crate::fp16::f16_add(&self.cache, device, &lb.q, &bq_f16, &mut qb)?;
-                    lb.q = qb;
+                // 2b. Biases (pre-computed FP16 — zero allocation, one kernel per bias)
+                if let Some(ref bq_f16) = layer.bq_f16 {
+                    // f16_add writes to a separate output — we need a temp buffer
+                    // BUT we can reuse q_rope as temp since it's not written yet
+                    crate::fp16::f16_add(&self.cache, device, &lb.q, bq_f16, &mut lb.q_rope)?;
+                    std::mem::swap(&mut lb.q, &mut lb.q_rope);
                 }
-                if let Some(ref bk) = layer.bk {
-                    let mut bk_f16 = GpuTensor::<half::f16>::zeros(device, bk.shape.clone(), DType::F16)?;
-                    crate::fp16::cast_f32_to_f16(&self.cache, device, bk, &mut bk_f16)?;
-                    let mut kb = GpuTensor::<half::f16>::zeros(device, lb.k.shape.clone(), DType::F16)?;
-                    crate::fp16::f16_add(&self.cache, device, &lb.k, &bk_f16, &mut kb)?;
-                    lb.k = kb;
+                if let Some(ref bk_f16) = layer.bk_f16 {
+                    crate::fp16::f16_add(&self.cache, device, &lb.k, bk_f16, &mut lb.k_rope)?;
+                    std::mem::swap(&mut lb.k, &mut lb.k_rope);
                 }
-                if let Some(ref bv) = layer.bv {
-                    let mut bv_f16 = GpuTensor::<half::f16>::zeros(device, bv.shape.clone(), DType::F16)?;
-                    crate::fp16::cast_f32_to_f16(&self.cache, device, bv, &mut bv_f16)?;
-                    let mut vb = GpuTensor::<half::f16>::zeros(device, lb.v.shape.clone(), DType::F16)?;
-                    crate::fp16::f16_add(&self.cache, device, &lb.v, &bv_f16, &mut vb)?;
-                    lb.v = vb;
+                if let Some(ref bv_f16) = layer.bv_f16 {
+                    crate::fp16::f16_add(&self.cache, device, &lb.v, bv_f16, &mut lb.v_biased)?;
+                    std::mem::swap(&mut lb.v, &mut lb.v_biased);
                 }
 
                 // 3. RoPE (FP16)

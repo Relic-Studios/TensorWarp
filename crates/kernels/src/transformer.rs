@@ -56,6 +56,10 @@ pub struct TransformerBlockWeightsF16 {
     /// Pre-computed FP16 norm weights (avoid per-call casting)
     pub attn_norm_f16: Option<GpuTensor<half::f16>>,
     pub ffn_norm_f16: Option<GpuTensor<half::f16>>,
+    /// Pre-computed FP16 biases (avoid per-call casting)
+    pub bq_f16: Option<GpuTensor<half::f16>>,
+    pub bk_f16: Option<GpuTensor<half::f16>>,
+    pub bv_f16: Option<GpuTensor<half::f16>>,
 }
 
 impl TransformerBlockWeightsF16 {
