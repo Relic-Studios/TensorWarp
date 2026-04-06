@@ -1398,6 +1398,9 @@ pub struct Q4LayerDecodeBuffers {
     pub swiglu: GpuTensor<f32>,
     pub ffn_out: GpuTensor<f32>,
     pub output: GpuTensor<f32>,
+    // Fused projection buffers
+    pub qkv: GpuTensor<f32>,      // [1, H + 2*KV]
+    pub gate_up: GpuTensor<f32>,   // [1, 2*FFN]
 }
 
 /// Pre-allocated tensors for Q4 decode — zero cudaMalloc during generation.
@@ -1450,6 +1453,8 @@ impl Q4DecodeBuffers {
                 swiglu: GpuTensor::zeros(device, sf.clone(), DType::F32)?,
                 ffn_out: GpuTensor::zeros(device, sh.clone(), DType::F32)?,
                 output: GpuTensor::zeros(device, sh.clone(), DType::F32)?,
+                qkv: GpuTensor::zeros(device, Shape::from_static(&[1, h + kv * 2]), DType::F32)?,
+                gate_up: GpuTensor::zeros(device, Shape::from_static(&[1, ffn * 2]), DType::F32)?,
             });
         }
 
@@ -2016,10 +2021,16 @@ impl QuantizedGenerationEngine {
 
                 ops::rmsnorm(&self.cache, device, x, &mw.attn_norm, &mut lb.normed, h, self.config.norm_eps)?;
 
-                // TW-Marlin GEMM for Q, K, V
-                crate::quantize::gemm_tw_marlin_m1(&self.cache, device, &lb.normed, &mw.wq_packed, &mw.wq_scales, &mut lb.q, h, h)?;
-                crate::quantize::gemm_tw_marlin_m1(&self.cache, device, &lb.normed, &mw.wk_packed, &mw.wk_scales, &mut lb.k, kv_dim, h)?;
-                crate::quantize::gemm_tw_marlin_m1(&self.cache, device, &lb.normed, &mw.wv_packed, &mw.wv_scales, &mut lb.v, kv_dim, h)?;
+                // QKV projection — fused (1 GEMM) or separate (3 GEMMs)
+                if let (Some(ref qkv_p), Some(ref qkv_s)) = (&mw.wqkv_packed, &mw.wqkv_scales) {
+                    let qkv_n = h + kv_dim + kv_dim;
+                    crate::quantize::gemm_tw_marlin_m1(&self.cache, device, &lb.normed, qkv_p, qkv_s, &mut lb.qkv, qkv_n, h)?;
+                    ops::split_qkv(&self.cache, device, &lb.qkv, &mut lb.q, &mut lb.k, &mut lb.v, h, kv_dim, 1)?;
+                } else {
+                    crate::quantize::gemm_tw_marlin_m1(&self.cache, device, &lb.normed, &mw.wq_packed, &mw.wq_scales, &mut lb.q, h, h)?;
+                    crate::quantize::gemm_tw_marlin_m1(&self.cache, device, &lb.normed, &mw.wk_packed, &mw.wk_scales, &mut lb.k, kv_dim, h)?;
+                    crate::quantize::gemm_tw_marlin_m1(&self.cache, device, &lb.normed, &mw.wv_packed, &mw.wv_scales, &mut lb.v, kv_dim, h)?;
+                }
 
                 // Fused bias + RoPE + KV append
                 let has_bias = mw.bq.is_some();
@@ -2047,7 +2058,7 @@ impl QuantizedGenerationEngine {
                 ops::fused_residual_rmsnorm(&self.cache, device, &lb.attn_proj, x,
                     &mw.ffn_norm, &mut lb.ffn_normed, &mut lb.residual, h, self.config.norm_eps)?;
 
-                // FFN
+                // FFN gate+up (separate — FFN GEMMs already have good SM occupancy)
                 crate::quantize::gemm_tw_marlin_m1(&self.cache, device, &lb.ffn_normed, &mw.wg_packed, &mw.wg_scales, &mut lb.gate, ffn, h)?;
                 crate::quantize::gemm_tw_marlin_m1(&self.cache, device, &lb.ffn_normed, &mw.wu_packed, &mw.wu_scales, &mut lb.up, ffn, h)?;
                 ops::fused_silu_mul(&self.cache, device, &lb.gate, &lb.up, &mut lb.swiglu)?;

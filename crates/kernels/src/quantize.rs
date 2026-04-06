@@ -946,6 +946,56 @@ pub fn reorder_to_tw_marlin(
     Ok((packed_tensor, scales_tensor))
 }
 
+/// Fuse multiple TW-Marlin weight matrices along the N dimension.
+/// E.g., fuse Q[K,H] + K[K,KV] + V[K,KV] into QKV[K, H+2*KV].
+/// Packed nibbles and scales are concatenated along N for each K-group.
+pub fn fuse_tw_marlin_n(
+    device: &WarpDevice,
+    matrices: &[(&GpuTensor<u8>, &GpuTensor<f32>)], // [(packed, scales), ...]
+    k: u32,
+    ns: &[u32], // N dimension of each matrix
+) -> Result<(GpuTensor<u8>, GpuTensor<f32>), DeviceError> {
+    let num_k_groups = k / BLOCK_SIZE;
+    let total_n: u32 = ns.iter().sum();
+
+    // Read all to host
+    let packed_hosts: Vec<Vec<u8>> = matrices.iter()
+        .map(|(p, _)| p.to_host(device)).collect::<Result<_, _>>()?;
+    let scale_hosts: Vec<Vec<f32>> = matrices.iter()
+        .map(|(_, s)| s.to_host(device)).collect::<Result<_, _>>()?;
+
+    let packed_size = (num_k_groups * total_n * 16) as usize;
+    let scales_size = (num_k_groups * total_n) as usize;
+    let mut fused_packed = vec![0u8; packed_size];
+    let mut fused_scales = vec![0.0f32; scales_size];
+
+    for g in 0..num_k_groups as usize {
+        let mut col_offset = 0usize;
+        for (idx, &n) in ns.iter().enumerate() {
+            let n = n as usize;
+            for c in 0..n {
+                // Packed: src[g * n + c] * 16 → dst[g * total_n + col_offset + c] * 16
+                let src_packed_off = (g * n + c) * 16;
+                let dst_packed_off = (g * total_n as usize + col_offset + c) * 16;
+                fused_packed[dst_packed_off..dst_packed_off + 16]
+                    .copy_from_slice(&packed_hosts[idx][src_packed_off..src_packed_off + 16]);
+
+                // Scales: src[g * n + c] → dst[g * total_n + col_offset + c]
+                fused_scales[g * total_n as usize + col_offset + c] =
+                    scale_hosts[idx][g * n + c];
+            }
+            col_offset += n;
+        }
+    }
+
+    let packed_tensor = GpuTensor::from_host(device, &fused_packed,
+        warp_ir::Shape::from_static(&[packed_size]), warp_ir::DType::U8)?;
+    let scales_tensor = GpuTensor::from_host(device, &fused_scales,
+        warp_ir::Shape::from_static(&[scales_size]), warp_ir::DType::F32)?;
+
+    Ok((packed_tensor, scales_tensor))
+}
+
 /// TW-Marlin format weights for one transformer layer.
 pub struct TWMarlinWeights {
     pub attn_norm: GpuTensor<f32>,
@@ -961,6 +1011,11 @@ pub struct TWMarlinWeights {
     pub bq: Option<GpuTensor<f32>>,
     pub bk: Option<GpuTensor<f32>>,
     pub bv: Option<GpuTensor<f32>>,
+    // Fused projections — 3 GEMMs → 1 (created by fuse_projections)
+    pub wqkv_packed: Option<GpuTensor<u8>>,
+    pub wqkv_scales: Option<GpuTensor<f32>>,
+    pub wgu_packed: Option<GpuTensor<u8>>,  // gate+up fused
+    pub wgu_scales: Option<GpuTensor<f32>>,
 }
 
 impl TWMarlinWeights {
@@ -1006,7 +1061,40 @@ impl TWMarlinWeights {
                 Some(t) => Some(GpuTensor::from_host(device, &t.to_host(device)?, t.shape.clone(), warp_ir::DType::F32)?),
                 None => None,
             },
+            wqkv_packed: None, wqkv_scales: None,
+            wgu_packed: None, wgu_scales: None,
         })
+    }
+
+    /// Fuse QKV and gate+up projections for fewer GEMM launches.
+    /// 3 QKV GEMMs → 1, 2 gate+up GEMMs → 1. Saves 3 kernel launches per layer.
+    pub fn fuse_projections(
+        &mut self,
+        device: &WarpDevice,
+        config: &crate::transformer::TransformerConfig,
+    ) -> Result<(), DeviceError> {
+        let h = config.hidden_size;
+        let kv = config.kv_dim();
+        let ffn = config.ffn_dim;
+
+        // Fuse QKV: [K=H, N=H+KV+KV]
+        let (qkv_p, qkv_s) = fuse_tw_marlin_n(device,
+            &[(&self.wq_packed, &self.wq_scales),
+              (&self.wk_packed, &self.wk_scales),
+              (&self.wv_packed, &self.wv_scales)],
+            h, &[h, kv, kv])?;
+        self.wqkv_packed = Some(qkv_p);
+        self.wqkv_scales = Some(qkv_s);
+
+        // Fuse gate+up: [K=H, N=2*FFN]
+        let (gu_p, gu_s) = fuse_tw_marlin_n(device,
+            &[(&self.wg_packed, &self.wg_scales),
+              (&self.wu_packed, &self.wu_scales)],
+            h, &[ffn, ffn])?;
+        self.wgu_packed = Some(gu_p);
+        self.wgu_scales = Some(gu_s);
+
+        Ok(())
     }
 }
 
