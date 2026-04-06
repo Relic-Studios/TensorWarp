@@ -798,11 +798,21 @@ fn run_safetensors(
         println!("Block-major weight reorder: {:.1}ms", reorder_start.elapsed().as_secs_f64() * 1000.0);
 
         let use_graph = std::env::args().any(|a| a == "--graph");
-        let mode = if use_graph { "CUDA graph" } else { "pre-alloc" };
+        let use_marlin = std::env::args().any(|a| a == "--marlin");
+        let mode = if use_marlin { "TW-Marlin" } else if use_graph { "CUDA graph" } else { "pre-alloc" };
         println!("\nGenerating (max_seq_len={}, Q4_0 quantized, {})...\n", max_seq_len, mode);
         println!("--- output ---");
 
-        let result = if use_graph {
+        let result = if use_marlin {
+            // Convert to TW-Marlin separated format
+            let marlin_start = std::time::Instant::now();
+            let marlin_layers: Vec<_> = engine.layers.iter().map(|l| {
+                warp_kernels::quantize::TWMarlinWeights::from_quantized(&device, l, &engine.config).unwrap()
+            }).collect();
+            device.synchronize().unwrap();
+            println!("TW-Marlin format conversion: {:.1}ms", marlin_start.elapsed().as_secs_f64() * 1000.0);
+            engine.generate_tw_marlin(&device, &prompt_ids, &gen_config, max_seq_len, &marlin_layers)
+        } else if use_graph {
             engine.generate_with_graph(&device, &prompt_ids, &gen_config, max_seq_len)
         } else {
             engine.generate_prealloc(&device, &prompt_ids, &gen_config, max_seq_len)

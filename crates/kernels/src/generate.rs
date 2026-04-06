@@ -1948,6 +1948,136 @@ impl QuantizedGenerationEngine {
             kv_cache_memory_bytes: kv_cache.memory_bytes(),
         })
     }
+
+    /// Generate with TW-Marlin separated format — best bandwidth utilization.
+    /// Converts weights to separated scales + packed nibbles on first call.
+    pub fn generate_tw_marlin(
+        &self,
+        device: &WarpDevice,
+        prompt_ids: &[i32],
+        gen_config: &GenerateConfig,
+        max_seq_len: u32,
+        marlin_layers: &[crate::quantize::TWMarlinWeights],
+    ) -> Result<GenerationResult, DeviceError> {
+        let kv_dim = self.config.kv_dim();
+        let num_layers = self.layers.len() as u32;
+        let vocab = self.vocab_size as usize;
+        let h = self.config.hidden_size;
+        let d = self.config.head_dim;
+        let ffn = self.config.ffn_dim;
+
+        let mut kv_cache = ModelKVCache::new(device, num_layers, max_seq_len, kv_dim)?;
+        let mut buffers = Q4DecodeBuffers::allocate(
+            device, &self.config, self.layers.len(), self.vocab_size,
+        )?;
+
+        // Prefill (uses original Q4 path)
+        let prefill_start = std::time::Instant::now();
+        let logits = self.forward_prefill(device, prompt_ids, &mut kv_cache)?;
+        device.synchronize()?;
+        let prefill_time = prefill_start.elapsed();
+
+        let all_logits = logits.to_host(device)?;
+        let prompt_len = prompt_ids.len();
+        let mut last_logits = all_logits[(prompt_len - 1) * vocab..prompt_len * vocab].to_vec();
+
+        let decode_start = std::time::Instant::now();
+        let mut generated = Vec::new();
+        let mut pos = prompt_len as u32;
+        let base_seed: u64 = prompt_ids.iter().fold(42u64, |acc, &t| {
+            acc.wrapping_mul(6364136223846793005).wrapping_add(t as u64)
+        });
+
+        for step in 0..gen_config.max_tokens {
+            let rng_seed = base_seed.wrapping_add(step as u64);
+            let next_token = sample_token(&last_logits, gen_config, &generated, rng_seed);
+            if let Some(eos) = gen_config.eos_token_id {
+                if next_token == eos { break; }
+            }
+            generated.push(next_token);
+            if !gen_config.stop_sequences.is_empty()
+                && matches_stop_sequence(&generated, &gen_config.stop_sequences)
+            { break; }
+
+            device.htod_copy(&[next_token], &mut buffers.ids.data)?;
+
+            // Decode with TW-Marlin weights
+            sampling::embedding(&self.cache, device, &self.embed_tokens, &buffers.ids,
+                &mut buffers.hidden, 1, h)?;
+
+            for (i, mw) in marlin_layers.iter().enumerate() {
+                let x_ptr: *const GpuTensor<f32> = if i == 0 {
+                    &buffers.hidden as *const _
+                } else {
+                    &buffers.layers[i - 1].output as *const _
+                };
+                let x: &GpuTensor<f32> = unsafe { &*x_ptr };
+                let lb = &mut buffers.layers[i];
+
+                ops::rmsnorm(&self.cache, device, x, &mw.attn_norm, &mut lb.normed, h, self.config.norm_eps)?;
+
+                // TW-Marlin GEMM for Q, K, V
+                crate::quantize::gemm_tw_marlin_m1(&self.cache, device, &lb.normed, &mw.wq_packed, &mw.wq_scales, &mut lb.q, h, h)?;
+                crate::quantize::gemm_tw_marlin_m1(&self.cache, device, &lb.normed, &mw.wk_packed, &mw.wk_scales, &mut lb.k, kv_dim, h)?;
+                crate::quantize::gemm_tw_marlin_m1(&self.cache, device, &lb.normed, &mw.wv_packed, &mw.wv_scales, &mut lb.v, kv_dim, h)?;
+
+                // Fused bias + RoPE + KV append
+                let has_bias = mw.bq.is_some();
+                let bq_ref = if has_bias { mw.bq.as_ref().unwrap() } else { &lb.q };
+                let bk_ref = if has_bias { mw.bk.as_ref().unwrap() } else { &lb.k };
+                let bv_ref = if has_bias { mw.bv.as_ref().unwrap() } else { &lb.v };
+                {
+                    let kv_layer = &mut kv_cache.layers[i];
+                    ops::fused_bias_rope_append(&self.cache, device,
+                        &lb.q, &lb.k, &lb.v, &mut lb.q_rope, &mut lb.k_rope,
+                        bq_ref, bk_ref, bv_ref,
+                        &mut kv_layer.k, &mut kv_layer.v,
+                        self.config.num_heads, self.config.num_kv_heads, d,
+                        kv_dim, pos, kv_layer.max_seq_len, self.config.rope_base, has_bias)?;
+                    kv_layer.len = pos + 1;
+
+                    crate::kv_cache::decode_attention_flash(&self.cache, device,
+                        &lb.q_rope, kv_layer, &mut lb.attn_out,
+                        self.config.num_heads, self.config.num_kv_heads, d)?;
+                }
+
+                // Output projection
+                crate::quantize::gemm_tw_marlin_m1(&self.cache, device, &lb.attn_out, &mw.wo_packed, &mw.wo_scales, &mut lb.attn_proj, h, h)?;
+
+                ops::fused_residual_rmsnorm(&self.cache, device, &lb.attn_proj, x,
+                    &mw.ffn_norm, &mut lb.ffn_normed, &mut lb.residual, h, self.config.norm_eps)?;
+
+                // FFN
+                crate::quantize::gemm_tw_marlin_m1(&self.cache, device, &lb.ffn_normed, &mw.wg_packed, &mw.wg_scales, &mut lb.gate, ffn, h)?;
+                crate::quantize::gemm_tw_marlin_m1(&self.cache, device, &lb.ffn_normed, &mw.wu_packed, &mw.wu_scales, &mut lb.up, ffn, h)?;
+                ops::fused_silu_mul(&self.cache, device, &lb.gate, &lb.up, &mut lb.swiglu)?;
+                crate::quantize::gemm_tw_marlin_m1(&self.cache, device, &lb.swiglu, &mw.wd_packed, &mw.wd_scales, &mut lb.ffn_out, h, ffn)?;
+
+                ops::add(&self.cache, device, &lb.residual, &lb.ffn_out, &mut lb.output)?;
+            }
+
+            // LM head
+            let last = marlin_layers.len() - 1;
+            ops::rmsnorm(&self.cache, device, &buffers.layers[last].output,
+                &self.final_norm, &mut buffers.normed, h, self.config.norm_eps)?;
+            ops::gemm(&self.cache, device, &buffers.normed, &self.lm_head,
+                &mut buffers.logits, 1, self.vocab_size, h)?;
+
+            device.synchronize()?;
+            last_logits = buffers.logits.to_host(device)?;
+            pos += 1;
+        }
+
+        let decode_time = decode_start.elapsed();
+        Ok(GenerationResult {
+            tokens: generated.clone(), prefill_time, decode_time,
+            tokens_generated: generated.len(), prefill_tokens: prompt_len,
+            tokens_per_sec: if decode_time.as_secs_f64() > 0.0 {
+                generated.len() as f64 / decode_time.as_secs_f64()
+            } else { 0.0 },
+            kv_cache_memory_bytes: kv_cache.memory_bytes(),
+        })
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════

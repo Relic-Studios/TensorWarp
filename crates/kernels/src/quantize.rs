@@ -880,12 +880,251 @@ extern "C" __global__ void warp_gemm_q4_0_m1_v3(
 // With auto-selected splits: KV proj goes from 2% to 50%+ SM util,
 // attention Q/O from 11% to 88%, FFN from 58% to 100%.
 
-// ── Software-Pipelined Split-K Q4 GEMM ─────────────────────────
+// ═══════════════════════════════════════════════════════════════
+// TW-Marlin Format: Separated Scales + Packed Nibbles
+// ═══════════════════════════════════════════════════════════════
 //
-// Pre-loads the NEXT K-block's data into registers while processing
-// the current one. The GPU's memory subsystem can issue the next
-// global loads while the ALU processes the current data, hiding
-// memory latency through instruction-level parallelism.
+// Q4_0 stores [scale(4B) + nibbles(16B)] interleaved = 20-byte blocks.
+// This 20-byte stride means warp reads waste cache line bandwidth.
+//
+// TW-Marlin separates them:
+//   packed[num_k_groups][N][16] — contiguous nibbles, uint4-aligned
+//   scales[num_k_groups][N]    — contiguous f32 scales
+//
+// Warp of 32 threads reads:
+//   32 × 16B packed = 512B = 4 cache lines (100% utilized)
+//   32 × 4B scales  = 128B = 1 cache line  (100% utilized)
+//   Total: 5 cache lines, 640B useful / 640B fetched = 100% efficiency
+//
+// vs Q4_0 block-major: 20-byte stride, ~85% efficiency
+
+/// Reorder Q4_0 column-block weights into TW-Marlin separated format.
+/// Returns (packed_nibbles, scales) as separate GPU tensors.
+pub fn reorder_to_tw_marlin(
+    device: &WarpDevice,
+    col_major_q4: &GpuTensor<u8>,
+    k: u32,
+    n: u32,
+) -> Result<(GpuTensor<u8>, GpuTensor<f32>), DeviceError> {
+    let num_k_groups = k / BLOCK_SIZE;
+    let src = col_major_q4.to_host(device)?;
+
+    // Packed nibbles: [num_k_groups][N][16]
+    let packed_size = (num_k_groups * n * 16) as usize;
+    let mut packed = vec![0u8; packed_size];
+
+    // Scales: [num_k_groups][N]
+    let scales_size = (num_k_groups * n) as usize;
+    let mut scales = vec![0.0f32; scales_size];
+
+    for col in 0..n as usize {
+        for g in 0..num_k_groups as usize {
+            // Source: column-major Q4_0 block at (col * num_k_groups + g) * 20
+            let src_offset = (col * num_k_groups as usize + g) * Q4_0_BLOCK_BYTES as usize;
+
+            // Read scale (f32, 4 bytes)
+            let scale = f32::from_le_bytes([
+                src[src_offset], src[src_offset + 1],
+                src[src_offset + 2], src[src_offset + 3],
+            ]);
+
+            // Destination indices
+            let scale_idx = g * n as usize + col;
+            let packed_offset = (g * n as usize + col) * 16;
+
+            scales[scale_idx] = scale;
+            packed[packed_offset..packed_offset + 16]
+                .copy_from_slice(&src[src_offset + 4..src_offset + 20]);
+        }
+    }
+
+    let packed_tensor = GpuTensor::from_host(device, &packed,
+        warp_ir::Shape::from_static(&[packed_size]), warp_ir::DType::U8)?;
+    let scales_tensor = GpuTensor::from_host(device, &scales,
+        warp_ir::Shape::from_static(&[scales_size]), warp_ir::DType::F32)?;
+
+    Ok((packed_tensor, scales_tensor))
+}
+
+/// TW-Marlin format weights for one transformer layer.
+pub struct TWMarlinWeights {
+    pub attn_norm: GpuTensor<f32>,
+    pub ffn_norm: GpuTensor<f32>,
+    // Separated packed nibbles + scales for each projection
+    pub wq_packed: GpuTensor<u8>,  pub wq_scales: GpuTensor<f32>,
+    pub wk_packed: GpuTensor<u8>,  pub wk_scales: GpuTensor<f32>,
+    pub wv_packed: GpuTensor<u8>,  pub wv_scales: GpuTensor<f32>,
+    pub wo_packed: GpuTensor<u8>,  pub wo_scales: GpuTensor<f32>,
+    pub wg_packed: GpuTensor<u8>,  pub wg_scales: GpuTensor<f32>,
+    pub wu_packed: GpuTensor<u8>,  pub wu_scales: GpuTensor<f32>,
+    pub wd_packed: GpuTensor<u8>,  pub wd_scales: GpuTensor<f32>,
+    pub bq: Option<GpuTensor<f32>>,
+    pub bk: Option<GpuTensor<f32>>,
+    pub bv: Option<GpuTensor<f32>>,
+}
+
+impl TWMarlinWeights {
+    /// Convert from QuantizedBlockWeights to TW-Marlin separated format.
+    pub fn from_quantized(
+        device: &WarpDevice,
+        q: &crate::transformer::QuantizedBlockWeights,
+        config: &crate::transformer::TransformerConfig,
+    ) -> Result<Self, DeviceError> {
+        let h = config.hidden_size;
+        let kv = config.kv_dim();
+        let ffn = config.ffn_dim;
+
+        let (wq_p, wq_s) = reorder_to_tw_marlin(device, &q.wq, h, h)?;
+        let (wk_p, wk_s) = reorder_to_tw_marlin(device, &q.wk, h, kv)?;
+        let (wv_p, wv_s) = reorder_to_tw_marlin(device, &q.wv, h, kv)?;
+        let (wo_p, wo_s) = reorder_to_tw_marlin(device, &q.wo, h, h)?;
+        let (wg_p, wg_s) = reorder_to_tw_marlin(device, &q.w_gate, h, ffn)?;
+        let (wu_p, wu_s) = reorder_to_tw_marlin(device, &q.w_up, h, ffn)?;
+        let (wd_p, wd_s) = reorder_to_tw_marlin(device, &q.w_down, ffn, h)?;
+
+        Ok(Self {
+            attn_norm: GpuTensor::from_host(device, &q.attn_norm.to_host(device)?,
+                q.attn_norm.shape.clone(), warp_ir::DType::F32)?,
+            ffn_norm: GpuTensor::from_host(device, &q.ffn_norm.to_host(device)?,
+                q.ffn_norm.shape.clone(), warp_ir::DType::F32)?,
+            wq_packed: wq_p, wq_scales: wq_s,
+            wk_packed: wk_p, wk_scales: wk_s,
+            wv_packed: wv_p, wv_scales: wv_s,
+            wo_packed: wo_p, wo_scales: wo_s,
+            wg_packed: wg_p, wg_scales: wg_s,
+            wu_packed: wu_p, wu_scales: wu_s,
+            wd_packed: wd_p, wd_scales: wd_s,
+            bq: match &q.bq {
+                Some(t) => Some(GpuTensor::from_host(device, &t.to_host(device)?, t.shape.clone(), warp_ir::DType::F32)?),
+                None => None,
+            },
+            bk: match &q.bk {
+                Some(t) => Some(GpuTensor::from_host(device, &t.to_host(device)?, t.shape.clone(), warp_ir::DType::F32)?),
+                None => None,
+            },
+            bv: match &q.bv {
+                Some(t) => Some(GpuTensor::from_host(device, &t.to_host(device)?, t.shape.clone(), warp_ir::DType::F32)?),
+                None => None,
+            },
+        })
+    }
+}
+
+/// TW-Marlin Split-K M=1 GEMM kernel with separated scales + packed nibbles.
+/// uint4 loads for packed data (16B aligned), f32 loads for scales.
+const GEMM_TW_MARLIN_M1_SRC: &str = r#"
+extern "C" __global__ void warp_gemm_tw_marlin_m1(
+    float* __restrict__ C,
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ packed,  // [num_k_groups, N, 16]
+    const float* __restrict__ scales,          // [num_k_groups, N]
+    int K,
+    int N,
+    int num_k_groups,
+    int k_blocks_per_split
+) {
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= N) return;
+
+    int k_split_id = blockIdx.y;
+    int start_g = k_split_id * k_blocks_per_split;
+    int end_g = start_g + k_blocks_per_split;
+    if (end_g > num_k_groups) end_g = num_k_groups;
+
+    float dot = 0.0f;
+
+    for (int g = start_g; g < end_g; g++) {
+        // Load scale — adjacent threads read adjacent floats (coalesced!)
+        float scale = scales[g * N + n];
+
+        // Load 16 packed bytes via uint4 (128-bit aligned load!)
+        // packed layout: [g][n][16 bytes]
+        const unsigned char* my_packed = packed + ((long long)g * N + n) * 16;
+        const unsigned int* p = (const unsigned int*)my_packed;
+        unsigned int v0 = p[0], v1 = p[1], v2 = p[2], v3 = p[3];
+
+        int k_base = g * 32;
+
+        #define TW_PROC(V, off) { \
+            unsigned int _v = V; \
+            for (int i = 0; i < 4; i++) { \
+                unsigned char byte = (_v >> (i * 8)) & 0xFF; \
+                int ki = k_base + (off) + i * 2; \
+                dot += __ldg(&A[ki]) * (float)((byte & 0x0F) - 8) * scale; \
+                dot += __ldg(&A[ki + 1]) * (float)(((byte >> 4) & 0x0F) - 8) * scale; \
+            } \
+        }
+
+        TW_PROC(v0, 0);
+        TW_PROC(v1, 8);
+        TW_PROC(v2, 16);
+        TW_PROC(v3, 24);
+
+        #undef TW_PROC
+    }
+
+    atomicAdd(&C[n], dot);
+}
+"#;
+
+/// TW-Marlin M=1 GEMM with separated format.
+pub fn gemm_tw_marlin_m1(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    a: &GpuTensor<f32>,
+    packed: &GpuTensor<u8>,
+    scales: &GpuTensor<f32>,
+    c: &mut GpuTensor<f32>,
+    n: u32,
+    k: u32,
+) -> Result<(), DeviceError> {
+    assert!(k % BLOCK_SIZE == 0);
+    let num_k_groups = k / BLOCK_SIZE;
+
+    let threads = 256u32;
+    let n_blocks = (n + threads - 1) / threads;
+
+    // Adaptive Split-K
+    let splits = if k < 2048 || n_blocks >= 128 {
+        1
+    } else {
+        let target = 256u32;
+        let max_splits = (num_k_groups / 8).max(1);
+        ((target + n_blocks - 1) / n_blocks).max(1).min(max_splits)
+    };
+    let k_blocks_per_split = (num_k_groups + splits - 1) / splits;
+
+    let f = cache.get_or_compile(device, GEMM_TW_MARLIN_M1_SRC, "warp_gemm_tw_marlin_m1")?;
+
+    // Zero output for atomicAdd
+    device.stream.memset_zeros(&mut c.data)
+        .map_err(|e| DeviceError::Memory(format!("memset zeros: {e}")))?;
+
+    let k_i = k as i32;
+    let n_i = n as i32;
+    let nkg_i = num_k_groups as i32;
+    let kbps_i = k_blocks_per_split as i32;
+
+    let cfg = LaunchConfig {
+        grid_dim: (n_blocks, splits, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut c.data)
+            .arg(&a.data)
+            .arg(&packed.data)
+            .arg(&scales.data)
+            .arg(&k_i)
+            .arg(&n_i)
+            .arg(&nkg_i)
+            .arg(&kbps_i)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
 
 const GEMM_Q4_0_M1_SPLITK_SRC: &str = r#"
 extern "C" __global__ void warp_gemm_q4_0_m1_splitk(
