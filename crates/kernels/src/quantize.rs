@@ -880,6 +880,13 @@ extern "C" __global__ void warp_gemm_q4_0_m1_v3(
 // With auto-selected splits: KV proj goes from 2% to 50%+ SM util,
 // attention Q/O from 11% to 88%, FFN from 58% to 100%.
 
+// ── Software-Pipelined Split-K Q4 GEMM ─────────────────────────
+//
+// Pre-loads the NEXT K-block's data into registers while processing
+// the current one. The GPU's memory subsystem can issue the next
+// global loads while the ALU processes the current data, hiding
+// memory latency through instruction-level parallelism.
+
 const GEMM_Q4_0_M1_SPLITK_SRC: &str = r#"
 extern "C" __global__ void warp_gemm_q4_0_m1_splitk(
     float* __restrict__ C,
