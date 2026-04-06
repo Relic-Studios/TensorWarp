@@ -952,16 +952,18 @@ pub fn gemm_q4_0_m1_splitk(
     assert!(k % BLOCK_SIZE == 0, "K must be divisible by {BLOCK_SIZE}");
     let num_k_blocks = k / BLOCK_SIZE;
 
-    // Auto-select split count to maximize SM occupancy
-    // Only use Split-K when n_blocks alone can't fill the GPU (N < ~32K)
-    // For small models (K < 2048), Skip Split-K entirely (overhead > benefit)
+    // Auto-select split count to maximize SM occupancy.
+    // Only use Split-K when n_blocks alone can't fill the GPU.
+    // Cap splits to ensure each split processes at least 8 K-blocks
+    // (fewer than that = atomicAdd overhead dominates).
     let threads = 256u32;
     let n_blocks = (n + threads - 1) / threads;
     let splits = if k < 2048 || n_blocks >= 128 {
         1 // Small K or enough N-blocks already — no split needed
     } else {
-        let target_blocks = 256u32; // 2x the SM count for good occupancy
-        ((target_blocks + n_blocks - 1) / n_blocks).max(1).min(num_k_blocks)
+        let target_blocks = 256u32; // 2x SM count
+        let max_splits = (num_k_blocks / 8).max(1); // at least 8 K-blocks per split
+        ((target_blocks + n_blocks - 1) / n_blocks).max(1).min(max_splits)
     };
     let k_blocks_per_split = (num_k_blocks + splits - 1) / splits;
 
