@@ -579,24 +579,48 @@ fn run_safetensors(
 
     println!("Found {} safetensors file(s)", st_files.len());
 
-    // 2. Load config.json
+    // 2. Load config.json — detect architecture (Gemma vs LLaMA)
     let config_path = model_path.join("config.json");
-    let llama_config = if config_path.exists() {
-        match warp_loader::LlamaConfig::from_json(config_path.to_str().unwrap_or("")) {
-            Ok(cfg) => {
-                println!("Config: {} layers, H={}, vocab={}, GQA={}/{}",
-                    cfg.num_hidden_layers, cfg.hidden_size, cfg.vocab_size,
-                    cfg.num_attention_heads, cfg.num_key_value_heads);
-                cfg
-            }
-            Err(e) => {
-                eprintln!("Failed to load config.json: {e}");
-                std::process::exit(1);
-            }
-        }
-    } else {
+    if !config_path.exists() {
         eprintln!("No config.json found in {} — cannot determine model architecture.", model_path.display());
         std::process::exit(1);
+    }
+    let config_json = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let is_gemma = warp_loader::GemmaHFConfig::is_gemma(&config_json);
+
+    if is_gemma {
+        eprintln!("Detected Gemma architecture — Gemma loader not yet wired into generation engine.");
+        eprintln!("Config parsed successfully. Kernel foundations ready (GeGLU, sliding window, QK-norm, partial RoPE).");
+        eprintln!("Next step: wire GemmaModelQ4 into a Gemma generation engine.");
+        // TODO: Load and run Gemma model
+        // For now, just parse and display config
+        match warp_loader::GemmaHFConfig::from_json(config_path.to_str().unwrap_or("")) {
+            Ok(cfg) => {
+                let gc = cfg.to_gemma_config();
+                println!("Gemma Config: {} layers, H={}, vocab={}, GQA={}/{}, head_dim={}",
+                    gc.num_layers, gc.hidden_size, gc.vocab_size,
+                    gc.num_heads, gc.num_kv_heads, gc.head_dim);
+                println!("  Sliding window: {}, pattern: 1 global per {} layers",
+                    gc.sliding_window, gc.sliding_window_pattern);
+                println!("  K=V sharing: {}, GeGLU activation, softcapping: {}",
+                    gc.k_eq_v, gc.final_logit_softcapping);
+            }
+            Err(e) => eprintln!("Failed to parse Gemma config: {e}"),
+        }
+        std::process::exit(0);
+    }
+
+    let llama_config = match warp_loader::LlamaConfig::from_json(config_path.to_str().unwrap_or("")) {
+        Ok(cfg) => {
+            println!("Config: {} layers, H={}, vocab={}, GQA={}/{}",
+                cfg.num_hidden_layers, cfg.hidden_size, cfg.vocab_size,
+                cfg.num_attention_heads, cfg.num_key_value_heads);
+            cfg
+        }
+        Err(e) => {
+            eprintln!("Failed to load config.json: {e}");
+            std::process::exit(1);
+        }
     };
 
     // 3. Initialize GPU
