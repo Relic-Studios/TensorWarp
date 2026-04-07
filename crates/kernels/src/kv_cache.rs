@@ -84,6 +84,9 @@ pub struct LayerKVCache {
     pub max_seq_len: u32,
     /// KV dimension
     pub kv_dim: u32,
+    /// When true, K and V share the same projection (Gemma 4 attention_k_eq_v).
+    /// During append, the same projected values are written to both K and V caches.
+    pub k_eq_v: bool,
 }
 
 impl LayerKVCache {
@@ -91,7 +94,16 @@ impl LayerKVCache {
         let shape = Shape::from_static(&[max_seq_len as usize, kv_dim as usize]);
         let k = GpuTensor::<f32>::zeros(device, shape.clone(), DType::F32)?;
         let v = GpuTensor::<f32>::zeros(device, shape, DType::F32)?;
-        Ok(Self { k, v, len: 0, max_seq_len, kv_dim })
+        Ok(Self { k, v, len: 0, max_seq_len, kv_dim, k_eq_v: false })
+    }
+
+    /// Create with shared K=V mode (Gemma 4). Both buffers allocated,
+    /// but the fused_bias_rope_append writes K data to both K and V.
+    pub fn new_shared_kv(device: &WarpDevice, max_seq_len: u32, kv_dim: u32) -> Result<Self, DeviceError> {
+        let shape = Shape::from_static(&[max_seq_len as usize, kv_dim as usize]);
+        let k = GpuTensor::<f32>::zeros(device, shape.clone(), DType::F32)?;
+        let v = GpuTensor::<f32>::zeros(device, shape, DType::F32)?;
+        Ok(Self { k, v, len: 0, max_seq_len, kv_dim, k_eq_v: true })
     }
 
     /// Bulk-write K and V from a prefill pass.

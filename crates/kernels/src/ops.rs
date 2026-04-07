@@ -975,6 +975,46 @@ pub fn fused_gelu_mul(
     Ok(())
 }
 
+/// Logit softcapping: out = cap * tanh(x / cap).
+/// Used by Gemma 2/4 to bound logit magnitudes before softmax.
+/// cap=0.0 means disabled (no-op copy).
+const LOGIT_SOFTCAP_SRC: &str = r#"
+extern "C" __global__ void warp_logit_softcap(
+    float *out, const float *x, float cap, size_t n
+) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = cap * tanhf(x[i] / cap);
+    }
+}
+"#;
+
+/// Apply logit softcapping: out = cap * tanh(x / cap).
+/// No-op if cap <= 0.0.
+pub fn logit_softcap(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    x: &GpuTensor<f32>,
+    out: &mut GpuTensor<f32>,
+    cap: f32,
+) -> Result<(), DeviceError> {
+    if cap <= 0.0 {
+        // No-op — just copy
+        let data = device.dtoh(&x.data)?;
+        *out = GpuTensor::from_host(device, &data, x.shape.clone(), warp_ir::DType::F32)?;
+        return Ok(());
+    }
+    let f = cache.get_or_compile(device, LOGIT_SOFTCAP_SRC, "warp_logit_softcap")?;
+    let n = x.numel;
+    let cfg = LaunchConfig::for_num_elems(n as u32);
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut out.data).arg(&x.data).arg(&cap).arg(&n)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
 // ── Fused QKV projection ─────────────────────────────────────
 // Computes Q, K, V in a single GEMM by concatenating weight matrices:
 // [normed] × [Wq | Wk | Wv] → [Q | K | V]

@@ -229,6 +229,117 @@ impl TransformerConfig {
     }
 }
 
+// ── Gemma 4 Architecture Config ─────────────────────────────────
+//
+// Gemma 4 has per-layer variation: sliding vs global attention,
+// dual RoPE frequencies, different head_dim per layer type,
+// shared K=V projections, and GeGLU activation.
+
+/// Per-layer attention configuration for Gemma-family models.
+#[derive(Debug, Clone)]
+pub struct GemmaLayerAttentionConfig {
+    /// Whether this layer uses sliding window or full (global) attention.
+    pub is_global: bool,
+    /// Sliding window size (only used when is_global=false). 0 = full attention.
+    pub window_size: u32,
+    /// Head dimension for this layer's attention.
+    /// Sliding layers use head_dim (e.g. 256), global layers use global_head_dim (e.g. 512).
+    pub head_dim: u32,
+    /// Number of KV heads for this layer.
+    /// Sliding layers use num_kv_heads (e.g. 16), global layers use num_global_kv_heads (e.g. 4).
+    pub num_kv_heads: u32,
+    /// RoPE theta for this layer.
+    /// Sliding: 10000.0 (standard). Global: 1000000.0.
+    pub rope_theta: f32,
+    /// Fraction of head dimensions to rotate with RoPE.
+    /// 1.0 = full rotation (sliding). 0.25 = partial (global).
+    pub partial_rotary_factor: f32,
+}
+
+/// Model-level config for Gemma 4 architecture.
+#[derive(Debug, Clone)]
+pub struct GemmaConfig {
+    pub hidden_size: u32,
+    pub num_heads: u32,
+    pub num_kv_heads: u32,           // sliding layers
+    pub num_global_kv_heads: u32,    // global layers
+    pub head_dim: u32,               // sliding layers (e.g. 256)
+    pub global_head_dim: u32,        // global layers (e.g. 512)
+    pub ffn_dim: u32,
+    pub vocab_size: u32,
+    pub num_layers: u32,
+    pub norm_eps: f32,
+    pub sliding_window: u32,         // e.g. 1024
+    pub sliding_window_pattern: u32, // e.g. 6 (every 6th layer is global)
+    pub rope_theta: f32,             // sliding RoPE base (10000.0)
+    pub rope_theta_global: f32,      // global RoPE base (1000000.0)
+    pub partial_rotary_factor: f32,  // global layers (0.25)
+    pub k_eq_v: bool,                // shared K=V projections
+    pub final_logit_softcapping: f32, // 30.0 (0.0 = disabled)
+    pub tie_word_embeddings: bool,
+}
+
+impl GemmaConfig {
+    /// Generate per-layer attention configs based on the sliding/global pattern.
+    pub fn layer_configs(&self) -> Vec<GemmaLayerAttentionConfig> {
+        (0..self.num_layers).map(|i| {
+            // Pattern: every sliding_window_pattern-th layer is global
+            // e.g. pattern=6: layers 5, 11, 17, 23, ... are global
+            let is_global = self.sliding_window_pattern > 0
+                && ((i + 1) % self.sliding_window_pattern == 0);
+
+            if is_global {
+                GemmaLayerAttentionConfig {
+                    is_global: true,
+                    window_size: 0,
+                    head_dim: self.global_head_dim,
+                    num_kv_heads: self.num_global_kv_heads,
+                    rope_theta: self.rope_theta_global,
+                    partial_rotary_factor: self.partial_rotary_factor,
+                }
+            } else {
+                GemmaLayerAttentionConfig {
+                    is_global: false,
+                    window_size: self.sliding_window,
+                    head_dim: self.head_dim,
+                    num_kv_heads: self.num_kv_heads,
+                    rope_theta: self.rope_theta,
+                    partial_rotary_factor: 1.0, // full rotation for sliding
+                }
+            }
+        }).collect()
+    }
+
+    /// KV dim for a specific layer (depends on layer type).
+    pub fn kv_dim_for_layer(&self, layer_config: &GemmaLayerAttentionConfig) -> u32 {
+        layer_config.num_kv_heads * layer_config.head_dim
+    }
+
+    /// Gemma 4 31B default config.
+    pub fn gemma4_31b() -> Self {
+        Self {
+            hidden_size: 5376,
+            num_heads: 32,
+            num_kv_heads: 16,
+            num_global_kv_heads: 4,
+            head_dim: 256,
+            global_head_dim: 512,
+            ffn_dim: 21504,
+            vocab_size: 262144,
+            num_layers: 60,
+            norm_eps: 1e-6,
+            sliding_window: 1024,
+            sliding_window_pattern: 6,
+            rope_theta: 10000.0,
+            rope_theta_global: 1000000.0,
+            partial_rotary_factor: 0.25,
+            k_eq_v: true,
+            final_logit_softcapping: 30.0,
+            tie_word_embeddings: true,
+        }
+    }
+}
+
 /// Q4_0 quantized weights for a single transformer block.
 ///
 /// Norm weights stay f32 (tiny, not worth quantizing).
