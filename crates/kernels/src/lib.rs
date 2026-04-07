@@ -38,6 +38,7 @@ pub mod gather;
 pub mod gemm;
 pub mod gemm_small;
 pub mod generate;
+pub mod gemma_generate;
 pub mod mem_pool;
 pub mod missing_ops;
 pub mod multi_gpu;

@@ -59,13 +59,13 @@ impl Default for GenerateConfig {
 }
 
 /// Check if generated tokens end with any stop sequence.
-fn matches_stop_sequence(generated: &[i32], stop: &[Vec<i32>]) -> bool {
+pub fn matches_stop_sequence(generated: &[i32], stop: &[Vec<i32>]) -> bool {
     stop.iter().any(|seq| !seq.is_empty() && generated.ends_with(seq))
 }
 
 /// Sample a token from logits using the full sampling pipeline:
 /// repetition penalty -> temperature -> top-K -> top-P -> greedy/multinomial.
-fn sample_token(logits: &[f32], config: &GenerateConfig, generated: &[i32], rng_seed: u64) -> i32 {
+pub fn sample_token(logits: &[f32], config: &GenerateConfig, generated: &[i32], rng_seed: u64) -> i32 {
     let mut logits = logits.to_vec();
 
     // 1. Repetition penalty — reduce probability of tokens already generated.
