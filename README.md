@@ -1,217 +1,196 @@
-# TensorWarp 🌀
+# TensorWarp
 
-**A from-scratch GPU inference engine in Rust + CUDA.**
+GPU inference engine written in Rust and CUDA. Compiles and runs ONNX models on NVIDIA GPUs with JIT kernel compilation, automatic operator fusion, and quantized inference.
 
-> *"We don't use TensorRT. We are the TensorRT."*
-> — us, at 3am, probably wrong but vibing
+## Requirements
 
-TensorWarp JIT-compiles CUDA kernels via NVRTC, fuses operations automatically, and runs real models through a modular ONNX pipeline. It's not finished. It's not always faster than the big frameworks. But it's ours, it's open source, and every line was written from zero.
+- Rust 1.75+
+- CUDA Toolkit 12.x
+- NVIDIA GPU (RTX 30/40 series tested)
+- Windows or Linux
 
-```
-┌─────────────────────────────────────────────────────┐
-│  "How hard can GPU inference be?"                   │
-│                                                     │
-│  The GPU inference:                                 │
-│  ┌───────────────────────────────────────────────┐  │
-│  │ ONNX Model                                    │  │
-│  │   ↓ parse protobuf by hand (no codegen)       │  │
-│  │ IR Graph (130+ ops, SSA, arena-allocated)      │  │
-│  │   ↓ pattern fusion + autofuse + DCE            │  │
-│  │ Optimized Graph                                │  │
-│  │   ↓ JIT compile CUDA C → PTX → cubin           │  │
-│  │ GPU Kernels (cached to disk, 99.9% hit rate)   │  │
-│  │   ↓ CUDA graph capture (single launch)         │  │
-│  │ Tokens go brr                                  │  │
-│  └───────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────┘
+## Build
+
+```bash
+cargo build --release
+cargo test -p warp-kernels    # 184 tests
 ```
 
-## What Actually Works (no cap)
+## Usage
 
-### ✅ LLM Inference — Real, Measured, Reproducible
-```
-Model          Config                         tok/sec    GPU
-─────────────  ─────────────────────────────  ─────────  ────────
-Qwen 7B Q4     --q4 --marlin --graph --greedy  67-71     RTX 4090
-Qwen 0.5B Q4   --q4                            115       RTX 4090
-```
+### Run an ONNX model
 
-Is that faster than TensorRT? **No.** TRT would probably do 100-130+ on the same model. But we wrote every kernel from scratch in ~6 weeks and we're at 55-60% of theoretical bandwidth. We're not done.
+```bash
+# Inspect model ops and compatibility
+cargo run --release -- onnx model.onnx
 
-### ✅ ONNX Model Execution — CNN Verified Correct
-```
-Model          Nodes   Params    Result
-─────────────  ──────  ────────  ──────────────────────────────
-SqueezeNet     66      1.2M      ✅ Exact match with ONNX Runtime
-Tiny Transformer 62    ~80K      ✅ Runs end-to-end (output shape bug in Slice)
+# Run inference with dummy inputs
+cargo run --release -- pipeline model.onnx
 ```
 
-These run through the **modular ONNX interpreter path** — not hard-coded model support. If the ops have kernels, the model runs. No per-model engineering needed.
+The ONNX pipeline loads the model, compiles it through the optimization passes, uploads weights to GPU, and executes. Any ONNX model whose ops are supported will run without model-specific code.
 
-### ✅ Kernel Performance
+### Run LLM inference
+
+```bash
+# Download a model (Qwen, LLaMA, Mistral — any LLaMA-family)
+# Then run with quantization + CUDA graph acceleration:
+
+cargo run --release -p tensorwarp -- run <model_path> \
+  --q4 --marlin --graph --greedy --max-tokens 64
+
+# Other flags:
+#   --prompt "Your prompt"     Custom prompt
+#   --temperature 0.7          Sampling temperature
+#   --top-k 50                 Top-K filtering
+#   --top-p 0.9                Nucleus sampling
+#   --max-tokens 128           Max tokens to generate
+#   --chat                     Chat mode
+#   --system "..."             System prompt
+#   --profile                  Per-operation timing breakdown
 ```
-FP16 Tensor Core GEMM:     155 TFLOPS (97% of cuBLAS)
-Elementwise auto-fusion:   6.43x speedup (3 kernels → 1)
-Q4 weight compression:     6.4x smaller, 3.5x faster than F32
-CUDA graph decode:         +16% vs eager (single GPU launch per step)
+
+### Other commands
+
+```bash
+cargo run --release -- info       # GPU device info
+cargo run --release -- bench      # GEMM and fusion benchmarks
+cargo run --release -- generate   # Test generation with tiny model
+cargo run --release -- compile model.onnx   # Compile without running
 ```
 
-### 🚧 What's In Progress
-- More ONNX model coverage (ResNet, MobileNet, ViT next)
-- Transformer Slice/indexing correctness
-- Cross-attention (unlocks Whisper, Stable Diffusion)
-- Sliding window attention (unlocks Gemma 4)
-- Pushing toward 100 tok/sec on 7B
+## Performance
 
-### ❌ What Doesn't Work Yet
-- Stable Diffusion / SDXL (need cross-attention + ConvTranspose2D validation)
-- Whisper (need encoder-decoder architecture)
-- Multi-GPU (infrastructure exists, NCCL needs Linux)
-- Metal backend (codegen exists, never tested on real hardware)
+Measured on RTX 4090, April 2026.
+
+| Model | Config | Decode speed |
+|-------|--------|-------------|
+| Qwen 7B (Q4) | `--q4 --marlin --graph --greedy` | 67-71 tok/sec |
+| Qwen 0.5B (Q4) | `--q4` | 115 tok/sec |
+
+| Kernel | Result |
+|--------|--------|
+| FP16 Tensor Core GEMM | 155 TFLOPS (97% of cuBLAS) |
+| Auto-fused elementwise chain | 6.43x speedup over separate launches |
+| Q4 weight compression | 6.4x smaller, 3.5x faster than F32 |
+| CUDA graph decode | +16% vs eager execution |
+
+### ONNX model correctness
+
+| Model | Type | Nodes | Result |
+|-------|------|-------|--------|
+| SqueezeNet 1.0 | CNN | 66 | Exact match with ONNX Runtime |
+| Tiny Transformer | Attention+FFN | 62 | Runs end-to-end, Slice indexing bug in progress |
 
 ## Architecture
 
 ```
-ONNX / SafeTensors / GGUF
-        │
-        ▼
-   ┌─────────┐     ┌───────────┐
-   │ warp-ir  │────▶│ optimizer  │  O1: pattern fusion (MatMul+Bias+Act)
-   │ 130+ ops │     │           │  O2: autofuse (arbitrary elementwise chains)
-   │ SSA graph│     │           │  DCE, const fold
-   └─────────┘     └─────┬─────┘
-                         │
-                    ┌────▼──────┐
-                    │ warp-     │  160+ CUDA kernels
-                    │ kernels   │  NVRTC JIT compilation
-                    │           │  Disk-cached (< 10ms reload)
-                    └─────┬─────┘
-                          │
-                 ┌────────┴────────┐
-                 │                 │
-          ┌──────▼──────┐  ┌──────▼──────┐
-          │ ONNX interp │  │ LLM decode  │
-          │ (any model) │  │ (optimized) │
-          │ walk graph,  │  │ CUDA graph, │
-          │ dispatch ops │  │ KV cache,   │
-          └─────────────┘  │ TW-Marlin   │
-                           └─────────────┘
+Input (ONNX / SafeTensors / GGUF)
+  |
+  v
+warp-loader         Parse model, extract weights and graph
+  |
+  v
+warp-ir             Intermediate representation (130+ ops, SSA graph)
+  |
+  v
+warp-optimizer      Fusion passes:
+                      O1: MatMul+Bias+Activation, Residual+RMSNorm
+                      O2: AutoFuse arbitrary elementwise chains
+                      Dead code elimination, constant folding
+  |
+  v
+warp-kernels        160+ CUDA kernels, JIT compiled via NVRTC
+                    Cached to disk (99.9% hit rate, <10ms reload)
+  |
+  +---> ONNX Interpreter    Graph walker, dispatches per-op to GPU.
+  |                          Model-agnostic. Works for any supported model.
+  |
+  +---> LLM Decode Engine   Optimized autoregressive path.
+                             CUDA graph capture, KV cache, pre-allocated
+                             buffers, TW-Marlin Q4 quantization.
 ```
 
-Two execution paths:
-- **ONNX Interpreter**: Model-agnostic. Walks the graph, dispatches ops to GPU kernels. Works for CNNs, transformers, anything with supported ops.
-- **LLM Decode Engine**: Hand-optimized for autoregressive generation. CUDA graphs, pre-allocated buffers, TW-Marlin Q4 format, fused kernels.
+Both paths use the same kernel library. The ONNX interpreter handles arbitrary models. The LLM engine adds decode-specific optimizations (CUDA graphs, KV cache management, quantized GEMM).
 
-Both use the same underlying kernel library.
+## Crates
 
-## Quick Start
+| Crate | Purpose |
+|-------|---------|
+| `warp-ir` | Graph IR with 130+ operation types, shape inference, SSA form |
+| `warp-optimizer` | Pattern fusion, autofuse, constant folding, dead code elimination |
+| `warp-kernels` | CUDA kernels: GEMM (F32/FP16/Q4/Q8), attention, convolution, normalization, quantization, generation engine |
+| `warp-loader` | ONNX protobuf parser, ONNX executor, SafeTensors/GGUF loaders, HuggingFace model loader, tokenizer |
+| `warp-codegen` | PTX and Metal code generation |
+| `warp-runtime` | Runtime types and scheduling |
+| `warp-cli` | Command-line interface |
+| `warp-python` | PyO3 Python bindings |
+| `warp-server` | OpenAI-compatible HTTP server |
 
-```bash
-# Build (requires Rust 1.75+, CUDA 12.x, NVIDIA GPU)
-cargo build --release
+## Supported ONNX operations
 
-# GPU info
-cargo run --release -- info
+**Compute:** MatMul, Gemm, Conv (1D/2D/3D), ConvTranspose, DepthwiseConv
 
-# Run an ONNX model
-cargo run --release -- pipeline model.onnx
+**Normalization:** RMSNorm, LayerNorm, BatchNorm, GroupNorm, InstanceNorm
 
-# Inspect ONNX model ops
-cargo run --release -- onnx model.onnx
+**Activation:** ReLU, GELU, SiLU, Sigmoid, Tanh, LeakyReLU, Clip, Softmax
 
-# Run LLM inference (Qwen/LLaMA from HuggingFace)
-cargo run --release -p tensorwarp -- run <model_path> --q4 --marlin --graph --greedy --max-tokens 64
+**Pooling:** MaxPool (1D/2D), AvgPool, GlobalAveragePool
 
-# Benchmarks
-cargo run --release -- bench
+**Elementwise:** Add, Sub, Mul, Div, Pow, Sqrt, Abs, Neg, Exp, Log, Sin, Cos, Ceil, Floor
 
-# Tests (184 passing)
-cargo test -p warp-kernels
+**Reduction:** ReduceMean, ReduceSum, ReduceMax
+
+**Shape:** Reshape, Transpose, Concat, Slice, Gather, Split, Flatten, Squeeze, Unsqueeze, Expand, Pad
+
+**Other:** Softmax, ArgMax, TopK, Dropout, Identity, Constant, Shape, Cast, Resize, NonMaxSuppression
+
+**Quantization:** Q4_0, Q8_0, W4A16 GEMM, W8A16 GEMM, TW-Marlin format
+
+**Fused (created by optimizer):** MatMul+Bias, MatMul+Bias+Activation, Residual+RMSNorm, SiLU*Mul (SwiGLU), AutoFused elementwise chains
+
+## LLM-specific features
+
+**KV Cache:** GPU-resident per-layer cache with bulk prefill and fused K+V append.
+
+**TW-Marlin Q4:** Custom quantized weight format with separated packed nibbles and FP16 scales. Adaptive Split-K, fused QKV projections (3 GEMMs into 1), fused gate+up projections (2 GEMMs into 1).
+
+**CUDA Graphs:** Full transformer decode step captured as a single GPU command. Device-side position and cache length buffers allow graph replay without re-recording.
+
+**Sampling:** Greedy (argmax), temperature scaling, top-K, top-P (nucleus), repetition penalty, stop sequences.
+
+## Current limitations
+
+- LLM support is limited to LLaMA-family architectures (Qwen, LLaMA, Mistral)
+- No cross-attention (blocks Whisper, Stable Diffusion)
+- No sliding window attention (blocks Gemma 4)
+- Multi-GPU requires Linux + NCCL
+- Metal backend has codegen but is untested on hardware
+- ONNX Slice op has an indexing bug affecting some transformer exports
+
+## Programmatic usage
+
+```rust
+use warp_kernels::device::WarpDevice;
+use warp_kernels::tensor::GpuTensor;
+use warp_ir::{DType, Shape};
+
+// Initialize GPU
+let device = WarpDevice::new(0)?;
+
+// Load and run ONNX model
+use warp_loader::{OnnxModel, OnnxExecutor};
+let model = OnnxModel::load("model.onnx")?;
+let exec = OnnxExecutor::new(&device, &model)?;
+let outputs = exec.run(&device, &[("input", &input_tensor)])?;
+
+// Or use the full pipeline (load + optimize + execute)
+use warp_loader::InferencePipeline;
+let pipe = InferencePipeline::load("model.onnx", 0,
+    warp_optimizer::OptimizationLevel::O2)?;
+let results = pipe.infer(&[("input", data_vec, shape_vec)])?;
 ```
-
-## Crate Structure
-
-| Crate | What it does | Lines |
-|-------|-------------|-------|
-| `warp-ir` | SSA graph IR, 130+ ops, shapes, dtypes | ~2K |
-| `warp-optimizer` | Pattern fusion, autofuse, constfold, DCE | ~1.5K |
-| `warp-kernels` | 160+ CUDA kernels, GEMM, attention, quantization, generation | ~33K |
-| `warp-loader` | ONNX parser + executor, SafeTensors, GGUF, LLaMA loader, tokenizer | ~7K |
-| `warp-cli` | CLI: info, bench, generate, run, onnx, compile, pipeline, profile | ~1K |
-
-**Total: ~45K lines of Rust, 160+ CUDA kernels, 184 tests, 9 crates**
-
-## Key Technical Details
-
-### TW-Marlin Q4 Format
-Custom quantized weight layout for M=1 decode GEMMs:
-- Separated packed nibbles + FP16 scales (halved scale bandwidth)
-- Adaptive Split-K for SM occupancy on small N
-- Fused QKV projections (3 GEMMs → 1 GEMM + split)
-- Fused gate+up projections (2 GEMMs → 1 GEMM + split)
-- Factored scale multiply (1 FMUL per group instead of 32)
-
-### CUDA Graph Acceleration
-Entire transformer decode captured as a single GPU command:
-- 28 layers × ~10 ops = ~280 kernel launches → 1 graph replay
-- Device-side pos/cache_len buffers (no re-record per step)
-- Patched vendored cudarc for graph capture safety
-
-### AutoFuse Engine
-Discovers and fuses arbitrary elementwise chains at compile time:
-```
-Before: Add → GELU → Mul → Sigmoid  (4 kernel launches, 4 memory passes)
-After:  warp_autofused_0              (1 kernel launch, 1 memory pass)
-```
-Walks IR graph topologically, finds maximal single-user chains, generates per-chain CUDA kernels via NVRTC.
-
-### LLM Decode Profiling (7B Q4, RTX 4090)
-```
-Component                    Time/step    % of total
-─────────────────────────    ─────────    ──────────
-Graph replay (28 layers)     8-10 ms      ~65%
-LM head (cuBLAS F32)         2.5 ms       ~20%
-Logits readback (608 KB)     0.13 ms       ~1%
-CPU sampling (greedy)         0.1 ms       ~1%
-```
-Bottleneck is GPU compute at ~42% of theoretical bandwidth. Time is spread evenly across operations — no single kernel dominates.
-
-## What We Learned
-
-Things that worked:
-- Pre-allocated decode buffers → 5x speedup (biggest single win)
-- cuBLAS for LM head → 87% bandwidth utilization
-- CUDA graph capture → 16% speedup
-- Adaptive Split-K → 71% speedup on 7B Q4
-
-Things that didn't work:
-- Q4 LM head (stride-16 access kills coalescing vs cuBLAS F32)
-- GPU argmax (sync overhead > CPU argmax time — CPU work is hidden behind GPU)
-- cp.async double-buffer for M=1 (L1 cache already optimal)
-- Self-speculative decode (25% acceptance without fine-tuning)
-
-## Roadmap
-
-**Now:**
-- [ ] Fix ONNX Slice/indexing for transformer correctness
-- [ ] Test more models (ResNet, MobileNet, ViT)
-- [ ] Cross-attention kernel (unlocks Whisper + diffusion)
-- [ ] Sliding window attention (unlocks Gemma 4)
-
-**Soon:**
-- [ ] FP16 LM head (halve the 2.5ms bottleneck)
-- [ ] ONNX compiled graph path (IR → fused → CUDA graph)
-- [ ] Non-causal attention mode
-
-**Later:**
-- [ ] Tensor parallelism (multi-GPU, NCCL)
-- [ ] Persistent kernel (fuse all non-GEMM ops between GEMMs)
-- [ ] Metal backend (codegen exists, needs Apple hardware)
 
 ## License
 
 MIT OR Apache-2.0
-
----
-
-*Built from scratch by [Relic Studios](https://github.com/Relic-Studios). Not affiliated with NVIDIA. TensorRT is NVIDIA's trademark — we just respect the hustle.*
