@@ -15,7 +15,22 @@ use warp_kernels::transformer::{
 
 use crate::safetensors_loader::{ShardedSafeTensorsLoader, LoaderError};
 
-/// HuggingFace config.json for Gemma 4 / Gemma 3.
+/// Top-level HuggingFace config.json wrapper.
+/// Gemma 4 nests model config under `text_config`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GemmaHFConfigWrapper {
+    #[serde(default)]
+    pub text_config: Option<GemmaHFConfig>,
+    // Top-level fields (Gemma 3 puts them here, Gemma 4 nests them)
+    #[serde(default)]
+    pub hidden_size: Option<u32>,
+    #[serde(default)]
+    pub tie_word_embeddings: bool,
+    #[serde(default)]
+    pub model_type: Option<String>,
+}
+
+/// HuggingFace config.json for Gemma 4 / Gemma 3 text model.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GemmaHFConfig {
     pub hidden_size: u32,
@@ -52,6 +67,10 @@ pub struct GemmaHFConfig {
     pub hidden_activation: Option<String>,
     #[serde(default)]
     pub max_position_embeddings: Option<u32>,
+    /// Explicit per-layer attention types (Gemma 4).
+    /// Values: "sliding_attention" or "full_attention"
+    #[serde(default)]
+    pub layer_types: Vec<String>,
 }
 
 fn default_head_dim() -> u32 { 256 }
@@ -62,9 +81,23 @@ fn default_sliding_window_pattern() -> u32 { 6 }
 
 impl GemmaHFConfig {
     /// Load from a config.json file.
+    /// Handles both Gemma 4 (nested under `text_config`) and Gemma 3 (top-level) formats.
     pub fn from_json(path: &str) -> Result<Self, LoaderError> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| LoaderError::Io(e.to_string()))?;
+
+        // Try parsing as wrapper first (Gemma 4 with nested text_config)
+        if let Ok(wrapper) = serde_json::from_str::<GemmaHFConfigWrapper>(&content) {
+            if let Some(mut tc) = wrapper.text_config {
+                // Inherit tie_word_embeddings from top level if not set in text_config
+                if !tc.tie_word_embeddings && wrapper.tie_word_embeddings {
+                    tc.tie_word_embeddings = wrapper.tie_word_embeddings;
+                }
+                return Ok(tc);
+            }
+        }
+
+        // Fall back to direct parse (Gemma 3 style, top-level fields)
         serde_json::from_str(&content)
             .map_err(|e| LoaderError::Config(e.to_string()))
     }
@@ -73,10 +106,19 @@ impl GemmaHFConfig {
     pub fn to_gemma_config(&self) -> GemmaConfig {
         let global_head_dim = self.global_head_dim.unwrap_or(self.head_dim);
         let num_global_kv_heads = self.num_global_key_value_heads.unwrap_or(self.num_key_value_heads);
-        // Gemma 4 uses rope_theta for global, rope_local_base_freq for sliding
-        // Gemma 3 uses rope_theta for global, rope_local_base_freq for sliding
         let rope_theta_sliding = self.rope_local_base_freq.unwrap_or(10000.0) as f32;
         let rope_theta_global = self.rope_theta as f32;
+
+        // Derive sliding_window_pattern from layer_types if available
+        let pattern = if !self.layer_types.is_empty() {
+            // Count consecutive sliding layers before first global
+            let first_global = self.layer_types.iter()
+                .position(|t| t == "full_attention")
+                .unwrap_or(self.layer_types.len());
+            (first_global + 1) as u32
+        } else {
+            self.sliding_window_pattern
+        };
 
         GemmaConfig {
             hidden_size: self.hidden_size,
@@ -90,7 +132,7 @@ impl GemmaHFConfig {
             num_layers: self.num_hidden_layers,
             norm_eps: self.rms_norm_eps as f32,
             sliding_window: self.sliding_window,
-            sliding_window_pattern: self.sliding_window_pattern,
+            sliding_window_pattern: pattern,
             rope_theta: rope_theta_sliding,
             rope_theta_global,
             partial_rotary_factor: self.partial_rotary_factor.unwrap_or(1.0),
