@@ -85,6 +85,7 @@ pub enum OnnxAttr {
     String(String),
     Ints(Vec<i64>),
     Floats(Vec<f32>),
+    Tensor(OnnxTensor),
 }
 
 /// An ONNX graph node (operation).
@@ -1004,6 +1005,7 @@ fn parse_attribute(data: &[u8]) -> Result<(String, OnnxAttr), OnnxError> {
     let mut s_val = Vec::new();
     let mut floats = Vec::new();
     let mut ints = Vec::new();
+    let mut tensor_val: Option<OnnxTensor> = None;
 
     let mut buf = data;
     while !buf.is_empty() {
@@ -1020,6 +1022,13 @@ fn parse_attribute(data: &[u8]) -> Result<(String, OnnxAttr), OnnxError> {
             (4, WireType::LengthDelimited) => { // string (s field)
                 let d = pb_bytes(&mut buf)?;
                 s_val = d.to_vec();
+            }
+            // field 5: TensorProto t (for Constant ops)
+            (5, WireType::LengthDelimited) => {
+                let d = pb_bytes(&mut buf)?;
+                if let Ok(t) = parse_tensor_proto(d) {
+                    tensor_val = Some(t);
+                }
             }
             (7, WireType::LengthDelimited) => { // packed floats
                 let d = pb_bytes(&mut buf)?;
@@ -1046,6 +1055,7 @@ fn parse_attribute(data: &[u8]) -> Result<(String, OnnxAttr), OnnxError> {
         1 => OnnxAttr::Float(f_val),
         2 => OnnxAttr::Int(i_val),
         3 => OnnxAttr::String(String::from_utf8_lossy(&s_val).to_string()),
+        4 => tensor_val.map(OnnxAttr::Tensor).unwrap_or(OnnxAttr::Int(0)),
         6 => OnnxAttr::Floats(floats),
         7 => OnnxAttr::Ints(ints),
         _ => OnnxAttr::Int(i_val),
@@ -1132,8 +1142,11 @@ fn parse_tensor_proto(data: &[u8]) -> Result<OnnxTensor, OnnxError> {
             // field 8: name (string)
             (8, WireType::LengthDelimited) => { name = pb_string(&mut buf)?; }
 
-            // field 13: raw_data (bytes)
-            (13, WireType::LengthDelimited) => { raw_data = pb_bytes(&mut buf)?.to_vec(); }
+            // field 9: raw_data (bytes) — NOT field 13! Verified from onnx.proto3
+            (9, WireType::LengthDelimited) => { raw_data = pb_bytes(&mut buf)?.to_vec(); }
+
+            // field 12: doc_string (string)
+            (12, WireType::LengthDelimited) => { let _ = pb_string(&mut buf)?; }
 
             // field 14: external_data (repeated StringStringEntryProto)
             (14, WireType::LengthDelimited) => {

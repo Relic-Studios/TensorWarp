@@ -136,6 +136,65 @@ impl LayerKVCache {
         Ok(())
     }
 
+    /// Bulk-write K and V at a specific offset (for speculative decode verification).
+    /// Writes `seq_len` entries starting at `offset`.
+    pub fn prefill_at_offset(
+        &mut self,
+        kernel_cache: &KernelCache,
+        device: &WarpDevice,
+        k_all: &GpuTensor<f32>,  // [seq_len, kv_dim]
+        v_all: &GpuTensor<f32>,  // [seq_len, kv_dim]
+        seq_len: u32,
+        offset: u32,
+    ) -> Result<(), DeviceError> {
+        // Reuse the prefill kernel but write to an offset in the cache
+        // We need a kernel that copies with offset: cache[offset*dim + idx] = src[idx]
+        let src = r#"
+extern "C" __global__ void warp_kv_cache_prefill_offset(
+    float *cache, const float *src,
+    unsigned int seq_len, unsigned int dim,
+    unsigned int max_seq, unsigned int offset
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = seq_len * dim;
+    if (idx >= total) return;
+    unsigned int pos = offset + idx / dim;
+    unsigned int d = idx % dim;
+    if (pos >= max_seq) return;
+    cache[pos * dim + d] = src[idx];
+}
+"#;
+        let f = kernel_cache.get_or_compile(device, src, "warp_kv_cache_prefill_offset")?;
+        let total = seq_len * self.kv_dim;
+        let cfg = LaunchConfig::for_num_elems(total);
+
+        unsafe {
+            device.stream.launch_builder(&f)
+                .arg(&mut self.k.data)
+                .arg(&k_all.data)
+                .arg(&seq_len)
+                .arg(&self.kv_dim)
+                .arg(&self.max_seq_len)
+                .arg(&offset)
+                .launch(cfg)
+                .map_err(|e: cudarc::driver::result::DriverError| DeviceError::Launch(e.to_string()))?;
+        }
+        unsafe {
+            device.stream.launch_builder(&f)
+                .arg(&mut self.v.data)
+                .arg(&v_all.data)
+                .arg(&seq_len)
+                .arg(&self.kv_dim)
+                .arg(&self.max_seq_len)
+                .arg(&offset)
+                .launch(cfg)
+                .map_err(|e: cudarc::driver::result::DriverError| DeviceError::Launch(e.to_string()))?;
+        }
+
+        self.len = offset + seq_len;
+        Ok(())
+    }
+
     /// Append K and V vectors for one new token position.
     /// Uses a fused kernel to write both K and V in a single launch.
     pub fn append(
@@ -807,6 +866,213 @@ pub fn decode_attention_flash(
 }
 
 // ═══════════════════════════════════════════════════════════════
+// FlashDecoding Device-Len Variant (CUDA graph compatible)
+// ═══════════════════════════════════════════════════════════════
+//
+// Same as FlashDecoding but reads cache_len from a device pointer.
+// Launches max_chunks blocks regardless of actual cache_len — unused
+// chunks produce zero-weight output (block_sum_exp = 0) which the
+// reduction kernel safely skips.
+
+/// FlashDecoding chunk kernel — device-len variant for CUDA graph capture.
+const FLASH_DECODE_CHUNK_DEVICE_LEN_SRC: &str = r#"
+extern "C" __global__ void warp_flash_decode_chunk_dl(
+    float *partial_O,
+    float *partial_m,
+    float *partial_L,
+    const float *Q,
+    const float *K_cache,
+    const float *V_cache,
+    const unsigned int *cache_len_buf,  // device pointer to cache_len
+    unsigned int num_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    unsigned int max_chunks,
+    unsigned int chunk_size,
+    float scale
+) {
+    unsigned int chunk_idx = blockIdx.x;
+    unsigned int q_head = blockIdx.y;
+    unsigned int tid = threadIdx.x;
+
+    if (q_head >= num_heads) return;
+
+    unsigned int cache_len = cache_len_buf[0];
+    unsigned int n_rep = num_heads / num_kv_heads;
+    unsigned int kv_head = q_head / n_rep;
+    unsigned int kv_dim = num_kv_heads * head_dim;
+
+    unsigned int chunk_start = chunk_idx * chunk_size;
+    unsigned int chunk_end = chunk_start + chunk_size;
+    if (chunk_end > cache_len) chunk_end = cache_len;
+
+    // Empty chunk — write sentinel values so reduction skips it
+    if (chunk_start >= cache_len) {
+        unsigned int out_base = q_head * max_chunks;
+        if (tid < head_dim) {
+            partial_O[(q_head * max_chunks + chunk_idx) * head_dim + tid] = 0.0f;
+        }
+        if (tid == 0) {
+            partial_m[out_base + chunk_idx] = -1e30f;
+            partial_L[out_base + chunk_idx] = 0.0f;
+        }
+        return;
+    }
+    unsigned int chunk_len = chunk_end - chunk_start;
+
+    extern __shared__ float smem[];
+    float *smem_Q = smem;
+    float *smem_scores = smem + head_dim;
+    float *smem_O = smem + head_dim + chunk_size;
+
+    if (tid < head_dim) {
+        smem_Q[tid] = Q[q_head * head_dim + tid];
+        smem_O[tid] = 0.0f;
+    }
+    __syncthreads();
+
+    float local_max = -1e30f;
+    for (unsigned int i = tid; i < chunk_len; i += blockDim.x) {
+        unsigned int pos = chunk_start + i;
+        float dot = 0.0f;
+        for (unsigned int dd = 0; dd < head_dim; dd++) {
+            dot += smem_Q[dd] * K_cache[pos * kv_dim + kv_head * head_dim + dd];
+        }
+        dot *= scale;
+        smem_scores[i] = dot;
+        local_max = fmaxf(local_max, dot);
+    }
+
+    __shared__ float smem_reduce[256];
+    smem_reduce[tid] = local_max;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s /= 2) {
+        if (tid < (unsigned int)s) smem_reduce[tid] = fmaxf(smem_reduce[tid], smem_reduce[tid + s]);
+        __syncthreads();
+    }
+    float block_max = smem_reduce[0];
+
+    float local_sum_exp = 0.0f;
+    for (unsigned int i = tid; i < chunk_len; i += blockDim.x) {
+        float e = expf(smem_scores[i] - block_max);
+        smem_scores[i] = e;
+        local_sum_exp += e;
+    }
+
+    smem_reduce[tid] = local_sum_exp;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s /= 2) {
+        if (tid < (unsigned int)s) smem_reduce[tid] += smem_reduce[tid + s];
+        __syncthreads();
+    }
+    float block_sum_exp = smem_reduce[0];
+    __syncthreads();
+
+    for (unsigned int i = 0; i < chunk_len; i++) {
+        float w = smem_scores[i];
+        if (w > 0.0f) {
+            for (unsigned int dd = tid; dd < head_dim; dd += blockDim.x) {
+                smem_O[dd] += w * V_cache[(chunk_start + i) * kv_dim + kv_head * head_dim + dd];
+            }
+        }
+    }
+    __syncthreads();
+
+    unsigned int out_base = q_head * max_chunks;
+    if (tid < head_dim) {
+        partial_O[(q_head * max_chunks + chunk_idx) * head_dim + tid] = smem_O[tid];
+    }
+    if (tid == 0) {
+        partial_m[out_base + chunk_idx] = block_max;
+        partial_L[out_base + chunk_idx] = block_sum_exp;
+    }
+}
+"#;
+
+/// FlashDecoding with device-len for CUDA graph capture.
+/// Launches max_chunks blocks (based on max_seq_len) so grid dims are constant.
+pub fn decode_attention_flash_device_len(
+    kernel_cache: &KernelCache,
+    device: &WarpDevice,
+    q: &GpuTensor<f32>,
+    kv: &LayerKVCache,
+    out: &mut GpuTensor<f32>,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    cache_len_buf: &cudarc::driver::CudaSlice<u32>,
+) -> Result<(), DeviceError> {
+    let chunk_size = FLASH_DECODE_CHUNK_SIZE;
+    // Always use max_seq_len for grid dims (constant for graph capture)
+    let max_chunks = (kv.max_seq_len + chunk_size - 1) / chunk_size;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    // Allocate partial buffers for max capacity
+    let mut partial_o = GpuTensor::<f32>::zeros(device,
+        Shape::from_static(&[num_heads as usize, max_chunks as usize, head_dim as usize]),
+        DType::F32)?;
+    let mut partial_m = GpuTensor::<f32>::zeros(device,
+        Shape::from_static(&[(num_heads * max_chunks) as usize]),
+        DType::F32)?;
+    let mut partial_l = GpuTensor::<f32>::zeros(device,
+        Shape::from_static(&[(num_heads * max_chunks) as usize]),
+        DType::F32)?;
+
+    // Kernel 1: Per-chunk attention (device-len)
+    let f_chunk = kernel_cache.get_or_compile(device, FLASH_DECODE_CHUNK_DEVICE_LEN_SRC, "warp_flash_decode_chunk_dl")?;
+    let smem_bytes = ((head_dim + chunk_size + head_dim) * 4) as u32;
+    let threads_per_block = 256u32.min(chunk_size);
+
+    let cfg_chunk = LaunchConfig {
+        grid_dim: (max_chunks, num_heads, 1),
+        block_dim: (threads_per_block, 1, 1),
+        shared_mem_bytes: smem_bytes,
+    };
+
+    unsafe {
+        device.stream.launch_builder(&f_chunk)
+            .arg(&mut partial_o.data)
+            .arg(&mut partial_m.data)
+            .arg(&mut partial_l.data)
+            .arg(&q.data)
+            .arg(&kv.k.data)
+            .arg(&kv.v.data)
+            .arg(cache_len_buf)
+            .arg(&num_heads)
+            .arg(&num_kv_heads)
+            .arg(&head_dim)
+            .arg(&max_chunks)
+            .arg(&chunk_size)
+            .arg(&scale)
+            .launch(cfg_chunk)
+            .map_err(|e: cudarc::driver::result::DriverError| DeviceError::Launch(e.to_string()))?;
+    }
+
+    // Kernel 2: Reduction (reuses existing kernel — handles L=0 chunks gracefully)
+    let f_reduce = kernel_cache.get_or_compile(device, FLASH_DECODE_REDUCE_SRC, "warp_flash_decode_reduce")?;
+    let cfg_reduce = LaunchConfig {
+        grid_dim: (num_heads, 1, 1),
+        block_dim: (head_dim, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        device.stream.launch_builder(&f_reduce)
+            .arg(&mut out.data)
+            .arg(&partial_o.data)
+            .arg(&partial_m.data)
+            .arg(&partial_l.data)
+            .arg(&num_heads)
+            .arg(&max_chunks)
+            .arg(&head_dim)
+            .launch(cfg_reduce)
+            .map_err(|e: cudarc::driver::result::DriverError| DeviceError::Launch(e.to_string()))?;
+    }
+
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════
 // FP16 KV Cache — halves memory bandwidth for attention
 // ═══════════════════════════════════════════════════════════════
 
@@ -1445,4 +1711,144 @@ mod tests {
         assert!(orig.iter().all(|v| v.is_finite()), "Original has NaN/Inf");
         assert!(flash.iter().all(|v| v.is_finite()), "FlashDecoding has NaN/Inf");
     }
+}
+
+// ═════════════════════════════════════════════════════════════════
+// Continuation Attention (for speculative decode verification)
+// ═════════════════════════════════════════════════════════════════
+//
+// N query tokens attend to the full KV cache (pre-existing + new entries)
+// with causal masking. Each query q_i at absolute position (offset + i)
+// can attend to KV positions [0, offset + i].
+//
+// Used for: speculative decode verification, chunked prefill.
+
+/// Continuation attention: N queries against KV cache with causal masking.
+/// Q: [num_q_tokens, num_heads * head_dim]
+/// K/V cache: [max_seq, kv_dim] (already populated up to total_len = offset + num_q)
+/// Output: [num_q_tokens, num_heads * head_dim]
+///
+/// Each query at relative position i has absolute position (offset + i)
+/// and can attend to all KV positions j where j <= offset + i.
+const CONTINUATION_ATTENTION_SRC: &str = r#"
+extern "C" __global__ void warp_continuation_attention(
+    float *out,                 // [num_q * num_heads * head_dim]
+    const float *Q,             // [num_q * num_heads * head_dim]
+    const float *K_cache,       // [max_seq * kv_dim]
+    const float *V_cache,       // [max_seq * kv_dim]
+    unsigned int num_q,         // number of query tokens
+    unsigned int num_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    unsigned int kv_dim,
+    unsigned int offset,        // absolute position of first query token
+    unsigned int total_len      // offset + num_q = total KV positions to attend to
+) {
+    // Grid: (num_q, num_heads, 1). Each block handles one query position + one head.
+    unsigned int q_idx = blockIdx.x;   // which query token (0..num_q-1)
+    unsigned int q_head = blockIdx.y;  // which attention head
+    unsigned int tid = threadIdx.x;
+
+    if (q_idx >= num_q || q_head >= num_heads) return;
+
+    unsigned int kv_head = q_head / (num_heads / num_kv_heads);  // GQA mapping
+    unsigned int abs_pos = offset + q_idx;  // absolute position of this query
+    unsigned int attend_len = abs_pos + 1;  // attend to positions [0, abs_pos]
+    if (attend_len > total_len) attend_len = total_len;
+
+    float scale = 1.0f / sqrtf((float)head_dim);
+
+    // Load query vector for this head into registers
+    float q_val = 0.0f;
+    if (tid < head_dim) {
+        q_val = Q[q_idx * num_heads * head_dim + q_head * head_dim + tid];
+    }
+
+    // Compute attention scores and weighted sum in a single pass (online softmax)
+    float max_score = -1e30f;
+    float sum_exp = 0.0f;
+    float acc = 0.0f;  // weighted V accumulator for this dimension
+
+    for (unsigned int pos = 0; pos < attend_len; pos++) {
+        // Compute dot product Q · K[pos] for this head
+        float dot = 0.0f;
+        for (unsigned int dd = 0; dd < head_dim; dd++) {
+            float q_d = Q[q_idx * num_heads * head_dim + q_head * head_dim + dd];
+            float k_d = K_cache[pos * kv_dim + kv_head * head_dim + dd];
+            dot += q_d * k_d;
+        }
+        dot *= scale;
+
+        // Online softmax update
+        if (dot > max_score) {
+            float correction = expf(max_score - dot);
+            acc = acc * correction;
+            sum_exp = sum_exp * correction;
+            max_score = dot;
+        }
+        float weight = expf(dot - max_score);
+        sum_exp += weight;
+
+        // Accumulate weighted V for this thread's dimension
+        if (tid < head_dim) {
+            acc += weight * V_cache[pos * kv_dim + kv_head * head_dim + tid];
+        }
+    }
+
+    // Normalize and write output
+    if (tid < head_dim && sum_exp > 0.0f) {
+        out[q_idx * num_heads * head_dim + q_head * head_dim + tid] = acc / sum_exp;
+    }
+}
+"#;
+
+/// Run continuation attention: N queries against KV cache with causal masking.
+/// Used for speculative decode verification and chunked prefill.
+///
+/// q: [num_q, num_heads * head_dim] — query vectors for new tokens
+/// kv: KV cache layer (must already contain entries up to offset + num_q)
+/// out: [num_q, num_heads * head_dim] — output
+/// offset: absolute position of the first query token
+pub fn continuation_attention(
+    kernel_cache: &KernelCache,
+    device: &WarpDevice,
+    q: &GpuTensor<f32>,
+    kv: &LayerKVCache,
+    out: &mut GpuTensor<f32>,
+    num_q: u32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    offset: u32,
+) -> Result<(), DeviceError> {
+    let total_len = offset + num_q;
+    let kv_dim = kv.kv_dim;
+
+    let f = kernel_cache.get_or_compile(device, CONTINUATION_ATTENTION_SRC, "warp_continuation_attention")?;
+
+    // Grid: (num_q, num_heads). Block: (head_dim).
+    // Each block handles one query position + one attention head.
+    let cfg = LaunchConfig {
+        grid_dim: (num_q, num_heads, 1),
+        block_dim: (head_dim.max(32), 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        device.stream.launch_builder(&f)
+            .arg(&mut out.data)
+            .arg(&q.data)
+            .arg(&kv.k.data)
+            .arg(&kv.v.data)
+            .arg(&num_q)
+            .arg(&num_heads)
+            .arg(&num_kv_heads)
+            .arg(&head_dim)
+            .arg(&kv_dim)
+            .arg(&offset)
+            .arg(&total_len)
+            .launch(cfg)
+            .map_err(|e: cudarc::driver::result::DriverError| DeviceError::Launch(e.to_string()))?;
+    }
+    Ok(())
 }

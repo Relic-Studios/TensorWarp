@@ -1255,6 +1255,159 @@ pub fn gemm(
     Ok(())
 }
 
+// ── M=1 F32 GEMM with Split-K ──────────────────────────────────
+//
+// Specialized for M=1 (single-token decode / LM head projection).
+// One thread per output column, full K dot product per thread.
+// Split-K for SM occupancy on large N (vocab projection).
+// Graph-capturable — no cuBLAS dependency.
+//
+// B is stored row-major [K, N]: element (k, n) at B[k * N + n].
+// Adjacent threads read adjacent columns — coalesced row reads.
+
+/// M=1 F32 GEMM — direct write (no atomicAdd, no memset needed). Graph-capturable.
+const GEMM_M1_F32_SRC: &str = r#"
+extern "C" __global__ void warp_gemm_m1_f32(
+    float* __restrict__ C,
+    const float* __restrict__ A,       // [1, K]
+    const float* __restrict__ B,       // [K, N] row-major
+    int K,
+    int N
+) {
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= N) return;
+
+    float dot = 0.0f;
+
+    // Process 4 elements at a time for ILP
+    int k = 0;
+    for (; k + 3 < K; k += 4) {
+        float a0 = __ldg(&A[k]);
+        float a1 = __ldg(&A[k + 1]);
+        float a2 = __ldg(&A[k + 2]);
+        float a3 = __ldg(&A[k + 3]);
+        dot += a0 * B[k * N + n];
+        dot += a1 * B[(k + 1) * N + n];
+        dot += a2 * B[(k + 2) * N + n];
+        dot += a3 * B[(k + 3) * N + n];
+    }
+    for (; k < K; k++) {
+        dot += __ldg(&A[k]) * B[k * N + n];
+    }
+
+    C[n] = dot;
+}
+"#;
+
+/// M=1 F32 GEMM with Split-K (for small N needing more SM occupancy).
+const GEMM_M1_F32_SPLITK_SRC: &str = r#"
+extern "C" __global__ void warp_gemm_m1_f32_splitk(
+    float* __restrict__ C,
+    const float* __restrict__ A,       // [1, K]
+    const float* __restrict__ B,       // [K, N] row-major
+    int K,
+    int N,
+    int k_per_split
+) {
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= N) return;
+
+    int k_split = blockIdx.y;
+    int k_start = k_split * k_per_split;
+    int k_end = k_start + k_per_split;
+    if (k_end > K) k_end = K;
+
+    float dot = 0.0f;
+
+    int k = k_start;
+    for (; k + 3 < k_end; k += 4) {
+        float a0 = __ldg(&A[k]);
+        float a1 = __ldg(&A[k + 1]);
+        float a2 = __ldg(&A[k + 2]);
+        float a3 = __ldg(&A[k + 3]);
+        dot += a0 * B[k * N + n];
+        dot += a1 * B[(k + 1) * N + n];
+        dot += a2 * B[(k + 2) * N + n];
+        dot += a3 * B[(k + 3) * N + n];
+    }
+    for (; k < k_end; k++) {
+        dot += __ldg(&A[k]) * B[k * N + n];
+    }
+
+    atomicAdd(&C[n], dot);
+}
+"#;
+
+/// M=1 F32 GEMM: C[1,N] = A[1,K] × B[K,N] — graph-capturable, no cuBLAS.
+///
+/// Specialized for the LM head vocab projection (M=1, N=vocab, K=hidden).
+/// Uses Split-K for SM occupancy on large N.
+pub fn gemm_m1_f32(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    a: &GpuTensor<f32>,       // [1, K]
+    b: &GpuTensor<f32>,       // [K, N] row-major
+    c: &mut GpuTensor<f32>,   // [1, N]
+    n: u32,
+    k: u32,
+) -> Result<(), DeviceError> {
+    let threads = 256u32;
+    let n_blocks = (n + threads - 1) / threads;
+
+    // Adaptive Split-K (same logic as Q4 M=1)
+    let splits = if k < 2048 || n_blocks >= 128 {
+        1
+    } else {
+        let target = 256u32;
+        let max_splits = (k / 256).max(1);
+        ((target + n_blocks - 1) / n_blocks).max(1).min(max_splits)
+    };
+
+    let k_i = k as i32;
+    let n_i = n as i32;
+
+    if splits == 1 {
+        // Direct write — no memset, no atomicAdd. Fully graph-capturable.
+        let f = cache.get_or_compile(device, GEMM_M1_F32_SRC, "warp_gemm_m1_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (n_blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            launch_err!(device.stream.launch_builder(&f)
+                .arg(&mut c.data)
+                .arg(&a.data)
+                .arg(&b.data)
+                .arg(&k_i)
+                .arg(&n_i)
+                .launch(cfg))?;
+        }
+    } else {
+        // Split-K with atomicAdd (needs memset)
+        let k_per_split = ((k + splits - 1) / splits) as i32;
+        let f = cache.get_or_compile(device, GEMM_M1_F32_SPLITK_SRC, "warp_gemm_m1_f32_splitk")?;
+        device.stream.memset_zeros(&mut c.data)
+            .map_err(|e| DeviceError::Memory(format!("memset zeros: {e}")))?;
+        let cfg = LaunchConfig {
+            grid_dim: (n_blocks, splits, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            launch_err!(device.stream.launch_builder(&f)
+                .arg(&mut c.data)
+                .arg(&a.data)
+                .arg(&b.data)
+                .arg(&k_i)
+                .arg(&n_i)
+                .arg(&k_per_split)
+                .launch(cfg))?;
+        }
+    }
+    Ok(())
+}
+
 /// Simple tiled GEMM (32×32 tiles). Used by autotuner for comparison.
 pub fn gemm_tiled32(
     cache: &KernelCache,

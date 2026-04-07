@@ -92,7 +92,9 @@ impl GraphCapture {
             .map_err(|e| DeviceError::Launch(format!("pre-bind context: {e}")))?;
 
         // Begin capture
-        stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+        // RELAXED mode allows cross-stream buffer dependencies during capture.
+        // Required because buffers may have been allocated/written on the default stream.
+        stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
             .map_err(|e| DeviceError::Launch(format!("graph begin_capture: {e}")))?;
 
         // Execute the closure — kernels are captured, not executed

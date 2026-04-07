@@ -799,11 +799,18 @@ fn run_safetensors(
 
         let use_graph = std::env::args().any(|a| a == "--graph");
         let use_marlin = std::env::args().any(|a| a == "--marlin");
-        let mode = if use_marlin { "TW-Marlin" } else if use_graph { "CUDA graph" } else { "pre-alloc" };
+        let use_speculative = std::env::args().any(|a| a == "--speculative");
+        let mode = if use_speculative { "self-speculative (layer-skip)" }
+            else if use_marlin && use_graph { "TW-Marlin + CUDA graph" }
+            else if use_marlin { "TW-Marlin" }
+            else if use_graph { "CUDA graph" }
+            else { "pre-alloc" };
         println!("\nGenerating (max_seq_len={}, Q4_0 quantized, {})...\n", max_seq_len, mode);
         println!("--- output ---");
 
-        let result = if use_marlin {
+        let result = if use_speculative {
+            engine.generate_speculative(&device, &prompt_ids, &gen_config, max_seq_len)
+        } else if use_marlin {
             // Convert to TW-Marlin separated format
             let marlin_start = std::time::Instant::now();
             let mut marlin_layers: Vec<_> = engine.layers.iter().map(|l| {
@@ -815,7 +822,11 @@ fn run_safetensors(
             }
             device.synchronize().unwrap();
             println!("TW-Marlin format conversion + fusion: {:.1}ms", marlin_start.elapsed().as_secs_f64() * 1000.0);
-            engine.generate_tw_marlin(&device, &prompt_ids, &gen_config, max_seq_len, &marlin_layers)
+            if use_graph {
+                engine.generate_tw_marlin_graph(&device, &prompt_ids, &gen_config, max_seq_len, &marlin_layers, None)
+            } else {
+                engine.generate_tw_marlin(&device, &prompt_ids, &gen_config, max_seq_len, &marlin_layers)
+            }
         } else if use_graph {
             engine.generate_with_graph(&device, &prompt_ids, &gen_config, max_seq_len)
         } else {

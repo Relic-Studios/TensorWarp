@@ -85,7 +85,14 @@ impl OnnxExecutor {
         let output_names = model.outputs.iter().map(|o| o.name.clone()).collect();
 
         // Analyze for fusible elementwise chains
-        let (fusions, fused_nodes) = Self::analyze_fusions(&model.nodes);
+        // Disabled when model has Constant nodes (common in PyTorch exports) — fusion
+        // can accidentally fuse ops that depend on Constant outputs, causing missing tensors.
+        let has_constants = model.nodes.iter().any(|n| n.op_type == "Constant");
+        let (fusions, fused_nodes) = if has_constants {
+            (Vec::new(), std::collections::HashSet::new())
+        } else {
+            Self::analyze_fusions(&model.nodes)
+        };
         if !fusions.is_empty() {
             log::info!("ONNX AutoFuse: discovered {} fusible chains ({} ops → {} kernels)",
                 fusions.len(),
@@ -142,6 +149,24 @@ impl OnnxExecutor {
             }
 
             self.execute_node(device, node, &tensors, &mut owned)?;
+
+            // Debug trace: dump first/last few nodes' output stats
+            if std::env::var("TW_TRACE").is_ok() {
+                for out_name in &node.outputs {
+                    if let Some(t) = owned.get(out_name) {
+                        let data = t.to_host(device).unwrap_or_default();
+                        if !data.is_empty() {
+                            let min = data.iter().cloned().fold(f32::INFINITY, f32::min);
+                            let max = data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                            let mean = data.iter().sum::<f32>() / data.len() as f32;
+                            let nonzero = data.iter().filter(|&&v| v != 0.0).count();
+                            eprintln!("[TRACE] node {} {} '{}' → '{}': {} elems, range=[{:.4}, {:.4}], mean={:.6}, nonzero={}",
+                                node_idx, node.op_type, node.name, out_name,
+                                data.len(), min, max, mean, nonzero);
+                        }
+                    }
+                }
+            }
         }
 
         // Collect outputs
@@ -223,6 +248,56 @@ impl OnnxExecutor {
                 }
                 owned.insert(out_name, out);
             }
+            // ── Sqrt / Pow — elementwise math ops for LayerNorm decomposition ──
+            "Sqrt" => {
+                let x = get(0)?;
+                let n = x.numel as u32;
+                let mut out = GpuTensor::<f32>::zeros(device, x.shape.clone(), DType::F32)?;
+                let f = self.cache.get_or_compile(device,
+                    r#"extern "C" __global__ void warp_sqrt(float *out, const float *x, unsigned int n) {
+                        unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+                        if (i < n) out[i] = sqrtf(x[i]);
+                    }"#, "warp_sqrt")?;
+                let cfg = cudarc::driver::LaunchConfig::for_num_elems(n);
+                unsafe {
+                    use cudarc::driver::PushKernelArg;
+                    device.stream.launch_builder(&f)
+                        .arg(&mut out.data)
+                        .arg(&x.data)
+                        .arg(&n)
+                        .launch(cfg)
+                        .map_err(|e| DeviceError::Launch(e.to_string()))?;
+                }
+                owned.insert(out_name, out);
+            }
+            "Pow" => {
+                let x = get(0)?;
+                let n = x.numel as u32;
+                // ONNX Pow(x, y): if y is a scalar constant (e.g. 2.0 for variance), broadcast
+                let exp_val = if node.inputs.len() >= 2 && !node.inputs[1].is_empty() {
+                    let exp_tensor = get(1)?;
+                    let exp_host = exp_tensor.to_host(device).unwrap_or_default();
+                    if exp_host.len() == 1 { exp_host[0] } else { 2.0 }
+                } else { 2.0 };
+                let mut out = GpuTensor::<f32>::zeros(device, x.shape.clone(), DType::F32)?;
+                let f = self.cache.get_or_compile(device,
+                    r#"extern "C" __global__ void warp_pow(float *out, const float *x, float exp_val, unsigned int n) {
+                        unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+                        if (i < n) out[i] = powf(x[i], exp_val);
+                    }"#, "warp_pow")?;
+                let cfg = cudarc::driver::LaunchConfig::for_num_elems(n);
+                unsafe {
+                    use cudarc::driver::PushKernelArg;
+                    device.stream.launch_builder(&f)
+                        .arg(&mut out.data)
+                        .arg(&x.data)
+                        .arg(&exp_val)
+                        .arg(&n)
+                        .launch(cfg)
+                        .map_err(|e| DeviceError::Launch(e.to_string()))?;
+                }
+                owned.insert(out_name, out);
+            }
             "LeakyRelu" => {
                 let x = get(0)?;
                 let alpha = node.get_float("alpha", 0.01);
@@ -235,15 +310,50 @@ impl OnnxExecutor {
             "Add" | "Sub" | "Mul" | "Div" => {
                 let a = get(0)?;
                 let b = get(1)?;
-                let mut out = GpuTensor::<f32>::zeros(device, a.shape.clone(), DType::F32)?;
-                match node.op_type.as_str() {
-                    "Add" => warp_kernels::ops::add(&self.cache, device, a, b, &mut out)?,
-                    "Sub" => warp_kernels::ops::sub(&self.cache, device, a, b, &mut out)?,
-                    "Mul" => warp_kernels::ops::mul(&self.cache, device, a, b, &mut out)?,
-                    "Div" => warp_kernels::ops::div(&self.cache, device, a, b, &mut out)?,
-                    _ => unreachable!(),
+
+                // Handle scalar broadcast: if one operand is scalar (1 elem), broadcast it
+                if a.numel != b.numel && (a.numel == 1 || b.numel == 1) {
+                    let (big, small, a_is_big) = if a.numel > b.numel { (a, b, true) } else { (b, a, false) };
+                    let n = big.numel as u32;
+                    let scalar_host = small.to_host(device)?;
+                    let scalar_val = scalar_host[0];
+                    let mut out = GpuTensor::<f32>::zeros(device, big.shape.clone(), DType::F32)?;
+
+                    // Generate scalar broadcast kernel
+                    let (op_name, op_expr) = match (node.op_type.as_str(), a_is_big) {
+                        ("Add", _) => ("scalar_add", "x[i] + s"),
+                        ("Mul", _) => ("scalar_mul", "x[i] * s"),
+                        ("Sub", true) => ("scalar_sub_r", "x[i] - s"),     // a - scalar
+                        ("Sub", false) => ("scalar_sub_l", "s - x[i]"),    // scalar - a
+                        ("Div", true) => ("scalar_div_r", "x[i] / s"),     // a / scalar
+                        ("Div", false) => ("scalar_div_l", "s / x[i]"),    // scalar / a
+                        _ => unreachable!(),
+                    };
+                    let src = format!(
+                        r#"extern "C" __global__ void warp_{op_name}(float *out, const float *x, float s, unsigned int n) {{
+                            unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+                            if (i < n) out[i] = {op_expr};
+                        }}"#);
+                    let f = self.cache.get_or_compile(device, &src, &format!("warp_{op_name}"))?;
+                    let cfg = cudarc::driver::LaunchConfig::for_num_elems(n);
+                    unsafe {
+                        use cudarc::driver::PushKernelArg;
+                        device.stream.launch_builder(&f)
+                            .arg(&mut out.data).arg(&big.data).arg(&scalar_val).arg(&n)
+                            .launch(cfg).map_err(|e| DeviceError::Launch(e.to_string()))?;
+                    }
+                    owned.insert(out_name, out);
+                } else {
+                    let mut out = GpuTensor::<f32>::zeros(device, a.shape.clone(), DType::F32)?;
+                    match node.op_type.as_str() {
+                        "Add" => warp_kernels::ops::add(&self.cache, device, a, b, &mut out)?,
+                        "Sub" => warp_kernels::ops::sub(&self.cache, device, a, b, &mut out)?,
+                        "Mul" => warp_kernels::ops::mul(&self.cache, device, a, b, &mut out)?,
+                        "Div" => warp_kernels::ops::div(&self.cache, device, a, b, &mut out)?,
+                        _ => unreachable!(),
+                    }
+                    owned.insert(out_name, out);
                 }
-                owned.insert(out_name, out);
             }
 
             // ── MatMul / Gemm ──────────────────────────────────
@@ -856,14 +966,31 @@ impl OnnxExecutor {
             }
 
             // ── Softmax (GPU) ──────────────────────────────────
+            // ONNX Softmax has an axis attribute. For opset < 13, default axis=1.
+            // For opset >= 13, default axis=-1. We flatten everything after axis into cols.
             "Softmax" => {
                 let x = get(0)?;
                 let dims = x.shape.dims();
-                let cols = dims.last().and_then(|d| d.static_val()).unwrap_or(x.numel) as u32;
-                let rows = (x.numel / cols as usize) as u32;
+                let ndim = dims.len();
+
+                // Get axis attribute (default: 1 for older opsets, -1 for opset 13+)
+                let axis = node.attrs.get("axis")
+                    .and_then(|a| if let crate::onnx::OnnxAttr::Int(i) = a { Some(*i as i32) } else { None })
+                    .unwrap_or(1); // default axis=1 (most common)
+
+                // Normalize negative axis
+                let axis = if axis < 0 { (ndim as i32 + axis) as usize } else { axis as usize };
+
+                // Rows = product of dims before axis, Cols = product of dims from axis onward
+                let rows: usize = dims[..axis].iter()
+                    .map(|d| d.static_val().unwrap_or(1))
+                    .product();
+                let cols: usize = dims[axis..].iter()
+                    .map(|d| d.static_val().unwrap_or(1))
+                    .product();
 
                 let mut out = GpuTensor::<f32>::zeros(device, x.shape.clone(), DType::F32)?;
-                warp_kernels::sampling::softmax(&self.cache, device, x, &mut out, rows, cols)?;
+                warp_kernels::sampling::softmax(&self.cache, device, x, &mut out, rows as u32, cols as u32)?;
                 owned.insert(out_name, out);
             }
 
@@ -1006,9 +1133,41 @@ impl OnnxExecutor {
 
             // ── Constant / Shape / Cast ───────────────────────
             "Constant" => {
-                // Constants should already be in initializers
+                // Extract constant value from node attributes
+                if let Some(crate::onnx::OnnxAttr::Tensor(t)) = node.attrs.get("value") {
+                    let data = t.to_f32();
+                    if !data.is_empty() {
+                        let shape = if t.shape.is_empty() {
+                            Shape::from_static(&[data.len()])
+                        } else {
+                            Shape::from_static(&t.shape.iter().map(|&d| d as usize).collect::<Vec<_>>())
+                        };
+                        let gpu = GpuTensor::from_host(device, &data, shape, DType::F32)?;
+                        owned.insert(out_name, gpu);
+                    }
+                } else if let Some(crate::onnx::OnnxAttr::Float(f)) = node.attrs.get("value_float") {
+                    let gpu = GpuTensor::from_host(device, &[*f], Shape::from_static(&[1]), DType::F32)?;
+                    owned.insert(out_name, gpu);
+                } else if let Some(crate::onnx::OnnxAttr::Int(i)) = node.attrs.get("value_int") {
+                    let gpu = GpuTensor::from_host(device, &[*i as f32], Shape::from_static(&[1]), DType::F32)?;
+                    owned.insert(out_name, gpu);
+                }
             }
-            "Shape" | "Cast" => {
+            "Shape" => {
+                // Shape op returns the dimensions of the input tensor as a 1D i64 tensor
+                // We store as f32 since our tensors are all f32
+                if let Ok(x) = get(0) {
+                    let dims: Vec<f32> = x.shape.dims().iter()
+                        .map(|d| d.static_val().unwrap_or(1) as f32)
+                        .collect();
+                    let ndim = dims.len();
+                    let out = GpuTensor::from_host(device, &dims,
+                        Shape::from_static(&[ndim]), DType::F32)?;
+                    owned.insert(out_name, out);
+                }
+            }
+            "Cast" => {
+                // Cast: just pass through for now (we only support f32)
                 if let Ok(x) = get(0) {
                     let data = device.dtoh(&x.data)?;
                     let out = GpuTensor::from_host(device, &data, x.shape.clone(), DType::F32)?;

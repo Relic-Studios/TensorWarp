@@ -838,9 +838,21 @@ pub trait DevicePtr<T>: DeviceSlice<T> {
     fn device_ptr<'a>(&'a self, stream: &'a CudaStream) -> (sys::CUdeviceptr, SyncOnDrop<'a>);
 }
 
+/// Check if a stream is currently capturing a CUDA graph.
+/// During capture, cross-stream event waits must be skipped to avoid isolation errors.
+fn is_stream_capturing(stream: &CudaStream) -> bool {
+    unsafe {
+        let mut status = sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
+        let res = sys::cuStreamIsCapturing(stream.cu_stream, &mut status);
+        res == sys::cudaError_enum::CUDA_SUCCESS
+            && status != sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE
+    }
+}
+
 impl<T> DevicePtr<T> for CudaSlice<T> {
     fn device_ptr<'a>(&'a self, stream: &'a CudaStream) -> (sys::CUdeviceptr, SyncOnDrop<'a>) {
-        if self.stream.context().is_in_multi_stream_mode() {
+        // Skip cross-stream event waits during CUDA graph capture to avoid isolation errors
+        if self.stream.context().is_in_multi_stream_mode() && !is_stream_capturing(stream) {
             if let Some(write) = self.write.as_ref() {
                 stream.ctx.record_err(stream.wait(write));
             }
@@ -854,7 +866,7 @@ impl<T> DevicePtr<T> for CudaSlice<T> {
 
 impl<T> DevicePtr<T> for CudaView<'_, T> {
     fn device_ptr<'a>(&'a self, stream: &'a CudaStream) -> (sys::CUdeviceptr, SyncOnDrop<'a>) {
-        if self.stream.context().is_in_multi_stream_mode() {
+        if self.stream.context().is_in_multi_stream_mode() && !is_stream_capturing(stream) {
             if let Some(write) = self.write.as_ref() {
                 stream.ctx.record_err(stream.wait(write));
             }
@@ -865,7 +877,7 @@ impl<T> DevicePtr<T> for CudaView<'_, T> {
 
 impl<T> DevicePtr<T> for CudaViewMut<'_, T> {
     fn device_ptr<'a>(&'a self, stream: &'a CudaStream) -> (sys::CUdeviceptr, SyncOnDrop<'a>) {
-        if self.stream.context().is_in_multi_stream_mode() {
+        if self.stream.context().is_in_multi_stream_mode() && !is_stream_capturing(stream) {
             if let Some(write) = self.write.as_ref() {
                 stream.ctx.record_err(stream.wait(write));
             }
@@ -901,7 +913,8 @@ impl<T> DevicePtrMut<T> for CudaSlice<T> {
         &'a mut self,
         stream: &'a CudaStream,
     ) -> (sys::CUdeviceptr, SyncOnDrop<'a>) {
-        if self.stream.context().is_in_multi_stream_mode() {
+        // Skip cross-stream event waits during CUDA graph capture
+        if self.stream.context().is_in_multi_stream_mode() && !is_stream_capturing(stream) {
             if let Some(read) = self.read.as_ref() {
                 stream.ctx.record_err(stream.wait(read));
             }
@@ -921,7 +934,7 @@ impl<T> DevicePtrMut<T> for CudaViewMut<'_, T> {
         &'a mut self,
         stream: &'a CudaStream,
     ) -> (sys::CUdeviceptr, SyncOnDrop<'a>) {
-        if self.stream.context().is_in_multi_stream_mode() {
+        if self.stream.context().is_in_multi_stream_mode() && !is_stream_capturing(stream) {
             if let Some(read) = self.read.as_ref() {
                 stream.ctx.record_err(stream.wait(read));
             }
