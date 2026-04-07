@@ -106,11 +106,13 @@ impl GemmaGenerationEngine {
                 &mut normed, h, self.config.norm_eps)?;
 
             // 2. Q, K projections
+            // NOTE: Gemma 4 has hidden_size(5376) != num_heads*head_dim(8192)
+            let q_dim = num_q_heads * d;
             let mut q = GpuTensor::<f32>::zeros(device,
-                Shape::from_static(&[1, (num_q_heads * d) as usize]), DType::F32)?;
+                Shape::from_static(&[1, q_dim as usize]), DType::F32)?;
             let mut k = GpuTensor::<f32>::zeros(device,
                 Shape::from_static(&[1, kv_dim as usize]), DType::F32)?;
-            crate::quantize::gemm_q4_0_m1(&self.cache, device, &normed, &layer.wq, &mut q, num_q_heads * d, h)?;
+            crate::quantize::gemm_q4_0_m1(&self.cache, device, &normed, &layer.wq, &mut q, q_dim, h)?;
             crate::quantize::gemm_q4_0_m1(&self.cache, device, &normed, &layer.wk, &mut k, kv_dim, h)?;
 
             // V projection — same as K when k_eq_v, otherwise separate
@@ -172,11 +174,11 @@ impl GemmaGenerationEngine {
                 window,
             )?;
 
-            // 7. Output projection
+            // 7. Output projection: [q_dim] → [hidden_size]
             let mut attn_proj = GpuTensor::<f32>::zeros(device,
                 Shape::from_static(&[1, h as usize]), DType::F32)?;
             crate::quantize::gemm_q4_0_m1(&self.cache, device, &attn_out, &layer.wo,
-                &mut attn_proj, h, num_q_heads * d)?;
+                &mut attn_proj, h, q_dim)?;
 
             // 8. Fused residual + FFN norm
             let mut ffn_normed = GpuTensor::<f32>::zeros(device,

@@ -198,32 +198,40 @@ impl GemmaModelQ4 {
             config.num_layers / config.sliding_window_pattern);
         if config.k_eq_v { eprintln!("  K=V shared projections enabled"); }
 
+        // Detect weight prefix: "model.language_model." for multimodal, "model." for text-only
+        let prefix = if loader.load_f32("model.language_model.embed_tokens.weight", device).is_ok() {
+            "model.language_model"
+        } else {
+            "model"
+        };
+        eprintln!("  Weight prefix: {prefix}");
+
         // Embedding
-        let embed_tokens = loader.load_f32("model.embed_tokens.weight", device)?;
+        let embed_tokens = loader.load_f32(&format!("{prefix}.embed_tokens.weight"), device)?;
 
         // Layers
         let mut layers = Vec::with_capacity(config.num_layers as usize);
         for i in 0..config.num_layers {
             let lc = &layer_configs[i as usize];
             let kv_dim = config.kv_dim_for_layer(lc);
-            let prefix = format!("model.layers.{i}");
+            let layer_prefix = format!("{prefix}.layers.{i}");
 
             eprintln!("  Loading layer {i}/{} ({}, kv_heads={}, head_dim={})...",
                 config.num_layers,
                 if lc.is_global { "global" } else { "sliding" },
                 lc.num_kv_heads, lc.head_dim);
 
-            let layer = load_gemma_layer_q4(loader, device, &prefix, h, kv_dim, ffn, &config)?;
+            let layer = load_gemma_layer_q4(loader, device, &layer_prefix, h, kv_dim, ffn, &config, lc)?;
             layers.push(layer);
         }
 
         // Final norm
-        let final_norm = loader.load_f32("model.norm.weight", device)?;
+        let final_norm = loader.load_f32(&format!("{prefix}.norm.weight"), device)?;
 
         // LM head (tied to embedding for Gemma)
         let lm_head = if config.tie_word_embeddings {
             eprintln!("  Tied embeddings: transposing embed_tokens for lm_head");
-            loader.load_f32_transposed("model.embed_tokens.weight", device)?
+            loader.load_f32_transposed(&format!("{prefix}.embed_tokens.weight"), device)?
         } else {
             loader.load_f32_transposed("lm_head.weight", device)?
         };
@@ -250,6 +258,11 @@ impl GemmaModelQ4 {
 }
 
 /// Load a single Gemma layer with Q4 quantization.
+///
+/// IMPORTANT: Gemma 4 has hidden_size != num_heads * head_dim.
+/// Q projection: [hidden_size] → [num_heads * head_dim]
+/// K projection: [hidden_size] → [num_kv_heads * head_dim]
+/// O projection: [num_heads * head_dim] → [hidden_size]
 fn load_gemma_layer_q4(
     loader: &ShardedSafeTensorsLoader,
     device: &WarpDevice,
@@ -258,13 +271,15 @@ fn load_gemma_layer_q4(
     kv_dim: u32,
     ffn: u32,
     config: &GemmaConfig,
+    layer_config: &GemmaLayerAttentionConfig,
 ) -> Result<QuantizedBlockWeights, LoaderError> {
-    // Gemma weight names follow the same pattern as LLaMA
+    let q_dim = config.num_heads * layer_config.head_dim; // e.g. 32*256=8192
+    let o_in_dim = q_dim; // O projects from head space back to hidden
+
     // Biases: Gemma doesn't use QKV biases
     let bq = loader.load_f32(&format!("{prefix}.self_attn.q_proj.bias"), device).ok();
     let bk = loader.load_f32(&format!("{prefix}.self_attn.k_proj.bias"), device).ok();
     let bv = if config.k_eq_v {
-        // K=V: no separate V bias
         bk.as_ref().map(|t| {
             let data = t.to_host(device).unwrap();
             GpuTensor::from_host(device, &data, t.shape.clone(), DType::F32).unwrap()
@@ -273,20 +288,24 @@ fn load_gemma_layer_q4(
         loader.load_f32(&format!("{prefix}.self_attn.v_proj.bias"), device).ok()
     };
 
-    let wq = load_and_quantize_q4(loader, device, &format!("{prefix}.self_attn.q_proj.weight"), h, h)?;
+    // Q: [hidden_size, q_dim] after transpose. K=hidden_size, N=q_dim.
+    let wq = load_and_quantize_q4(loader, device, &format!("{prefix}.self_attn.q_proj.weight"), h, q_dim)?;
+    // K: [hidden_size, kv_dim] after transpose
     let wk = load_and_quantize_q4(loader, device, &format!("{prefix}.self_attn.k_proj.weight"), h, kv_dim)?;
 
-    // K=V sharing: V projection uses the same weights as K
+    // V: same as K when k_eq_v
     let wv = if config.k_eq_v {
         load_and_quantize_q4(loader, device, &format!("{prefix}.self_attn.k_proj.weight"), h, kv_dim)?
     } else {
         load_and_quantize_q4(loader, device, &format!("{prefix}.self_attn.v_proj.weight"), h, kv_dim)?
     };
 
+    // O: [q_dim, hidden_size] after transpose. K=q_dim, N=hidden_size.
+    let wo = load_and_quantize_q4(loader, device, &format!("{prefix}.self_attn.o_proj.weight"), o_in_dim, h)?;
+
     Ok(QuantizedBlockWeights {
         attn_norm: loader.load_f32(&format!("{prefix}.input_layernorm.weight"), device)?,
-        wq, wk, wv,
-        wo: load_and_quantize_q4(loader, device, &format!("{prefix}.self_attn.o_proj.weight"), h, h)?,
+        wq, wk, wv, wo,
         ffn_norm: loader.load_f32(&format!("{prefix}.post_attention_layernorm.weight"), device)?,
         w_gate: load_and_quantize_q4(loader, device, &format!("{prefix}.mlp.gate_proj.weight"), h, ffn)?,
         w_up: load_and_quantize_q4(loader, device, &format!("{prefix}.mlp.up_proj.weight"), h, ffn)?,
