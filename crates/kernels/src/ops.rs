@@ -333,6 +333,66 @@ extern "C" __global__ void warp_rmsnorm(
 }
 "#;
 
+/// RMSNorm without learnable weights — used for QK-norm in Gemma 3/4.
+/// Normalizes each row: out[i] = x[i] * rsqrt(mean(x^2) + eps)
+const RMSNORM_NO_WEIGHT_SRC: &str = r#"
+extern "C" __global__ void warp_rmsnorm_noweight(
+    float *out, const float *x,
+    unsigned int hidden_size, float eps, size_t n_rows
+) {
+    unsigned int row = blockIdx.x;
+    if (row >= n_rows) return;
+
+    const float *x_row = x + row * hidden_size;
+    float *out_row = out + row * hidden_size;
+
+    float sum_sq = 0.0f;
+    for (unsigned int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        float v = x_row[i];
+        sum_sq += v * v;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+    sum_sq = __shfl_sync(0xffffffff, sum_sq, 0);
+
+    float rms = rsqrtf(sum_sq / (float)hidden_size + eps);
+
+    for (unsigned int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        out_row[i] = x_row[i] * rms;
+    }
+}
+"#;
+
+/// QK-norm: RMSNorm without learnable weights.
+/// Normalizes Q and K tensors before attention (Gemma 3/4).
+/// Input shape: [num_heads, head_dim] flattened — each head is one row.
+pub fn rmsnorm_no_weight(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    x: &GpuTensor<f32>,
+    out: &mut GpuTensor<f32>,
+    hidden_size: u32,
+    eps: f32,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, RMSNORM_NO_WEIGHT_SRC, "warp_rmsnorm_noweight")?;
+    let n_rows = (x.numel / hidden_size as usize) as usize;
+    let cfg = LaunchConfig {
+        grid_dim: (n_rows as u32, 1, 1),
+        block_dim: (32.min(hidden_size), 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut out.data)
+            .arg(&x.data)
+            .arg(&hidden_size)
+            .arg(&eps)
+            .arg(&n_rows)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
 /// Cached elementwise add.
 pub fn add(
     cache: &KernelCache,
@@ -869,6 +929,42 @@ pub fn fused_silu_mul(
     out: &mut GpuTensor<f32>,
 ) -> Result<(), DeviceError> {
     let f = cache.get_or_compile(device, FUSED_SILU_MUL_SRC, "warp_fused_silu_mul")?;
+    let n = gate.numel;
+    let cfg = LaunchConfig::for_num_elems(n as u32);
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut out.data).arg(&gate.data).arg(&up.data).arg(&n)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+/// Fused GeGLU gate: out = gelu(gate) * up.
+/// Used by Gemma 2/3/4 instead of SwiGLU. Uses the tanh approximation of GELU
+/// (gelu_pytorch_tanh): 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+const FUSED_GELU_MUL_SRC: &str = r#"
+extern "C" __global__ void warp_fused_gelu_mul(
+    float *out, const float *gate, const float *up, size_t n
+) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float g = gate[i];
+        float gelu_g = 0.5f * g * (1.0f + tanhf(0.7978845608f * (g + 0.044715f * g * g * g)));
+        out[i] = gelu_g * up[i];
+    }
+}
+"#;
+
+/// Fused GeGLU gate: out = gelu_tanh(gate) * up.
+/// Same interface as fused_silu_mul but with GELU activation (Gemma family).
+pub fn fused_gelu_mul(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    gate: &GpuTensor<f32>,
+    up: &GpuTensor<f32>,
+    out: &mut GpuTensor<f32>,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, FUSED_GELU_MUL_SRC, "warp_fused_gelu_mul")?;
     let n = gate.numel;
     let cfg = LaunchConfig::for_num_elems(n as u32);
     unsafe {

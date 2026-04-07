@@ -86,6 +86,87 @@ pub fn rope(
     Ok(())
 }
 
+/// Partial RoPE: only rotate the first `rotary_dim` dimensions, pass rest through.
+/// Used by Gemma 4 global attention layers (partial_rotary_factor = 0.25 → rotary_dim = head_dim/4).
+const ROPE_PARTIAL_SRC: &str = r#"
+extern "C" __global__ void warp_rope_partial(
+    float *out,
+    const float *input,
+    unsigned int B,
+    unsigned int N,
+    unsigned int D,           // full head_dim
+    unsigned int rotary_dim,  // dimensions to rotate (must be even)
+    float base,
+    unsigned int offset
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total_elems = B * N * D;
+    if (idx >= total_elems) return;
+
+    unsigned int d = idx % D;
+    unsigned int pos_in_seq = (idx / D) % N;
+    unsigned int b = idx / (N * D);
+    unsigned int pos = pos_in_seq + offset;
+
+    unsigned int base_offset = b * N * D + pos_in_seq * D;
+
+    if (d < rotary_dim / 2) {
+        // Rotated pair: (d, d + rotary_dim/2)
+        unsigned int pair = d;
+        float freq = 1.0f / powf(base, 2.0f * (float)pair / (float)rotary_dim);
+        float theta = (float)pos * freq;
+        float cos_t = cosf(theta);
+        float sin_t = sinf(theta);
+
+        float x0 = input[base_offset + pair];
+        float x1 = input[base_offset + pair + rotary_dim / 2];
+
+        out[base_offset + pair]                = x0 * cos_t - x1 * sin_t;
+        out[base_offset + pair + rotary_dim / 2] = x0 * sin_t + x1 * cos_t;
+    } else if (d >= rotary_dim) {
+        // Pass-through: unrotated dimensions
+        out[base_offset + d] = input[base_offset + d];
+    }
+    // dims [rotary_dim/2, rotary_dim) are handled by the pair branch above
+}
+"#;
+
+/// Partial RoPE: rotate first `rotary_dim` dimensions, pass rest through unchanged.
+pub fn rope_partial(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    input: &GpuTensor<f32>,
+    out: &mut GpuTensor<f32>,
+    batch: u32,
+    seq_len: u32,
+    head_dim: u32,
+    rotary_dim: u32,
+    base: f32,
+    offset: u32,
+) -> Result<(), DeviceError> {
+    assert!(rotary_dim % 2 == 0, "rotary_dim must be even");
+    assert!(rotary_dim <= head_dim, "rotary_dim must be <= head_dim");
+
+    let f = cache.get_or_compile(device, ROPE_PARTIAL_SRC, "warp_rope_partial")?;
+    let total = batch * seq_len * head_dim;
+    let cfg = LaunchConfig::for_num_elems(total);
+
+    unsafe {
+        device.stream.launch_builder(&f)
+            .arg(&mut out.data)
+            .arg(&input.data)
+            .arg(&batch)
+            .arg(&seq_len)
+            .arg(&head_dim)
+            .arg(&rotary_dim)
+            .arg(&base)
+            .arg(&offset)
+            .launch(cfg)
+            .map_err(|e: cudarc::driver::result::DriverError| DeviceError::Launch(e.to_string()))?;
+    }
+    Ok(())
+}
+
 /// CPU reference RoPE.
 pub fn cpu_rope(
     input: &[f32], out: &mut [f32],

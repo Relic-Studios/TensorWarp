@@ -875,6 +875,8 @@ pub fn decode_attention_flash(
 // reduction kernel safely skips.
 
 /// FlashDecoding chunk kernel — device-len variant for CUDA graph capture.
+/// Supports sliding window attention: when window_size > 0, only attend to
+/// the last `window_size` KV entries. Chunks outside the window are skipped.
 const FLASH_DECODE_CHUNK_DEVICE_LEN_SRC: &str = r#"
 extern "C" __global__ void warp_flash_decode_chunk_dl(
     float *partial_O,
@@ -889,7 +891,8 @@ extern "C" __global__ void warp_flash_decode_chunk_dl(
     unsigned int head_dim,
     unsigned int max_chunks,
     unsigned int chunk_size,
-    float scale
+    float scale,
+    unsigned int window_size  // 0 = full attention, >0 = sliding window
 ) {
     unsigned int chunk_idx = blockIdx.x;
     unsigned int q_head = blockIdx.y;
@@ -902,12 +905,18 @@ extern "C" __global__ void warp_flash_decode_chunk_dl(
     unsigned int kv_head = q_head / n_rep;
     unsigned int kv_dim = num_kv_heads * head_dim;
 
+    // Sliding window: compute effective start position
+    unsigned int win_start = 0;
+    if (window_size > 0 && cache_len > window_size) {
+        win_start = cache_len - window_size;
+    }
+
     unsigned int chunk_start = chunk_idx * chunk_size;
     unsigned int chunk_end = chunk_start + chunk_size;
     if (chunk_end > cache_len) chunk_end = cache_len;
 
-    // Empty chunk — write sentinel values so reduction skips it
-    if (chunk_start >= cache_len) {
+    // Empty chunk or entirely outside sliding window — write sentinel values
+    if (chunk_start >= cache_len || chunk_end <= win_start) {
         unsigned int out_base = q_head * max_chunks;
         if (tid < head_dim) {
             partial_O[(q_head * max_chunks + chunk_idx) * head_dim + tid] = 0.0f;
@@ -918,6 +927,8 @@ extern "C" __global__ void warp_flash_decode_chunk_dl(
         }
         return;
     }
+    // Clamp chunk_start to window boundary (partial chunk at window edge)
+    if (chunk_start < win_start) chunk_start = win_start;
     unsigned int chunk_len = chunk_end - chunk_start;
 
     extern __shared__ float smem[];
@@ -991,6 +1002,7 @@ extern "C" __global__ void warp_flash_decode_chunk_dl(
 
 /// FlashDecoding with device-len for CUDA graph capture.
 /// Launches max_chunks blocks (based on max_seq_len) so grid dims are constant.
+/// `window_size`: 0 = full causal attention, >0 = sliding window (only attend to last N tokens).
 pub fn decode_attention_flash_device_len(
     kernel_cache: &KernelCache,
     device: &WarpDevice,
@@ -1001,6 +1013,23 @@ pub fn decode_attention_flash_device_len(
     num_kv_heads: u32,
     head_dim: u32,
     cache_len_buf: &cudarc::driver::CudaSlice<u32>,
+) -> Result<(), DeviceError> {
+    decode_attention_flash_device_len_window(kernel_cache, device, q, kv, out,
+        num_heads, num_kv_heads, head_dim, cache_len_buf, 0)
+}
+
+/// FlashDecoding with device-len and sliding window support.
+pub fn decode_attention_flash_device_len_window(
+    kernel_cache: &KernelCache,
+    device: &WarpDevice,
+    q: &GpuTensor<f32>,
+    kv: &LayerKVCache,
+    out: &mut GpuTensor<f32>,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    cache_len_buf: &cudarc::driver::CudaSlice<u32>,
+    window_size: u32,
 ) -> Result<(), DeviceError> {
     let chunk_size = FLASH_DECODE_CHUNK_SIZE;
     // Always use max_seq_len for grid dims (constant for graph capture)
@@ -1044,6 +1073,7 @@ pub fn decode_attention_flash_device_len(
             .arg(&max_chunks)
             .arg(&chunk_size)
             .arg(&scale)
+            .arg(&window_size)
             .launch(cfg_chunk)
             .map_err(|e: cudarc::driver::result::DriverError| DeviceError::Launch(e.to_string()))?;
     }
