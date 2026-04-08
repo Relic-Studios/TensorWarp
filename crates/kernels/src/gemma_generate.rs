@@ -110,7 +110,7 @@ impl GemmaGenerationEngine {
                 Shape::from_static(&[1, h as usize]), DType::F32)?;
             ops::rmsnorm(&self.cache, device, &hidden, &layer.attn_norm,
                 &mut normed, h, self.config.norm_eps)?;
-            if i == 0 { eprintln!("[decode] layer 0: rmsnorm OK"); }
+            if i == 0 { device.synchronize()?; eprintln!("[decode] layer 0: rmsnorm OK"); }
 
             // 2. Q, K projections
             // NOTE: Gemma 4 has hidden_size(5376) != num_heads*head_dim(8192)
@@ -120,9 +120,9 @@ impl GemmaGenerationEngine {
             let mut k = GpuTensor::<f32>::zeros(device,
                 Shape::from_static(&[1, kv_dim as usize]), DType::F32)?;
             crate::quantize::gemm_q4_0_m1(&self.cache, device, &normed, &layer.wq, &mut q, q_dim, h)?;
-            if i == 0 { eprintln!("[decode] layer 0: Q gemm OK (q_dim={})", q_dim); }
+            if i == 0 { device.synchronize()?; eprintln!("[decode] layer 0: Q gemm OK (q_dim={})", q_dim); }
             crate::quantize::gemm_q4_0_m1(&self.cache, device, &normed, &layer.wk, &mut k, kv_dim, h)?;
-            if i == 0 { eprintln!("[decode] layer 0: K gemm OK (kv_dim={})", kv_dim); }
+            if i == 0 { device.synchronize()?; eprintln!("[decode] layer 0: K gemm OK (kv_dim={})", kv_dim); }
 
             // V projection — same as K when k_eq_v, otherwise separate
             let mut v = GpuTensor::<f32>::zeros(device,
@@ -140,7 +140,7 @@ impl GemmaGenerationEngine {
             let mut k_rope = GpuTensor::<f32>::zeros(device, k.shape.clone(), DType::F32)?;
 
             let rotary_dim = (d as f32 * lc.partial_rotary_factor) as u32;
-            if i == 0 { eprintln!("[decode] layer 0: V done, starting RoPE (rotary_dim={}, d={}, theta={})", rotary_dim, d, lc.rope_theta); }
+            if i == 0 { device.synchronize()?; eprintln!("[decode] layer 0: V done, starting RoPE (rotary_dim={}, d={}, theta={})", rotary_dim, d, lc.rope_theta); }
             if rotary_dim < d && rotary_dim > 0 {
                 // Partial RoPE (global layers)
                 crate::rope::rope_partial(&self.cache, device, &q, &mut q_rope,
@@ -155,14 +155,17 @@ impl GemmaGenerationEngine {
                     num_kv_heads, 1, d, lc.rope_theta, pos)?;
             }
 
-            if i == 0 { eprintln!("[decode] layer 0: RoPE OK"); }
+            if i == 0 { device.synchronize()?; eprintln!("[decode] layer 0: RoPE OK"); }
             // 4. QK-norm (RMSNorm on Q and K before attention)
             let mut q_normed = GpuTensor::<f32>::zeros(device, q_rope.shape.clone(), DType::F32)?;
             let mut k_normed = GpuTensor::<f32>::zeros(device, k_rope.shape.clone(), DType::F32)?;
             ops::rmsnorm_no_weight(&self.cache, device, &q_rope, &mut q_normed, d, self.config.norm_eps)?;
             ops::rmsnorm_no_weight(&self.cache, device, &k_rope, &mut k_normed, d, self.config.norm_eps)?;
 
-            if i == 0 { eprintln!("[decode] layer 0: QK-norm OK"); }
+            if i == 0 {
+                device.synchronize()?;
+                eprintln!("[decode] layer 0: QK-norm OK (synced)");
+            }
             // 5. KV cache append
             let kv_cache = &mut kv_caches[i];
             // For sliding window, wrap position within window
@@ -171,7 +174,7 @@ impl GemmaGenerationEngine {
             } else {
                 pos
             };
-            kv_cache.prefill_at_offset(&self.cache, device, &k_normed, &v, cache_pos, 1)?;
+            kv_cache.prefill_at_offset(&self.cache, device, &k_normed, &v, 1, cache_pos)?;
             kv_cache.len = (pos + 1).min(kv_cache.max_seq_len);
 
             if i == 0 { eprintln!("[decode] layer 0: KV append OK (cache_pos={}, len={})", cache_pos, kv_cache.len); }
