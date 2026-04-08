@@ -257,23 +257,22 @@ impl GemmaGenerationEngine {
             crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.attn_out, &layer.wo,
                 &mut lb.attn_proj, h, q_dim)?;
 
-            // Post-attention norm (Gemma 4 has this as separate norm, not fused with residual)
-            // ffn_norm = post_attention_layernorm in our naming
+            // Exact Gemma architecture (from HuggingFace):
+            // hidden = post_attention_layernorm(attn_output)
+            // hidden = residual + hidden
+            // residual = hidden
+            // hidden = pre_feedforward_layernorm(hidden)
+            // hidden = FFN(hidden)
+            // hidden = post_feedforward_layernorm(hidden)
+            // output = residual + hidden
+
+            // ffn_norm maps to post_attention_layernorm
             ops::rmsnorm(&self.cache, device, &lb.attn_proj, &layer.ffn_norm,
-                &mut lb.residual, h, self.config.norm_eps)?;
+                &mut lb.ffn_normed, h, self.config.norm_eps)?;
+            // residual = x + post_attn_normed
+            ops::add(&self.cache, device, x, &lb.ffn_normed, &mut lb.residual)?;
 
-            // Attention residual: x + attn_output * layer_scalar
-            let ls = layer.layer_scalar.unwrap_or(1.0);
-            if ls != 1.0 {
-                ops::mul_scalar(&self.cache, device, &lb.residual, &mut lb.attn_proj, ls)?;
-                ops::add(&self.cache, device, x, &lb.attn_proj, &mut lb.residual)?;
-            } else {
-                ops::add(&self.cache, device, x, &lb.residual, &mut lb.attn_proj)?;
-                // attn_proj now holds the attention residual
-                ops::mul_scalar(&self.cache, device, &lb.attn_proj, &mut lb.residual, 1.0)?;
-            }
-
-            // Pre-FFN norm
+            // pre_feedforward_layernorm
             if let Some(ref pre_norm) = layer.pre_ffn_norm {
                 ops::rmsnorm(&self.cache, device, &lb.residual, pre_norm,
                     &mut lb.ffn_normed, h, self.config.norm_eps)?;
@@ -292,21 +291,12 @@ impl GemmaGenerationEngine {
             crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.geglu, &layer.w_down,
                 &mut lb.ffn_out, h, ffn)?;
 
-            // Post-FFN norm
+            // post_feedforward_layernorm
             if let Some(ref post_norm) = layer.post_ffn_norm {
-                let mut ffn_normed2 = GpuTensor::<f32>::zeros(device,
-                    Shape::from_static(&[1, h as usize]), DType::F32)?;
                 ops::rmsnorm(&self.cache, device, &lb.ffn_out, post_norm,
-                    &mut ffn_normed2, h, self.config.norm_eps)?;
-                lb.ffn_out = ffn_normed2;
-            }
-
-            // FFN residual: residual + ffn_output * layer_scalar
-            if ls != 1.0 {
-                let mut scaled = GpuTensor::<f32>::zeros(device,
-                    Shape::from_static(&[1, h as usize]), DType::F32)?;
-                ops::mul_scalar(&self.cache, device, &lb.ffn_out, &mut scaled, ls)?;
-                ops::add(&self.cache, device, &lb.residual, &scaled, &mut lb.output)?;
+                    &mut lb.geglu, h, self.config.norm_eps)?;
+                // output = residual + post_ffn_normed
+                ops::add(&self.cache, device, &lb.residual, &lb.geglu, &mut lb.output)?;
             } else {
                 ops::add(&self.cache, device, &lb.residual, &lb.ffn_out, &mut lb.output)?;
             }
