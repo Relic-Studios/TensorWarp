@@ -332,6 +332,15 @@ fn load_gemma_layer_q4(
         bq, bk, bv,
         q_norm: loader.load_f32(&format!("{prefix}.self_attn.q_norm.weight"), device).ok(),
         k_norm: loader.load_f32(&format!("{prefix}.self_attn.k_norm.weight"), device).ok(),
+        pre_ffn_norm: loader.load_f32(&format!("{prefix}.pre_feedforward_layernorm.weight"), device).ok(),
+        post_ffn_norm: loader.load_f32(&format!("{prefix}.post_feedforward_layernorm.weight"), device).ok(),
+        layer_scalar: {
+            // layer_scalar is a single float tensor
+            let ls = loader.load_f32(&format!("{prefix}.layer_scalar"), device).ok()
+                .and_then(|t| t.to_host(device).ok())
+                .and_then(|v| v.first().copied());
+            ls
+        },
         wq_bm: None, wk_bm: None, wv_bm: None, wo_bm: None,
         w_gate_bm: None, w_up_bm: None, w_down_bm: None,
     })
