@@ -326,7 +326,9 @@ extern "C" __global__ void warp_rmsnorm(
 
     float rms = rsqrtf(sum_sq / (float)hidden_size + eps);
 
-    // Normalize
+    // Normalize: x * rms * gamma
+    // NOTE: For Gemma models, gamma is a learned offset (initialized to 0),
+    // so the caller should pass (1+gamma) if needed. Standard LLaMA uses gamma directly.
     for (unsigned int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
         out_row[i] = x_row[i] * rms * gamma[i];
     }

@@ -236,8 +236,14 @@ impl GemmaModelQ4 {
             layers.push(layer);
         }
 
-        // Final norm
-        let final_norm = loader.load_f32(&format!("{prefix}.norm.weight"), device)?;
+        // Final norm (also needs +1 offset for Gemma)
+        let final_norm = {
+            let t = loader.load_f32(&format!("{prefix}.norm.weight"), device)?;
+            let mut host = t.to_host(device).map_err(|e| LoaderError::Device(e.to_string()))?;
+            for v in &mut host { *v += 1.0; }
+            GpuTensor::from_host(device, &host, t.shape.clone(), DType::F32)
+                .map_err(|e| LoaderError::Device(e.to_string()))?
+        };
 
         // LM head
         // For tied embeddings: DON'T duplicate the 5.6 GB embedding table.
@@ -322,18 +328,28 @@ fn load_gemma_layer_q4(
     // O: [q_dim, hidden_size] after transpose. K=q_dim, N=hidden_size.
     let wo = load_and_quantize_q4(loader, device, &format!("{prefix}.self_attn.o_proj.weight"), o_in_dim, h)?;
 
+    // Gemma RMSNorm uses (1 + weight) not weight (weight initialized to zeros).
+    // Add 1.0 to all norm weights on load so our standard RMSNorm kernel works.
+    let add_one_to_norm = |name: &str| -> Result<GpuTensor<f32>, LoaderError> {
+        let t = loader.load_f32(name, device)?;
+        let mut host = t.to_host(device).map_err(|e| LoaderError::Device(e.to_string()))?;
+        for v in &mut host { *v += 1.0; }
+        GpuTensor::from_host(device, &host, t.shape.clone(), DType::F32)
+            .map_err(|e| LoaderError::Device(e.to_string()))
+    };
+
     Ok(QuantizedBlockWeights {
-        attn_norm: loader.load_f32(&format!("{prefix}.input_layernorm.weight"), device)?,
+        attn_norm: add_one_to_norm(&format!("{prefix}.input_layernorm.weight"))?,
         wq, wk, wv, wo,
-        ffn_norm: loader.load_f32(&format!("{prefix}.post_attention_layernorm.weight"), device)?,
+        ffn_norm: add_one_to_norm(&format!("{prefix}.post_attention_layernorm.weight"))?,
         w_gate: load_and_quantize_q4(loader, device, &format!("{prefix}.mlp.gate_proj.weight"), h, ffn)?,
         w_up: load_and_quantize_q4(loader, device, &format!("{prefix}.mlp.up_proj.weight"), h, ffn)?,
         w_down: load_and_quantize_q4(loader, device, &format!("{prefix}.mlp.down_proj.weight"), ffn, h)?,
         bq, bk, bv,
-        q_norm: loader.load_f32(&format!("{prefix}.self_attn.q_norm.weight"), device).ok(),
-        k_norm: loader.load_f32(&format!("{prefix}.self_attn.k_norm.weight"), device).ok(),
-        pre_ffn_norm: loader.load_f32(&format!("{prefix}.pre_feedforward_layernorm.weight"), device).ok(),
-        post_ffn_norm: loader.load_f32(&format!("{prefix}.post_feedforward_layernorm.weight"), device).ok(),
+        q_norm: add_one_to_norm(&format!("{prefix}.self_attn.q_norm.weight")).ok(),
+        k_norm: add_one_to_norm(&format!("{prefix}.self_attn.k_norm.weight")).ok(),
+        pre_ffn_norm: add_one_to_norm(&format!("{prefix}.pre_feedforward_layernorm.weight")).ok(),
+        post_ffn_norm: add_one_to_norm(&format!("{prefix}.post_feedforward_layernorm.weight")).ok(),
         layer_scalar: {
             // layer_scalar is a single float tensor
             let ls = loader.load_f32(&format!("{prefix}.layer_scalar"), device).ok()
