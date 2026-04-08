@@ -339,6 +339,19 @@ impl GemmaGenerationEngine {
                 &mut buffers.logits, 1, self.config.vocab_size, h)?;
         }
 
+        // Debug: raw logits before softcapping (first call only)
+        {
+            let raw = buffers.logits.to_host(device)?;
+            let min = raw.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max = raw.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let nan_count = raw.iter().filter(|v| v.is_nan()).count();
+            let inf_count = raw.iter().filter(|v| v.is_infinite()).count();
+            static DIAG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if DIAG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2 {
+                eprintln!("[gemma] Raw logits: range=[{:.1}, {:.1}], nan={}, inf={}", min, max, nan_count, inf_count);
+            }
+        }
+
         // Logit softcapping
         if self.config.final_logit_softcapping > 0.0 {
             let mut capped = GpuTensor::<f32>::zeros(device, buffers.logits.shape.clone(), DType::F32)?;
