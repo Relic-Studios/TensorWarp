@@ -59,11 +59,11 @@ pub fn embedding(
 }
 
 /// F16 embedding lookup with F32 output: out[i,:] = (float)table_f16[indices[i], :]
+/// Uses unsigned short + PTX instead of cuda_fp16.h to avoid include path issues.
 const EMBEDDING_F16_SRC: &str = r#"
-#include <cuda_fp16.h>
 extern "C" __global__ void warp_embedding_f16(
     float *out,
-    const __half *table,
+    const unsigned short *table,  // F16 as raw u16 bits
     const int *indices,
     unsigned int seq_len,
     unsigned int hidden_size
@@ -76,7 +76,10 @@ extern "C" __global__ void warp_embedding_f16(
     unsigned int dim = idx % hidden_size;
     int token_id = indices[pos];
 
-    out[idx] = __half2float(table[token_id * hidden_size + dim]);
+    unsigned short bits = table[token_id * hidden_size + dim];
+    float val;
+    asm volatile("cvt.f32.f16 %0, %1;" : "=f"(val) : "h"(bits));
+    out[idx] = val;
 }
 "#;
 
