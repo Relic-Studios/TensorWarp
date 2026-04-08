@@ -620,7 +620,7 @@ fn run_safetensors(
         println!("Loaded in {:.1}s", load_start.elapsed().as_secs_f64());
 
         // Build generation engine
-        let engine = warp_kernels::gemma_generate::GemmaGenerationEngine::from_loaded(
+        let mut engine = warp_kernels::gemma_generate::GemmaGenerationEngine::from_loaded(
             model.config.clone(), model.layer_configs.clone(),
             model.embed_tokens, model.layers, model.final_norm, model.lm_head,
         );

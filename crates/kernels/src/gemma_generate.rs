@@ -61,6 +61,8 @@ pub struct GemmaGenerationEngine {
     pub final_norm: GpuTensor<f32>,
     pub lm_head: GpuTensor<f32>,
     pub cache: KernelCache,
+    /// Cached host-side F32 embedding for CPU LM head (avoids 2.8GB DtoH per token)
+    pub embed_host_f32: Option<Vec<f32>>,
 }
 
 impl GemmaGenerationEngine {
@@ -76,6 +78,7 @@ impl GemmaGenerationEngine {
         Self {
             config, layer_configs, embed_tokens, layers, final_norm, lm_head,
             cache: KernelCache::new(),
+            embed_host_f32: None,
         }
     }
 
@@ -147,6 +150,19 @@ impl GemmaGenerationEngine {
             logits: GpuTensor::zeros(device, Shape::from_static(&[1, vocab]), DType::F32)?,
             layers,
         })
+    }
+
+    /// Cache the host-side F32 embedding for CPU LM head.
+    /// Called once before generation to avoid 2.8 GB DtoH per token.
+    pub fn cache_embed_for_lm_head(&mut self, device: &WarpDevice) -> Result<(), DeviceError> {
+        if self.embed_host_f32.is_none() && self.config.tie_word_embeddings {
+            eprintln!("[gemma] Caching F32 embedding on host for LM head...");
+            let raw = self.embed_tokens.to_host(device)?;
+            let f32_data: Vec<f32> = raw.iter().map(|h| h.to_f32()).collect();
+            eprintln!("[gemma] Cached {:.1} MB", f32_data.len() as f64 * 4.0 / 1e6);
+            self.embed_host_f32 = Some(f32_data);
+        }
+        Ok(())
     }
 
     /// Pre-allocated decode step — zero allocation during generation.
@@ -257,13 +273,11 @@ impl GemmaGenerationEngine {
         ops::rmsnorm(&self.cache, device, &buffers.layers[last].output,
             &self.final_norm, &mut buffers.normed_final, h, self.config.norm_eps)?;
 
-        // LM head (CPU fallback for tied F16 embeddings — will optimize later)
+        // LM head (CPU with cached embedding — no per-token DtoH of 2.8 GB)
         if self.config.tie_word_embeddings && self.lm_head.numel <= 1 {
             let normed_host = buffers.normed_final.to_host(device)?;
-            let embed_host: Vec<f32> = {
-                let raw = self.embed_tokens.to_host(device)?;
-                raw.iter().map(|h| h.to_f32()).collect()
-            };
+            let embed_host = self.embed_host_f32.as_ref()
+                .expect("call cache_embed_for_lm_head() before generate()");
             let vocab = self.config.vocab_size;
             let mut logits_host = vec![0.0f32; vocab as usize];
             for v in 0..vocab as usize {
@@ -510,13 +524,16 @@ impl GemmaGenerationEngine {
 
     /// Generate tokens autoregressively.
     pub fn generate(
-        &self,
+        &mut self,
         device: &WarpDevice,
         prompt_ids: &[i32],
         gen_config: &GenerateConfig,
         max_seq_len: u32,
     ) -> Result<GenerationResult, DeviceError> {
         let vocab = self.config.vocab_size as usize;
+
+        // Cache host-side embedding for CPU LM head (one-time cost)
+        self.cache_embed_for_lm_head(device)?;
 
         // Allocate per-layer KV caches + decode buffers (zero allocation during generation)
         let mut kv_caches = self.allocate_kv_caches(device, max_seq_len)?;
