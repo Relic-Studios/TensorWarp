@@ -227,8 +227,21 @@ impl GemmaGenerationEngine {
         let vocab = self.config.vocab_size;
         let mut logits = GpuTensor::<f32>::zeros(device,
             Shape::from_static(&[1, vocab as usize]), DType::F32)?;
-        ops::gemm(&self.cache, device, &normed, &self.lm_head,
-            &mut logits, 1, vocab, h)?;
+
+        // LM head: for tied embeddings, embed_tokens is [vocab, hidden].
+        // We need logits[1,V] = normed[1,H] × embed^T[H,V].
+        // Use embed_tokens with transposed B if lm_head is the placeholder.
+        if self.config.tie_word_embeddings && self.lm_head.numel <= 1 {
+            // embed_tokens is [V, H] row-major. We want C = A × B^T.
+            // cuBLAS: C^T[V,1] = embed[V,H] × normed^T[H,1] (no transpose needed!)
+            // This is: m=V, n=1, k=H, A=embed(lda=H), B=normed(ldb=H), C=logits(ldc=V)
+            // Actually just treat embed_tokens[V,H] as B[H,V] with transB.
+            crate::cublas_gemm::gemm_cublas_f32_transB(device,
+                &normed, &self.embed_tokens, &mut logits, 1, vocab, h)?;
+        } else {
+            ops::gemm(&self.cache, device, &normed, &self.lm_head,
+                &mut logits, 1, vocab, h)?;
+        }
 
         // Logit softcapping
         if self.config.final_logit_softcapping > 0.0 {

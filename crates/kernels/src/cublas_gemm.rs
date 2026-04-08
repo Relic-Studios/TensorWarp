@@ -56,6 +56,45 @@ pub fn gemm_cublas_f32(
     Ok(())
 }
 
+/// F32 GEMM with transposed B: C[M,N] = A[M,K] × B^T[K,N] where B is stored as [N,K].
+/// Used for tied embeddings: logits = hidden × embed_tokens^T.
+pub fn gemm_cublas_f32_transB(
+    device: &WarpDevice,
+    a: &GpuTensor<f32>,   // [M, K] row-major
+    b: &GpuTensor<f32>,   // [N, K] row-major (will be transposed)
+    c: &mut GpuTensor<f32>, // [M, N] row-major
+    m: u32, n: u32, k: u32,
+) -> Result<(), DeviceError> {
+    let blas = device.cublas()?;
+
+    // Row-major C[M,N] = A[M,K] × B^T[K,N] where B stored as [N,K]
+    // Column-major: C^T[N,M] = (B^T)^T[N,K] × A^T[K,M] = B[N,K] × A^T[K,M]
+    // cuBLAS: transa=CUBLAS_OP_T (transpose B in col-major = no-transpose of B row-major... wait)
+    //
+    // Actually: in column-major land:
+    //   C^T[N,M] = B_colmaj[N,K] × A^T_colmaj[K,M]
+    //   B row-major [N,K] = B^T column-major [K,N], so we need transA=T to get [N,K]
+    //   A row-major [M,K] = A^T column-major [K,M], no transpose needed
+    let cfg = GemmConfig {
+        transa: cublasOperation_t::CUBLAS_OP_T,  // transpose B (stored as [N,K] row-major)
+        transb: cublasOperation_t::CUBLAS_OP_N,  // A as-is
+        m: n as i32,
+        n: m as i32,
+        k: k as i32,
+        alpha: 1.0f32,
+        lda: k as i32,   // leading dim of B in col-major (K, since B is [N,K] row-major = [K,N] col-major)
+        ldb: k as i32,   // leading dim of A in col-major (K, since A is [M,K] row-major = [K,M] col-major)
+        beta: 0.0f32,
+        ldc: n as i32,
+    };
+
+    unsafe {
+        blas.gemm(cfg, &b.data, &a.data, &mut c.data)
+            .map_err(|e| DeviceError::Launch(format!("cuBLAS sgemm transB: {e}")))?;
+    }
+    Ok(())
+}
+
 /// FP16 GEMM via cuBLAS: C = A @ B (row-major, half precision)
 ///
 /// Uses cuBLAS HGEMM with automatic tensor core dispatch.

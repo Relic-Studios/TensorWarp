@@ -228,10 +228,16 @@ impl GemmaModelQ4 {
         // Final norm
         let final_norm = loader.load_f32(&format!("{prefix}.norm.weight"), device)?;
 
-        // LM head (tied to embedding for Gemma)
+        // LM head
+        // For tied embeddings: DON'T duplicate the 5.6 GB embedding table.
+        // Instead, store a placeholder — the generation engine will use
+        // the embedding table directly with a transposed GEMM.
         let lm_head = if config.tie_word_embeddings {
-            eprintln!("  Tied embeddings: transposing embed_tokens for lm_head");
-            loader.load_f32_transposed(&format!("{prefix}.embed_tokens.weight"), device)?
+            eprintln!("  Tied embeddings: LM head will reuse embed_tokens (saves {:.1} GB)",
+                (config.vocab_size as f64 * config.hidden_size as f64 * 4.0) / 1e9);
+            // Create a tiny placeholder — the engine uses embed_tokens for the LM head GEMM
+            GpuTensor::from_host(device, &[0.0f32], Shape::from_static(&[1]), DType::F32)
+                .map_err(|e| LoaderError::Device(e.to_string()))?
         } else {
             loader.load_f32_transposed("lm_head.weight", device)?
         };
