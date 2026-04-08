@@ -58,6 +58,54 @@ pub fn embedding(
     Ok(())
 }
 
+/// F16 embedding lookup with F32 output: out[i,:] = (float)table_f16[indices[i], :]
+const EMBEDDING_F16_SRC: &str = r#"
+#include <cuda_fp16.h>
+extern "C" __global__ void warp_embedding_f16(
+    float *out,
+    const __half *table,
+    const int *indices,
+    unsigned int seq_len,
+    unsigned int hidden_size
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = seq_len * hidden_size;
+    if (idx >= total) return;
+
+    unsigned int pos = idx / hidden_size;
+    unsigned int dim = idx % hidden_size;
+    int token_id = indices[pos];
+
+    out[idx] = __half2float(table[token_id * hidden_size + dim]);
+}
+"#;
+
+/// F16 embedding lookup → F32 output. Saves 50% VRAM on embedding table.
+pub fn embedding_f16(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    table: &GpuTensor<half::f16>,
+    indices: &GpuTensor<i32>,
+    out: &mut GpuTensor<f32>,
+    seq_len: u32,
+    hidden_size: u32,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, EMBEDDING_F16_SRC, "warp_embedding_f16")?;
+    let total = seq_len * hidden_size;
+    let cfg = LaunchConfig::for_num_elems(total);
+    unsafe {
+        device.stream.launch_builder(&f)
+            .arg(&mut out.data)
+            .arg(&table.data)
+            .arg(&indices.data)
+            .arg(&seq_len)
+            .arg(&hidden_size)
+            .launch(cfg)
+            .map_err(|e: cudarc::driver::result::DriverError| DeviceError::Launch(e.to_string()))?;
+    }
+    Ok(())
+}
+
 // ── Softmax ───────────────────────────────────────────────────────
 
 const SOFTMAX_SRC: &str = r#"

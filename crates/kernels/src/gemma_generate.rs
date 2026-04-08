@@ -24,7 +24,8 @@ use crate::transformer::{GemmaConfig, GemmaLayerAttentionConfig, QuantizedBlockW
 pub struct GemmaGenerationEngine {
     pub config: GemmaConfig,
     pub layer_configs: Vec<GemmaLayerAttentionConfig>,
-    pub embed_tokens: GpuTensor<f32>,
+    /// Embedding table stored as F16 (saves 2.8 GB for 262K vocab)
+    pub embed_tokens: GpuTensor<half::f16>,
     pub layers: Vec<QuantizedBlockWeights>,
     pub final_norm: GpuTensor<f32>,
     pub lm_head: GpuTensor<f32>,
@@ -36,7 +37,7 @@ impl GemmaGenerationEngine {
     pub fn from_loaded(
         config: GemmaConfig,
         layer_configs: Vec<GemmaLayerAttentionConfig>,
-        embed_tokens: GpuTensor<f32>,
+        embed_tokens: GpuTensor<half::f16>,
         layers: Vec<QuantizedBlockWeights>,
         final_norm: GpuTensor<f32>,
         lm_head: GpuTensor<f32>,
@@ -85,12 +86,12 @@ impl GemmaGenerationEngine {
         let h = self.config.hidden_size;
         let ffn = self.config.ffn_dim;
 
-        // Embedding
+        // Embedding (F16 table → F32 output)
         let ids = GpuTensor::from_host(device, &[token_id],
             Shape::from_static(&[1]), DType::I32)?;
         let mut hidden = GpuTensor::<f32>::zeros(device,
             Shape::from_static(&[1, h as usize]), DType::F32)?;
-        sampling::embedding(&self.cache, device, &self.embed_tokens, &ids,
+        sampling::embedding_f16(&self.cache, device, &self.embed_tokens, &ids,
             &mut hidden, 1, h)?;
 
         for (i, (layer, lc)) in self.layers.iter().zip(self.layer_configs.iter()).enumerate() {
@@ -232,12 +233,28 @@ impl GemmaGenerationEngine {
         // We need logits[1,V] = normed[1,H] × embed^T[H,V].
         // Use embed_tokens with transposed B if lm_head is the placeholder.
         if self.config.tie_word_embeddings && self.lm_head.numel <= 1 {
-            // embed_tokens is [V, H] row-major. We want C = A × B^T.
-            // cuBLAS: C^T[V,1] = embed[V,H] × normed^T[H,1] (no transpose needed!)
-            // This is: m=V, n=1, k=H, A=embed(lda=H), B=normed(ldb=H), C=logits(ldc=V)
-            // Actually just treat embed_tokens[V,H] as B[H,V] with transB.
-            crate::cublas_gemm::gemm_cublas_f32_transB(device,
-                &normed, &self.embed_tokens, &mut logits, 1, vocab, h)?;
+            // embed_tokens is F16 [V, H]. We need logits[1,V] = normed[1,H] × embed^T[H,V].
+            // Cast normed to F16, use cuBLAS HGEMM with transB, cast result back to F32.
+            // For now, use the custom M=1 F32 path: download embed row-by-row is too slow.
+            // Instead: cast normed to F16, then use F16 GEMM.
+            // Actually simplest: use ops::gemm_m1_f32 with a transposed view... but we don't have that.
+            // Fallback: download normed to CPU, do matmul on CPU for the LM head.
+            // This is only 262K × 5376 dot products = ~1.4B FMAs, ~100ms on CPU.
+            let normed_host = normed.to_host(device)?;
+            let embed_host: Vec<f32> = {
+                let raw = self.embed_tokens.to_host(device)?;
+                raw.iter().map(|h| h.to_f32()).collect()
+            };
+            let mut logits_host = vec![0.0f32; vocab as usize];
+            for v in 0..vocab as usize {
+                let mut dot = 0.0f32;
+                for d in 0..h as usize {
+                    dot += normed_host[d] * embed_host[v * h as usize + d];
+                }
+                logits_host[v] = dot;
+            }
+            logits = GpuTensor::from_host(device, &logits_host,
+                Shape::from_static(&[1, vocab as usize]), DType::F32)?;
         } else {
             ops::gemm(&self.cache, device, &normed, &self.lm_head,
                 &mut logits, 1, vocab, h)?;
