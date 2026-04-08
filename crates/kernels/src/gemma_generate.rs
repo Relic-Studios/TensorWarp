@@ -226,9 +226,17 @@ impl GemmaGenerationEngine {
                     num_kv_heads, 1, d, lc.rope_theta, pos)?;
             }
 
-            // QK-norm
-            ops::rmsnorm_no_weight(&self.cache, device, &lb.q_rope, &mut lb.q_norm, d, self.config.norm_eps)?;
-            ops::rmsnorm_no_weight(&self.cache, device, &lb.k_rope, &mut lb.k_norm, d, self.config.norm_eps)?;
+            // QK-norm (with learnable weights if available, otherwise plain RMS)
+            if let Some(ref qn) = layer.q_norm {
+                ops::rmsnorm(&self.cache, device, &lb.q_rope, qn, &mut lb.q_norm, d, self.config.norm_eps)?;
+            } else {
+                ops::rmsnorm_no_weight(&self.cache, device, &lb.q_rope, &mut lb.q_norm, d, self.config.norm_eps)?;
+            }
+            if let Some(ref kn) = layer.k_norm {
+                ops::rmsnorm(&self.cache, device, &lb.k_rope, kn, &mut lb.k_norm, d, self.config.norm_eps)?;
+            } else {
+                ops::rmsnorm_no_weight(&self.cache, device, &lb.k_rope, &mut lb.k_norm, d, self.config.norm_eps)?;
+            }
 
             // KV cache append
             let kv_cache = &mut kv_caches[i];
@@ -392,11 +400,19 @@ impl GemmaGenerationEngine {
             }
 
             if i == 0 { device.synchronize()?; eprintln!("[decode] layer 0: RoPE OK"); }
-            // 4. QK-norm (RMSNorm on Q and K before attention)
+            // 4. QK-norm (with learnable weights if available)
             let mut q_normed = GpuTensor::<f32>::zeros(device, q_rope.shape.clone(), DType::F32)?;
             let mut k_normed = GpuTensor::<f32>::zeros(device, k_rope.shape.clone(), DType::F32)?;
-            ops::rmsnorm_no_weight(&self.cache, device, &q_rope, &mut q_normed, d, self.config.norm_eps)?;
-            ops::rmsnorm_no_weight(&self.cache, device, &k_rope, &mut k_normed, d, self.config.norm_eps)?;
+            if let Some(ref qn) = layer.q_norm {
+                ops::rmsnorm(&self.cache, device, &q_rope, qn, &mut q_normed, d, self.config.norm_eps)?;
+            } else {
+                ops::rmsnorm_no_weight(&self.cache, device, &q_rope, &mut q_normed, d, self.config.norm_eps)?;
+            }
+            if let Some(ref kn) = layer.k_norm {
+                ops::rmsnorm(&self.cache, device, &k_rope, kn, &mut k_normed, d, self.config.norm_eps)?;
+            } else {
+                ops::rmsnorm_no_weight(&self.cache, device, &k_rope, &mut k_normed, d, self.config.norm_eps)?;
+            }
 
             if i == 0 {
                 device.synchronize()?;

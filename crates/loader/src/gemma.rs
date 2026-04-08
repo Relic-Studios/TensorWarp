@@ -310,12 +310,8 @@ fn load_gemma_layer_q4(
     // K: [hidden_size, kv_dim] after transpose
     let wk = load_and_quantize_q4(loader, device, &format!("{prefix}.self_attn.k_proj.weight"), h, kv_dim)?;
 
-    // V: same as K when k_eq_v
-    let wv = if config.k_eq_v {
-        load_and_quantize_q4(loader, device, &format!("{prefix}.self_attn.k_proj.weight"), h, kv_dim)?
-    } else {
-        load_and_quantize_q4(loader, device, &format!("{prefix}.self_attn.v_proj.weight"), h, kv_dim)?
-    };
+    // V projection: always load from v_proj.weight (even with k_eq_v — weights exist on disk)
+    let wv = load_and_quantize_q4(loader, device, &format!("{prefix}.self_attn.v_proj.weight"), h, kv_dim)?;
 
     // O: [q_dim, hidden_size] after transpose. K=q_dim, N=hidden_size.
     let wo = load_and_quantize_q4(loader, device, &format!("{prefix}.self_attn.o_proj.weight"), o_in_dim, h)?;
@@ -328,6 +324,8 @@ fn load_gemma_layer_q4(
         w_up: load_and_quantize_q4(loader, device, &format!("{prefix}.mlp.up_proj.weight"), h, ffn)?,
         w_down: load_and_quantize_q4(loader, device, &format!("{prefix}.mlp.down_proj.weight"), ffn, h)?,
         bq, bk, bv,
+        q_norm: loader.load_f32(&format!("{prefix}.self_attn.q_norm.weight"), device).ok(),
+        k_norm: loader.load_f32(&format!("{prefix}.self_attn.k_norm.weight"), device).ok(),
         wq_bm: None, wk_bm: None, wv_bm: None, wo_bm: None,
         w_gate_bm: None, w_up_bm: None, w_down_bm: None,
     })

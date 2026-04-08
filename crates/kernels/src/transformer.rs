@@ -367,6 +367,9 @@ pub struct QuantizedBlockWeights {
     pub bq: Option<GpuTensor<f32>>,
     pub bk: Option<GpuTensor<f32>>,
     pub bv: Option<GpuTensor<f32>>,
+    /// QK-norm weights (Gemma 3/4) — RMSNorm applied to Q and K before attention
+    pub q_norm: Option<GpuTensor<f32>>,
+    pub k_norm: Option<GpuTensor<f32>>,
     /// Block-major reordered weights for coalesced M=1 GEMM reads.
     /// Created once by `reorder_for_decode()`. None until reordered.
     pub wq_bm: Option<GpuTensor<u8>>,
@@ -440,6 +443,7 @@ pub fn quantize_block_weights(
             Some(t) => Some(GpuTensor::from_host(device, &t.to_host(device)?, t.shape.clone(), warp_ir::DType::F32)?),
             None => None,
         },
+        q_norm: None, k_norm: None,
         wq_bm: None, wk_bm: None, wv_bm: None, wo_bm: None,
         w_gate_bm: None, w_up_bm: None, w_down_bm: None,
     })
@@ -2242,7 +2246,7 @@ mod tests {
             w_gate: GpuTensor::from_host(&dev, &unfused.w_gate.to_host(&dev).unwrap(), unfused.w_gate.shape.clone(), DType::F32).unwrap(),
             w_up: GpuTensor::from_host(&dev, &unfused.w_up.to_host(&dev).unwrap(), unfused.w_up.shape.clone(), DType::F32).unwrap(),
             w_down: GpuTensor::from_host(&dev, &unfused.w_down.to_host(&dev).unwrap(), unfused.w_down.shape.clone(), DType::F32).unwrap(),
-            bq: None, bk: None, bv: None,
+            bq: None, bk: None, bv: None, q_norm: None, k_norm: None,
             wqkv: None, bqkv: None, w_gate_up: None,
         };
         fused.fuse_projections(&dev).unwrap();
