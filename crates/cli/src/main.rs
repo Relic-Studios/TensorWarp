@@ -589,23 +589,74 @@ fn run_safetensors(
     let is_gemma = warp_loader::GemmaHFConfig::is_gemma(&config_json);
 
     if is_gemma {
-        eprintln!("Detected Gemma architecture — Gemma loader not yet wired into generation engine.");
-        eprintln!("Config parsed successfully. Kernel foundations ready (GeGLU, sliding window, QK-norm, partial RoPE).");
-        eprintln!("Next step: wire GemmaModelQ4 into a Gemma generation engine.");
-        // TODO: Load and run Gemma model
-        // For now, just parse and display config
-        match warp_loader::GemmaHFConfig::from_json(config_path.to_str().unwrap_or("")) {
-            Ok(cfg) => {
-                let gc = cfg.to_gemma_config();
-                println!("Gemma Config: {} layers, H={}, vocab={}, GQA={}/{}, head_dim={}",
-                    gc.num_layers, gc.hidden_size, gc.vocab_size,
-                    gc.num_heads, gc.num_kv_heads, gc.head_dim);
-                println!("  Sliding window: {}, pattern: 1 global per {} layers",
-                    gc.sliding_window, gc.sliding_window_pattern);
-                println!("  K=V sharing: {}, GeGLU activation, softcapping: {}",
-                    gc.k_eq_v, gc.final_logit_softcapping);
+        let gemma_hf = match warp_loader::GemmaHFConfig::from_json(config_path.to_str().unwrap_or("")) {
+            Ok(cfg) => cfg,
+            Err(e) => { eprintln!("Failed to parse Gemma config: {e}"); std::process::exit(1); }
+        };
+        let gc = gemma_hf.to_gemma_config();
+        println!("Gemma Config: {} layers, H={}, vocab={}, GQA={}/{}, head_dim={}",
+            gc.num_layers, gc.hidden_size, gc.vocab_size,
+            gc.num_heads, gc.num_kv_heads, gc.head_dim);
+        println!("  Sliding window: {}, pattern: 1 global per {} layers",
+            gc.sliding_window, gc.sliding_window_pattern);
+        println!("  K=V sharing: {}, GeGLU: true, softcapping: {}", gc.k_eq_v, gc.final_logit_softcapping);
+
+        // Load model
+        let device = match WarpDevice::new(0) {
+            Ok(d) => { println!("GPU: {}", d.summary()); d }
+            Err(e) => { eprintln!("CUDA init failed: {e}"); std::process::exit(1); }
+        };
+
+        let sharded = warp_loader::safetensors_loader::ShardedSafeTensorsLoader::open_dir(model_path)
+            .unwrap_or_else(|e| { eprintln!("Failed to open SafeTensors: {e}"); std::process::exit(1); });
+
+        println!("\nLoading Gemma 4 weights (Q4 quantization on load)...");
+        let load_start = std::time::Instant::now();
+        let model = match warp_loader::GemmaModelQ4::load(&sharded, &gemma_hf, &device) {
+            Ok(m) => m,
+            Err(e) => { eprintln!("Failed to load model: {e}"); std::process::exit(1); }
+        };
+        device.synchronize().unwrap();
+        println!("Loaded in {:.1}s", load_start.elapsed().as_secs_f64());
+
+        // Build generation engine
+        let engine = warp_kernels::gemma_generate::GemmaGenerationEngine::from_loaded(
+            model.config.clone(), model.layer_configs.clone(),
+            model.embed_tokens, model.layers, model.final_norm, model.lm_head,
+        );
+
+        let gen_config = warp_kernels::generate::GenerateConfig {
+            max_tokens: max_tokens as usize,
+            temperature,
+            eos_token_id: Some(1), // Gemma EOS token
+            greedy: greedy || temperature <= 0.01,
+            top_k, top_p,
+            repetition_penalty: rep_penalty,
+            stop_sequences: Vec::new(),
+        };
+
+        let prompt_text = if prompt.is_empty() { "Hello" } else { prompt };
+        // Simple tokenization: use the tokenizer if available
+        let tokenizer_path = model_path.join("tokenizer.json");
+        let prompt_ids = if tokenizer_path.exists() {
+            match warp_loader::Tokenizer::from_file(tokenizer_path.to_str().unwrap_or("")) {
+                Ok(tok) => {
+                    let ids: Vec<i32> = tok.encode(prompt_text).into_iter().map(|t| t as i32).collect();
+                    println!("Prompt: \"{}\" → {} tokens", prompt_text, ids.len());
+                    ids
+                }
+                Err(_) => { println!("Tokenizer failed, using token [2] (BOS)"); vec![2] }
             }
-            Err(e) => eprintln!("Failed to parse Gemma config: {e}"),
+        } else {
+            println!("No tokenizer.json, using token [2] (BOS)");
+            vec![2]
+        };
+
+        println!("\nGenerating (max_seq_len=2048, Gemma 4 Q4)...");
+        let max_seq_len = 2048u32;
+        match engine.generate(&device, &prompt_ids, &gen_config, max_seq_len) {
+            Ok(result) => { println!("\n{result}"); }
+            Err(e) => { eprintln!("\nGeneration failed: {e}"); }
         }
         std::process::exit(0);
     }

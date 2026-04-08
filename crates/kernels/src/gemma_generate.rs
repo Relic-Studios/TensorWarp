@@ -20,6 +20,37 @@ use crate::sampling;
 use crate::tensor::GpuTensor;
 use crate::transformer::{GemmaConfig, GemmaLayerAttentionConfig, QuantizedBlockWeights};
 
+/// Per-layer pre-allocated buffers for Gemma decode.
+pub struct GemmaLayerBuffers {
+    pub normed: GpuTensor<f32>,
+    pub q: GpuTensor<f32>,
+    pub k: GpuTensor<f32>,
+    pub v: GpuTensor<f32>,
+    pub q_rope: GpuTensor<f32>,
+    pub k_rope: GpuTensor<f32>,
+    pub q_norm: GpuTensor<f32>,
+    pub k_norm: GpuTensor<f32>,
+    pub attn_out: GpuTensor<f32>,
+    pub attn_proj: GpuTensor<f32>,
+    pub ffn_normed: GpuTensor<f32>,
+    pub residual: GpuTensor<f32>,
+    pub gate: GpuTensor<f32>,
+    pub up: GpuTensor<f32>,
+    pub geglu: GpuTensor<f32>,
+    pub ffn_out: GpuTensor<f32>,
+    pub output: GpuTensor<f32>,
+}
+
+/// All pre-allocated buffers for Gemma decode.
+pub struct GemmaDecodeBuffers {
+    pub ids: GpuTensor<i32>,
+    pub hidden: GpuTensor<f32>,
+    pub hidden_scaled: GpuTensor<f32>,
+    pub normed_final: GpuTensor<f32>,
+    pub logits: GpuTensor<f32>,
+    pub layers: Vec<GemmaLayerBuffers>,
+}
+
 /// Gemma generation engine with Q4 quantized weights.
 pub struct GemmaGenerationEngine {
     pub config: GemmaConfig,
@@ -74,8 +105,193 @@ impl GemmaGenerationEngine {
         Ok(caches)
     }
 
-    /// Single-token decode step with pre-allocated buffers.
-    /// This is the Gemma-specific decode loop with per-layer dispatch.
+    /// Allocate all decode buffers up-front. Zero allocation during generation.
+    fn allocate_decode_buffers(
+        &self,
+        device: &WarpDevice,
+    ) -> Result<GemmaDecodeBuffers, DeviceError> {
+        let h = self.config.hidden_size as usize;
+        let ffn = self.config.ffn_dim as usize;
+        let vocab = self.config.vocab_size as usize;
+
+        let mut layers = Vec::with_capacity(self.layers.len());
+        for lc in &self.layer_configs {
+            let q_dim = (self.config.num_heads * lc.head_dim) as usize;
+            let kv_dim = self.config.kv_dim_for_layer(lc) as usize;
+            layers.push(GemmaLayerBuffers {
+                normed: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F32)?,
+                q: GpuTensor::zeros(device, Shape::from_static(&[1, q_dim]), DType::F32)?,
+                k: GpuTensor::zeros(device, Shape::from_static(&[1, kv_dim]), DType::F32)?,
+                v: GpuTensor::zeros(device, Shape::from_static(&[1, kv_dim]), DType::F32)?,
+                q_rope: GpuTensor::zeros(device, Shape::from_static(&[1, q_dim]), DType::F32)?,
+                k_rope: GpuTensor::zeros(device, Shape::from_static(&[1, kv_dim]), DType::F32)?,
+                q_norm: GpuTensor::zeros(device, Shape::from_static(&[1, q_dim]), DType::F32)?,
+                k_norm: GpuTensor::zeros(device, Shape::from_static(&[1, kv_dim]), DType::F32)?,
+                attn_out: GpuTensor::zeros(device, Shape::from_static(&[1, q_dim]), DType::F32)?,
+                attn_proj: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F32)?,
+                ffn_normed: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F32)?,
+                residual: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F32)?,
+                gate: GpuTensor::zeros(device, Shape::from_static(&[1, ffn]), DType::F32)?,
+                up: GpuTensor::zeros(device, Shape::from_static(&[1, ffn]), DType::F32)?,
+                geglu: GpuTensor::zeros(device, Shape::from_static(&[1, ffn]), DType::F32)?,
+                ffn_out: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F32)?,
+                output: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F32)?,
+            });
+        }
+
+        Ok(GemmaDecodeBuffers {
+            ids: GpuTensor::zeros(device, Shape::from_static(&[1]), DType::I32)?,
+            hidden: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F32)?,
+            hidden_scaled: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F32)?,
+            normed_final: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F32)?,
+            logits: GpuTensor::zeros(device, Shape::from_static(&[1, vocab]), DType::F32)?,
+            layers,
+        })
+    }
+
+    /// Pre-allocated decode step — zero allocation during generation.
+    fn forward_decode_prealloc(
+        &self,
+        device: &WarpDevice,
+        buffers: &mut GemmaDecodeBuffers,
+        kv_caches: &mut [LayerKVCache],
+        pos: u32,
+    ) -> Result<(), DeviceError> {
+        let h = self.config.hidden_size;
+        let ffn = self.config.ffn_dim;
+
+        // Embedding + scaling
+        sampling::embedding_f16(&self.cache, device, &self.embed_tokens, &buffers.ids,
+            &mut buffers.hidden, 1, h)?;
+        let embed_scale = (h as f32).sqrt();
+        ops::mul_scalar(&self.cache, device, &buffers.hidden, &mut buffers.hidden_scaled, embed_scale)?;
+
+        for (i, (layer, lc)) in self.layers.iter().zip(self.layer_configs.iter()).enumerate() {
+            let kv_dim = self.config.kv_dim_for_layer(lc);
+            let d = lc.head_dim;
+            let num_q_heads = self.config.num_heads;
+            let num_kv_heads = lc.num_kv_heads;
+            let q_dim = num_q_heads * d;
+
+            // Get raw pointer to input (previous layer output or hidden_scaled)
+            let x_ptr: *const GpuTensor<f32> = if i == 0 {
+                &buffers.hidden_scaled as *const _
+            } else {
+                // Safety: layers[i-1] is not mutably borrowed — only layers[i] is
+                unsafe { &(*buffers.layers.as_ptr().add(i - 1)).output as *const _ }
+            };
+            let x: &GpuTensor<f32> = unsafe { &*x_ptr };
+            let lb = &mut buffers.layers[i];
+
+            ops::rmsnorm(&self.cache, device, x, &layer.attn_norm, &mut lb.normed, h, self.config.norm_eps)?;
+
+            // Q, K projections
+            crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.normed, &layer.wq, &mut lb.q, q_dim, h)?;
+            crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.normed, &layer.wk, &mut lb.k, kv_dim, h)?;
+
+            // V = K (shared projection)
+            if self.config.k_eq_v {
+                ops::mul_scalar(&self.cache, device, &lb.k, &mut lb.v, 1.0)?;
+            } else {
+                crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.normed, &layer.wv, &mut lb.v, kv_dim, h)?;
+            }
+
+            // RoPE
+            let rotary_dim = (d as f32 * lc.partial_rotary_factor) as u32;
+            if rotary_dim < d && rotary_dim > 0 {
+                crate::rope::rope_partial(&self.cache, device, &lb.q, &mut lb.q_rope,
+                    num_q_heads, 1, d, rotary_dim, lc.rope_theta, pos)?;
+                crate::rope::rope_partial(&self.cache, device, &lb.k, &mut lb.k_rope,
+                    num_kv_heads, 1, d, rotary_dim, lc.rope_theta, pos)?;
+            } else {
+                crate::rope::rope(&self.cache, device, &lb.q, &mut lb.q_rope,
+                    num_q_heads, 1, d, lc.rope_theta, pos)?;
+                crate::rope::rope(&self.cache, device, &lb.k, &mut lb.k_rope,
+                    num_kv_heads, 1, d, lc.rope_theta, pos)?;
+            }
+
+            // QK-norm
+            ops::rmsnorm_no_weight(&self.cache, device, &lb.q_rope, &mut lb.q_norm, d, self.config.norm_eps)?;
+            ops::rmsnorm_no_weight(&self.cache, device, &lb.k_rope, &mut lb.k_norm, d, self.config.norm_eps)?;
+
+            // KV cache append
+            let kv_cache = &mut kv_caches[i];
+            let cache_pos = if lc.window_size > 0 { pos % lc.window_size } else { pos };
+            kv_cache.prefill_at_offset(&self.cache, device, &lb.k_norm, &lb.v, 1, cache_pos)?;
+            kv_cache.len = (pos + 1).min(kv_cache.max_seq_len);
+
+            // Attention
+            let window = if lc.window_size > 0 { lc.window_size } else { 0 };
+            crate::kv_cache::decode_attention_flash_device_len_window(
+                &self.cache, device, &lb.q_norm, kv_cache, &mut lb.attn_out,
+                num_q_heads, num_kv_heads, d,
+                &device.htod(&[kv_cache.len])?,
+                window,
+            )?;
+
+            // Output projection
+            crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.attn_out, &layer.wo,
+                &mut lb.attn_proj, h, q_dim)?;
+
+            // Fused residual + FFN norm
+            ops::fused_residual_rmsnorm(&self.cache, device, &lb.attn_proj, x,
+                &layer.ffn_norm, &mut lb.ffn_normed, &mut lb.residual, h, self.config.norm_eps)?;
+
+            // Gate + Up + GeGLU
+            crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.ffn_normed, &layer.w_gate,
+                &mut lb.gate, ffn, h)?;
+            crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.ffn_normed, &layer.w_up,
+                &mut lb.up, ffn, h)?;
+            ops::fused_gelu_mul(&self.cache, device, &lb.gate, &lb.up, &mut lb.geglu)?;
+
+            // Down projection
+            crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.geglu, &layer.w_down,
+                &mut lb.ffn_out, h, ffn)?;
+
+            // Residual
+            ops::add(&self.cache, device, &lb.residual, &lb.ffn_out, &mut lb.output)?;
+        }
+
+        // Final norm
+        let last = self.layers.len() - 1;
+        ops::rmsnorm(&self.cache, device, &buffers.layers[last].output,
+            &self.final_norm, &mut buffers.normed_final, h, self.config.norm_eps)?;
+
+        // LM head (CPU fallback for tied F16 embeddings — will optimize later)
+        if self.config.tie_word_embeddings && self.lm_head.numel <= 1 {
+            let normed_host = buffers.normed_final.to_host(device)?;
+            let embed_host: Vec<f32> = {
+                let raw = self.embed_tokens.to_host(device)?;
+                raw.iter().map(|h| h.to_f32()).collect()
+            };
+            let vocab = self.config.vocab_size;
+            let mut logits_host = vec![0.0f32; vocab as usize];
+            for v in 0..vocab as usize {
+                let mut dot = 0.0f32;
+                for d in 0..h as usize {
+                    dot += normed_host[d] * embed_host[v * h as usize + d];
+                }
+                logits_host[v] = dot;
+            }
+            buffers.logits = GpuTensor::from_host(device, &logits_host,
+                Shape::from_static(&[1, vocab as usize]), DType::F32)?;
+        } else {
+            ops::gemm(&self.cache, device, &buffers.normed_final, &self.lm_head,
+                &mut buffers.logits, 1, self.config.vocab_size, h)?;
+        }
+
+        // Logit softcapping
+        if self.config.final_logit_softcapping > 0.0 {
+            let mut capped = GpuTensor::<f32>::zeros(device, buffers.logits.shape.clone(), DType::F32)?;
+            ops::logit_softcap(&self.cache, device, &buffers.logits, &mut capped,
+                self.config.final_logit_softcapping)?;
+            buffers.logits = capped;
+        }
+
+        Ok(())
+    }
+
+    /// Single-token decode step (allocating version — slow, used for initial testing).
     fn forward_decode(
         &self,
         device: &WarpDevice,
@@ -86,13 +302,19 @@ impl GemmaGenerationEngine {
         let h = self.config.hidden_size;
         let ffn = self.config.ffn_dim;
 
-        // Embedding (F16 table → F32 output)
+        // Embedding (F16 table → F32 output) + Gemma scaling (multiply by sqrt(hidden_size))
         let ids = GpuTensor::from_host(device, &[token_id],
             Shape::from_static(&[1]), DType::I32)?;
         let mut hidden = GpuTensor::<f32>::zeros(device,
             Shape::from_static(&[1, h as usize]), DType::F32)?;
         sampling::embedding_f16(&self.cache, device, &self.embed_tokens, &ids,
             &mut hidden, 1, h)?;
+        // Gemma scales embeddings by sqrt(hidden_size)
+        let embed_scale = (h as f32).sqrt();
+        let mut hidden_scaled = GpuTensor::<f32>::zeros(device,
+            Shape::from_static(&[1, h as usize]), DType::F32)?;
+        ops::mul_scalar(&self.cache, device, &hidden, &mut hidden_scaled, embed_scale)?;
+        hidden = hidden_scaled;
 
         for (i, (layer, lc)) in self.layers.iter().zip(self.layer_configs.iter()).enumerate() {
             let kv_dim = self.config.kv_dim_for_layer(lc);
@@ -128,9 +350,8 @@ impl GemmaGenerationEngine {
             let mut v = GpuTensor::<f32>::zeros(device,
                 Shape::from_static(&[1, kv_dim as usize]), DType::F32)?;
             if self.config.k_eq_v {
-                // Copy K to V (shared projection)
-                let k_data = k.to_host(device)?;
-                v = GpuTensor::from_host(device, &k_data, k.shape.clone(), DType::F32)?;
+                // Copy K to V on GPU (shared projection)
+                ops::mul_scalar(&self.cache, device, &k, &mut v, 1.0)?;
             } else {
                 crate::quantize::gemm_q4_0_m1(&self.cache, device, &normed, &layer.wv, &mut v, kv_dim, h)?;
             }
@@ -297,20 +518,20 @@ impl GemmaGenerationEngine {
     ) -> Result<GenerationResult, DeviceError> {
         let vocab = self.config.vocab_size as usize;
 
-        // Allocate per-layer KV caches
+        // Allocate per-layer KV caches + decode buffers (zero allocation during generation)
         let mut kv_caches = self.allocate_kv_caches(device, max_seq_len)?;
+        let mut buffers = self.allocate_decode_buffers(device)?;
+        eprintln!("[gemma] Pre-allocated decode buffers ({} layers)", self.layers.len());
 
-        // Prefill: process all prompt tokens
+        // Prefill: process all prompt tokens using pre-allocated buffers
         let prefill_start = std::time::Instant::now();
-        let mut last_logits = Vec::new();
         for (i, &token) in prompt_ids.iter().enumerate() {
-            let logits = self.forward_decode(device, token, &mut kv_caches, i as u32)?;
-            if i == prompt_ids.len() - 1 {
-                last_logits = logits;
-            }
+            device.htod_copy(&[token], &mut buffers.ids.data)?;
+            self.forward_decode_prealloc(device, &mut buffers, &mut kv_caches, i as u32)?;
         }
         device.synchronize()?;
         let prefill_time = prefill_start.elapsed();
+        let mut last_logits = buffers.logits.to_host(device)?;
 
         // Decode
         let decode_start = std::time::Instant::now();
@@ -334,8 +555,10 @@ impl GemmaGenerationEngine {
                 && matches_stop_sequence(&generated, &gen_config.stop_sequences)
             { break; }
 
-            last_logits = self.forward_decode(device, next_token, &mut kv_caches, pos)?;
+            device.htod_copy(&[next_token], &mut buffers.ids.data)?;
+            self.forward_decode_prealloc(device, &mut buffers, &mut kv_caches, pos)?;
             device.synchronize()?;
+            last_logits = buffers.logits.to_host(device)?;
             pos += 1;
         }
 

@@ -991,6 +991,32 @@ extern "C" __global__ void warp_logit_softcap(
 
 /// Apply logit softcapping: out = cap * tanh(x / cap).
 /// No-op if cap <= 0.0.
+/// Multiply all elements by a scalar: out[i] = x[i] * s
+const MUL_SCALAR_SRC: &str = r#"
+extern "C" __global__ void warp_mul_scalar(float *out, const float *x, float s, size_t n) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = x[i] * s;
+}
+"#;
+
+pub fn mul_scalar(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    x: &GpuTensor<f32>,
+    out: &mut GpuTensor<f32>,
+    scalar: f32,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, MUL_SCALAR_SRC, "warp_mul_scalar")?;
+    let n = x.numel;
+    let cfg = LaunchConfig::for_num_elems(n as u32);
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut out.data).arg(&x.data).arg(&scalar).arg(&n)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
 pub fn logit_softcap(
     cache: &KernelCache,
     device: &WarpDevice,
