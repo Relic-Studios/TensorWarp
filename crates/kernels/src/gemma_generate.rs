@@ -273,22 +273,23 @@ impl GemmaGenerationEngine {
         ops::rmsnorm(&self.cache, device, &buffers.layers[last].output,
             &self.final_norm, &mut buffers.normed_final, h, self.config.norm_eps)?;
 
-        // LM head (CPU with cached embedding — no per-token DtoH of 2.8 GB)
+        // LM head: cuBLAS F16 HGEMM with transB (embed_tokens is [V, H] F16)
+        // logits[1,V] = normed[1,H] × embed^T[H,V]
         if self.config.tie_word_embeddings && self.lm_head.numel <= 1 {
-            let normed_host = buffers.normed_final.to_host(device)?;
-            let embed_host = self.embed_host_f32.as_ref()
-                .expect("call cache_embed_for_lm_head() before generate()");
             let vocab = self.config.vocab_size;
-            let mut logits_host = vec![0.0f32; vocab as usize];
-            for v in 0..vocab as usize {
-                let mut dot = 0.0f32;
-                for d in 0..h as usize {
-                    dot += normed_host[d] * embed_host[v * h as usize + d];
-                }
-                logits_host[v] = dot;
-            }
-            buffers.logits = GpuTensor::from_host(device, &logits_host,
-                Shape::from_static(&[1, vocab as usize]), DType::F32)?;
+            // Cast normed F32 → F16
+            let mut normed_f16 = GpuTensor::<half::f16>::zeros(device,
+                Shape::from_static(&[1, h as usize]), DType::F16)?;
+            crate::fp16::cast_f32_to_f16(&self.cache, device, &buffers.normed_final, &mut normed_f16)?;
+
+            // cuBLAS HGEMM transB
+            let mut logits_f16 = GpuTensor::<half::f16>::zeros(device,
+                Shape::from_static(&[1, vocab as usize]), DType::F16)?;
+            crate::cublas_gemm::gemm_cublas_f16_transB(device,
+                &normed_f16, &self.embed_tokens, &mut logits_f16, 1, vocab, h)?;
+
+            // Cast logits F16 → F32
+            crate::fp16::cast_f16_to_f32(&self.cache, device, &logits_f16, &mut buffers.logits)?;
         } else {
             ops::gemm(&self.cache, device, &buffers.normed_final, &self.lm_head,
                 &mut buffers.logits, 1, self.config.vocab_size, h)?;
@@ -549,6 +550,20 @@ impl GemmaGenerationEngine {
         device.synchronize()?;
         let prefill_time = prefill_start.elapsed();
         let mut last_logits = buffers.logits.to_host(device)?;
+
+        // Diagnostic: print top-5 logits after prefill
+        {
+            let mut indexed: Vec<(usize, f32)> = last_logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            eprintln!("[gemma] Top-5 logits after prefill:");
+            for (id, val) in &indexed[..5.min(indexed.len())] {
+                eprintln!("  token {}: logit {:.4}", id, val);
+            }
+            let min_val = last_logits.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max_val = last_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let nonzero = last_logits.iter().filter(|&&v| v != 0.0).count();
+            eprintln!("  range: [{:.4}, {:.4}], nonzero: {}/{}", min_val, max_val, nonzero, last_logits.len());
+        }
 
         // Decode
         let decode_start = std::time::Instant::now();

@@ -95,6 +95,35 @@ pub fn gemm_cublas_f32_transB(
     Ok(())
 }
 
+/// F16 GEMM with transposed B: C[M,N] = A[M,K] × B^T[K,N] where B stored as [N,K].
+/// Used for tied F16 embedding LM head.
+pub fn gemm_cublas_f16_transB(
+    device: &WarpDevice,
+    a: &GpuTensor<half::f16>,
+    b: &GpuTensor<half::f16>,  // stored as [N, K], will be transposed
+    c: &mut GpuTensor<half::f16>,
+    m: u32, n: u32, k: u32,
+) -> Result<(), DeviceError> {
+    let blas = device.cublas()?;
+    let cfg = GemmConfig {
+        transa: cublasOperation_t::CUBLAS_OP_T,
+        transb: cublasOperation_t::CUBLAS_OP_N,
+        m: n as i32,
+        n: m as i32,
+        k: k as i32,
+        alpha: half::f16::from_f32(1.0),
+        lda: k as i32,
+        ldb: k as i32,
+        beta: half::f16::from_f32(0.0),
+        ldc: n as i32,
+    };
+    unsafe {
+        blas.gemm(cfg, &b.data, &a.data, &mut c.data)
+            .map_err(|e| DeviceError::Launch(format!("cuBLAS hgemm transB: {e}")))?;
+    }
+    Ok(())
+}
+
 /// FP16 GEMM via cuBLAS: C = A @ B (row-major, half precision)
 ///
 /// Uses cuBLAS HGEMM with automatic tensor core dispatch.
