@@ -13,6 +13,7 @@
 pub mod safetensors_loader;
 pub mod llama;
 pub mod gemma;
+pub mod warp_cache;
 pub mod onnx;
 pub mod onnx_compile;
 pub mod onnx_exec;
