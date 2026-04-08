@@ -310,8 +310,14 @@ fn load_gemma_layer_q4(
     // K: [hidden_size, kv_dim] after transpose
     let wk = load_and_quantize_q4(loader, device, &format!("{prefix}.self_attn.k_proj.weight"), h, kv_dim)?;
 
-    // V projection: always load from v_proj.weight (even with k_eq_v — weights exist on disk)
-    let wv = load_and_quantize_q4(loader, device, &format!("{prefix}.self_attn.v_proj.weight"), h, kv_dim)?;
+    // V projection: sliding layers have v_proj.weight, global layers share K weights (no v_proj on disk)
+    let wv = match load_and_quantize_q4(loader, device, &format!("{prefix}.self_attn.v_proj.weight"), h, kv_dim) {
+        Ok(v) => v,
+        Err(_) => {
+            // Global layer: V uses K weights
+            load_and_quantize_q4(loader, device, &format!("{prefix}.self_attn.k_proj.weight"), h, kv_dim)?
+        }
+    };
 
     // O: [q_dim, hidden_size] after transpose. K=q_dim, N=hidden_size.
     let wo = load_and_quantize_q4(loader, device, &format!("{prefix}.self_attn.o_proj.weight"), o_in_dim, h)?;
