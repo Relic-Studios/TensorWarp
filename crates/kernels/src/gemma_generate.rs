@@ -63,6 +63,20 @@ pub struct GemmaGenerationEngine {
     pub cache: KernelCache,
     /// Cached host-side F32 embedding for CPU LM head (avoids 2.8GB DtoH per token)
     pub embed_host_f32: Option<Vec<f32>>,
+    /// TW-Marlin weights per layer: (packed_nibbles, fp16_scales) for each projection
+    /// When present, the fast gemm_tw_marlin_m1 is used instead of gemm_q4_0_m1.
+    pub marlin_layers: Option<Vec<GemmaMarlinLayer>>,
+}
+
+/// TW-Marlin weights for one Gemma layer.
+pub struct GemmaMarlinLayer {
+    pub wq_p: GpuTensor<u8>,  pub wq_s: GpuTensor<half::f16>,
+    pub wk_p: GpuTensor<u8>,  pub wk_s: GpuTensor<half::f16>,
+    pub wv_p: GpuTensor<u8>,  pub wv_s: GpuTensor<half::f16>,
+    pub wo_p: GpuTensor<u8>,  pub wo_s: GpuTensor<half::f16>,
+    pub wg_p: GpuTensor<u8>,  pub wg_s: GpuTensor<half::f16>,
+    pub wu_p: GpuTensor<u8>,  pub wu_s: GpuTensor<half::f16>,
+    pub wd_p: GpuTensor<u8>,  pub wd_s: GpuTensor<half::f16>,
 }
 
 impl GemmaGenerationEngine {
@@ -79,6 +93,7 @@ impl GemmaGenerationEngine {
             config, layer_configs, embed_tokens, layers, final_norm, lm_head,
             cache: KernelCache::new(),
             embed_host_f32: None,
+            marlin_layers: None,
         }
     }
 
@@ -152,6 +167,37 @@ impl GemmaGenerationEngine {
         })
     }
 
+    /// Convert all layer weights to TW-Marlin format for fast M=1 GEMM.
+    pub fn convert_to_marlin(&mut self, device: &WarpDevice) -> Result<(), DeviceError> {
+        let h = self.config.hidden_size;
+        let ffn = self.config.ffn_dim;
+        let mut marlin = Vec::with_capacity(self.layers.len());
+
+        for (i, (layer, lc)) in self.layers.iter().zip(self.layer_configs.iter()).enumerate() {
+            let q_dim = self.config.num_heads * lc.head_dim;
+            let kv_dim = self.config.kv_dim_for_layer(lc);
+
+            if i % 10 == 0 { eprintln!("[gemma] Converting layer {}/{} to TW-Marlin...", i, self.layers.len()); }
+
+            let (wq_p, wq_s) = crate::quantize::reorder_to_tw_marlin(device, &layer.wq, h, q_dim)?;
+            let (wk_p, wk_s) = crate::quantize::reorder_to_tw_marlin(device, &layer.wk, h, kv_dim)?;
+            let (wv_p, wv_s) = crate::quantize::reorder_to_tw_marlin(device, &layer.wv, h, kv_dim)?;
+            let (wo_p, wo_s) = crate::quantize::reorder_to_tw_marlin(device, &layer.wo, q_dim, h)?;
+            let (wg_p, wg_s) = crate::quantize::reorder_to_tw_marlin(device, &layer.w_gate, h, ffn)?;
+            let (wu_p, wu_s) = crate::quantize::reorder_to_tw_marlin(device, &layer.w_up, h, ffn)?;
+            let (wd_p, wd_s) = crate::quantize::reorder_to_tw_marlin(device, &layer.w_down, ffn, h)?;
+
+            marlin.push(GemmaMarlinLayer {
+                wq_p, wq_s, wk_p, wk_s, wv_p, wv_s, wo_p, wo_s,
+                wg_p, wg_s, wu_p, wu_s, wd_p, wd_s,
+            });
+        }
+
+        eprintln!("[gemma] TW-Marlin conversion complete ({} layers)", marlin.len());
+        self.marlin_layers = Some(marlin);
+        Ok(())
+    }
+
     /// Cache the host-side F32 embedding for CPU LM head.
     /// Called once before generation to avoid 2.8 GB DtoH per token.
     pub fn cache_embed_for_lm_head(&mut self, device: &WarpDevice) -> Result<(), DeviceError> {
@@ -218,23 +264,22 @@ impl GemmaGenerationEngine {
                 // first8: [7.4203, 2.3646, 7.8419, 5.9251, 7.5541, 3.2455, 4.3227, -2.3455]
             }
 
-            // Q, K projections
-            crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.normed, &layer.wq, &mut lb.q, q_dim, h)?;
-            if i == 0 && pos == 0 {
-                let q_host = lb.q.to_host(device)?;
-                eprintln!("[ref] Q proj: min={:.4}, max={:.4}, mean={:.4}, first8={:?}",
-                    q_host.iter().cloned().fold(f32::INFINITY, f32::min),
-                    q_host.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
-                    q_host.iter().sum::<f32>() / q_host.len() as f32,
-                    &q_host[..8].iter().map(|v| format!("{:.4}", v)).collect::<Vec<_>>());
-                // PyTorch ref: Q min=-171.12, max=187.93, mean=0.61
-                // first8: [104.54, -15.10, -32.97, -60.36, 15.88, -0.98, -8.24, 15.06]
+            // Q, K projections — use TW-Marlin if available (3x faster)
+            let ml = self.marlin_layers.as_ref().map(|m| &m[i]);
+
+            if let Some(ml) = ml {
+                crate::quantize::gemm_tw_marlin_m1(&self.cache, device, &lb.normed, &ml.wq_p, &ml.wq_s, &mut lb.q, q_dim, h)?;
+                crate::quantize::gemm_tw_marlin_m1(&self.cache, device, &lb.normed, &ml.wk_p, &ml.wk_s, &mut lb.k, kv_dim, h)?;
+            } else {
+                crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.normed, &layer.wq, &mut lb.q, q_dim, h)?;
+                crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.normed, &layer.wk, &mut lb.k, kv_dim, h)?;
             }
-            crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.normed, &layer.wk, &mut lb.k, kv_dim, h)?;
 
             // V = K (shared projection)
             if self.config.k_eq_v {
                 ops::mul_scalar(&self.cache, device, &lb.k, &mut lb.v, 1.0)?;
+            } else if let Some(ml) = ml {
+                crate::quantize::gemm_tw_marlin_m1(&self.cache, device, &lb.normed, &ml.wv_p, &ml.wv_s, &mut lb.v, kv_dim, h)?;
             } else {
                 crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.normed, &layer.wv, &mut lb.v, kv_dim, h)?;
             }
@@ -281,8 +326,11 @@ impl GemmaGenerationEngine {
             )?;
 
             // Output projection
-            crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.attn_out, &layer.wo,
-                &mut lb.attn_proj, h, q_dim)?;
+            if let Some(ml) = ml {
+                crate::quantize::gemm_tw_marlin_m1(&self.cache, device, &lb.attn_out, &ml.wo_p, &ml.wo_s, &mut lb.attn_proj, h, q_dim)?;
+            } else {
+                crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.attn_out, &layer.wo, &mut lb.attn_proj, h, q_dim)?;
+            }
 
             // Exact Gemma architecture (from HuggingFace):
             // hidden = post_attention_layernorm(attn_output)
@@ -308,15 +356,21 @@ impl GemmaGenerationEngine {
             }
 
             // Gate + Up + GeGLU
-            crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.ffn_normed, &layer.w_gate,
-                &mut lb.gate, ffn, h)?;
-            crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.ffn_normed, &layer.w_up,
-                &mut lb.up, ffn, h)?;
+            if let Some(ml) = ml {
+                crate::quantize::gemm_tw_marlin_m1(&self.cache, device, &lb.ffn_normed, &ml.wg_p, &ml.wg_s, &mut lb.gate, ffn, h)?;
+                crate::quantize::gemm_tw_marlin_m1(&self.cache, device, &lb.ffn_normed, &ml.wu_p, &ml.wu_s, &mut lb.up, ffn, h)?;
+            } else {
+                crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.ffn_normed, &layer.w_gate, &mut lb.gate, ffn, h)?;
+                crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.ffn_normed, &layer.w_up, &mut lb.up, ffn, h)?;
+            }
             ops::fused_gelu_mul(&self.cache, device, &lb.gate, &lb.up, &mut lb.geglu)?;
 
             // Down projection
-            crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.geglu, &layer.w_down,
-                &mut lb.ffn_out, h, ffn)?;
+            if let Some(ml) = ml {
+                crate::quantize::gemm_tw_marlin_m1(&self.cache, device, &lb.geglu, &ml.wd_p, &ml.wd_s, &mut lb.ffn_out, h, ffn)?;
+            } else {
+                crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.geglu, &layer.w_down, &mut lb.ffn_out, h, ffn)?;
+            }
 
             // post_feedforward_layernorm
             if let Some(ref post_norm) = layer.post_ffn_norm {
@@ -625,6 +679,14 @@ impl GemmaGenerationEngine {
 
         // Cache host-side embedding for CPU LM head (one-time cost)
         self.cache_embed_for_lm_head(device)?;
+
+        // Convert to TW-Marlin for fast M=1 GEMM (if not already done)
+        if self.marlin_layers.is_none() {
+            let marlin_start = std::time::Instant::now();
+            self.convert_to_marlin(device)?;
+            device.synchronize()?;
+            eprintln!("[gemma] TW-Marlin conversion: {:.1}s", marlin_start.elapsed().as_secs_f64());
+        }
 
         // Allocate per-layer KV caches + decode buffers (zero allocation during generation)
         let mut kv_caches = self.allocate_kv_caches(device, max_seq_len)?;
