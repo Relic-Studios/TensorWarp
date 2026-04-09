@@ -49,6 +49,8 @@ pub struct GemmaDecodeBuffers {
     pub normed_final: GpuTensor<f32>,
     pub logits: GpuTensor<f32>,
     pub layers: Vec<GemmaLayerBuffers>,
+    /// Pre-allocated device-side cache_len buffers (one per layer) — avoids 60 cudaMalloc per token
+    pub cache_len_bufs: Vec<cudarc::driver::CudaSlice<u32>>,
 }
 
 /// Gemma generation engine with Q4 quantized weights.
@@ -157,6 +159,11 @@ impl GemmaGenerationEngine {
             });
         }
 
+        let mut cache_len_bufs = Vec::with_capacity(self.layers.len());
+        for _ in 0..self.layers.len() {
+            cache_len_bufs.push(device.alloc_zeros::<u32>(1)?);
+        }
+
         Ok(GemmaDecodeBuffers {
             ids: GpuTensor::zeros(device, Shape::from_static(&[1]), DType::I32)?,
             hidden: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F32)?,
@@ -164,6 +171,7 @@ impl GemmaGenerationEngine {
             normed_final: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F32)?,
             logits: GpuTensor::zeros(device, Shape::from_static(&[1, vocab]), DType::F32)?,
             layers,
+            cache_len_bufs,
         })
     }
 
@@ -316,12 +324,13 @@ impl GemmaGenerationEngine {
             kv_cache.prefill_at_offset(&self.cache, device, &lb.k_norm, &lb.v, 1, cache_pos)?;
             kv_cache.len = (pos + 1).min(kv_cache.max_seq_len);
 
-            // Attention
+            // Attention — use pre-allocated cache_len buffer
             let window = if lc.window_size > 0 { lc.window_size } else { 0 };
+            device.htod_copy(&[kv_cache.len], &mut buffers.cache_len_bufs[i])?;
             crate::kv_cache::decode_attention_flash_device_len_window(
                 &self.cache, device, &lb.q_norm, kv_cache, &mut lb.attn_out,
                 num_q_heads, num_kv_heads, d,
-                &device.htod(&[kv_cache.len])?,
+                &buffers.cache_len_bufs[i],
                 window,
             )?;
 
