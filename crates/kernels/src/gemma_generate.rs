@@ -255,22 +255,7 @@ impl GemmaGenerationEngine {
 
             ops::rmsnorm(&self.cache, device, x, &layer.attn_norm, &mut lb.normed, h, self.config.norm_eps)?;
 
-            // Debug: compare layer 0 intermediate values against PyTorch reference
-            if i == 0 && pos == 0 {
-                let x_host = x.to_host(device)?;
-                eprintln!("[ref] scaled_emb: min={:.4}, max={:.4}, mean={:.4}",
-                    x_host.iter().cloned().fold(f32::INFINITY, f32::min),
-                    x_host.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
-                    x_host.iter().sum::<f32>() / x_host.len() as f32);
-                let n_host = lb.normed.to_host(device)?;
-                eprintln!("[ref] after_norm: min={:.4}, max={:.4}, mean={:.4}, first8={:?}",
-                    n_host.iter().cloned().fold(f32::INFINITY, f32::min),
-                    n_host.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
-                    n_host.iter().sum::<f32>() / n_host.len() as f32,
-                    &n_host[..8].iter().map(|v| format!("{:.4}", v)).collect::<Vec<_>>());
-                // PyTorch ref: after_norm min=-210.33, max=107.53, mean=-0.0670
-                // first8: [7.4203, 2.3646, 7.8419, 5.9251, 7.5541, 3.2455, 4.3227, -2.3455]
-            }
+            // (layer 0 debug traces removed for speed)
 
             // Q, K projections — use TW-Marlin if available (3x faster)
             let ml = self.marlin_layers.as_ref().map(|m| &m[i]);
@@ -419,34 +404,11 @@ impl GemmaGenerationEngine {
                 &mut buffers.logits, 1, self.config.vocab_size, h)?;
         }
 
-        // Debug: raw logits before softcapping (first call only)
-        {
-            let raw = buffers.logits.to_host(device)?;
-            let min = raw.iter().cloned().fold(f32::INFINITY, f32::min);
-            let max = raw.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let nan_count = raw.iter().filter(|v| v.is_nan()).count();
-            let inf_count = raw.iter().filter(|v| v.is_infinite()).count();
-            static DIAG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if DIAG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2 {
-                eprintln!("[gemma] Raw logits: range=[{:.1}, {:.1}], nan={}, inf={}", min, max, nan_count, inf_count);
-            }
-        }
+        // (diagnostics removed for speed — logits are correct but large from Q4)
 
-        // Adaptive logit normalization for Q4 models.
-        // Q4 quantization through 60 layers produces logits in hundreds instead of [-10,10].
-        // Scale them to a reasonable range before sampling.
-        // This is equivalent to a dynamic temperature based on logit magnitude.
-        {
-            let raw = buffers.logits.to_host(device)?;
-            let max_abs = raw.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-            if max_abs > 50.0 {
-                // Normalize to roughly [-30, 30] range
-                let scale = 30.0 / max_abs;
-                let mut scaled = GpuTensor::<f32>::zeros(device, buffers.logits.shape.clone(), DType::F32)?;
-                ops::mul_scalar(&self.cache, device, &buffers.logits, &mut scaled, scale)?;
-                buffers.logits = scaled;
-            }
-        }
+        // Note: Q4 quantization through 60 layers produces logits in hundreds.
+        // The sampling function handles this via temperature scaling.
+        // No per-step normalization needed — the relative ordering is correct.
 
         Ok(())
     }
@@ -750,20 +712,6 @@ impl GemmaGenerationEngine {
         device.synchronize()?;
         let prefill_time = prefill_start.elapsed();
         let mut last_logits = buffers.logits.to_host(device)?;
-
-        // Diagnostic: print top-5 logits after prefill
-        {
-            let mut indexed: Vec<(usize, f32)> = last_logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
-            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            eprintln!("[gemma] Top-5 logits after prefill:");
-            for (id, val) in &indexed[..5.min(indexed.len())] {
-                eprintln!("  token {}: logit {:.4}", id, val);
-            }
-            let min_val = last_logits.iter().cloned().fold(f32::INFINITY, f32::min);
-            let max_val = last_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let nonzero = last_logits.iter().filter(|&&v| v != 0.0).count();
-            eprintln!("  range: [{:.4}, {:.4}], nonzero: {}/{}", min_val, max_val, nonzero, last_logits.len());
-        }
 
         // Decode
         let decode_start = std::time::Instant::now();
