@@ -363,8 +363,6 @@ fn load_gemma_layer_q4(
 }
 
 /// Load a weight tensor, transpose it, and quantize to Q4_0.
-/// VRAM-efficient: downloads F32 to host, drops GPU copy, then quantizes on CPU
-/// and uploads only the Q4 result. Peak VRAM usage is just the F32 tensor size.
 fn load_and_quantize_q4(
     loader: &ShardedSafeTensorsLoader,
     device: &WarpDevice,
@@ -373,20 +371,8 @@ fn load_and_quantize_q4(
     n: u32,
 ) -> Result<GpuTensor<u8>, LoaderError> {
     let cache = KernelCache::new();
-    // Load F32 transposed to GPU
     let w = loader.load_f32_transposed(name, device)?;
-    // Download to host immediately so we can free the GPU copy
-    let w_host = w.to_host(device).map_err(|e| LoaderError::Device(e.to_string()))?;
-    // Drop the F32 GPU tensor to free VRAM before quantizing
-    drop(w);
-    // Re-upload just for quantization (quantize_weights_q4_0 needs a GPU tensor)
-    // Actually, quantize_weights_q4_0 downloads to host again internally — so just
-    // create a minimal GPU tensor and let it do its thing.
-    let w_gpu = GpuTensor::from_host(device, &w_host,
-        Shape::from_static(&[k as usize, n as usize]), DType::F32)
+    let q = warp_kernels::quantize::quantize_weights_q4_0(&cache, device, &w, k, n)
         .map_err(|e| LoaderError::Device(e.to_string()))?;
-    let q = warp_kernels::quantize::quantize_weights_q4_0(&cache, device, &w_gpu, k, n)
-        .map_err(|e| LoaderError::Device(e.to_string()))?;
-    // w_gpu is dropped here, freeing the F32 VRAM
     Ok(q)
 }

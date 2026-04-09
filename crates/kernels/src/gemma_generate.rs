@@ -680,12 +680,51 @@ impl GemmaGenerationEngine {
         // Cache host-side embedding for CPU LM head (one-time cost)
         self.cache_embed_for_lm_head(device)?;
 
-        // Convert to TW-Marlin for fast M=1 GEMM (if not already done)
+        // Convert to TW-Marlin LAYER BY LAYER to manage VRAM.
+        // Each layer: convert Q4 → TW-Marlin, then replace Q4 with tiny placeholder.
+        // Peak VRAM overhead: ~300 MB (one layer's Q4 + TW-Marlin simultaneously).
         if self.marlin_layers.is_none() {
             let marlin_start = std::time::Instant::now();
-            self.convert_to_marlin(device)?;
+            let h = self.config.hidden_size;
+            let ffn = self.config.ffn_dim;
+            let mut marlin = Vec::with_capacity(self.layers.len());
+
+            let num_heads = self.config.num_heads;
+            let num_layers = self.layers.len();
+            let layer_dims: Vec<(u32, u32)> = self.layer_configs.iter()
+                .map(|lc| (num_heads * lc.head_dim, self.config.kv_dim_for_layer(lc)))
+                .collect();
+
+            for i in 0..num_layers {
+                let (q_dim, kv_dim) = layer_dims[i];
+                let layer = &mut self.layers[i];
+
+                if i % 10 == 0 { eprintln!("[gemma] Converting layer {}/{} to TW-Marlin...", i, num_layers); }
+
+                let (wq_p, wq_s) = crate::quantize::reorder_to_tw_marlin(device, &layer.wq, h, q_dim)?;
+                layer.wq = GpuTensor::from_host(device, &[0u8], Shape::from_static(&[1]), DType::U8)?;
+                let (wk_p, wk_s) = crate::quantize::reorder_to_tw_marlin(device, &layer.wk, h, kv_dim)?;
+                layer.wk = GpuTensor::from_host(device, &[0u8], Shape::from_static(&[1]), DType::U8)?;
+                let (wv_p, wv_s) = crate::quantize::reorder_to_tw_marlin(device, &layer.wv, h, kv_dim)?;
+                layer.wv = GpuTensor::from_host(device, &[0u8], Shape::from_static(&[1]), DType::U8)?;
+                let (wo_p, wo_s) = crate::quantize::reorder_to_tw_marlin(device, &layer.wo, q_dim, h)?;
+                layer.wo = GpuTensor::from_host(device, &[0u8], Shape::from_static(&[1]), DType::U8)?;
+                let (wg_p, wg_s) = crate::quantize::reorder_to_tw_marlin(device, &layer.w_gate, h, ffn)?;
+                layer.w_gate = GpuTensor::from_host(device, &[0u8], Shape::from_static(&[1]), DType::U8)?;
+                let (wu_p, wu_s) = crate::quantize::reorder_to_tw_marlin(device, &layer.w_up, h, ffn)?;
+                layer.w_up = GpuTensor::from_host(device, &[0u8], Shape::from_static(&[1]), DType::U8)?;
+                let (wd_p, wd_s) = crate::quantize::reorder_to_tw_marlin(device, &layer.w_down, ffn, h)?;
+                layer.w_down = GpuTensor::from_host(device, &[0u8], Shape::from_static(&[1]), DType::U8)?;
+
+                marlin.push(GemmaMarlinLayer {
+                    wq_p, wq_s, wk_p, wk_s, wv_p, wv_s, wo_p, wo_s,
+                    wg_p, wg_s, wu_p, wu_s, wd_p, wd_s,
+                });
+            }
+
             device.synchronize()?;
-            eprintln!("[gemma] TW-Marlin conversion: {:.1}s", marlin_start.elapsed().as_secs_f64());
+            eprintln!("[gemma] TW-Marlin conversion: {:.1}s (Q4 freed per-layer)", marlin_start.elapsed().as_secs_f64());
+            self.marlin_layers = Some(marlin);
         }
 
         // Allocate per-layer KV caches + decode buffers (zero allocation during generation)
