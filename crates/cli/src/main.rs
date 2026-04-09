@@ -607,14 +607,33 @@ fn run_safetensors(
             Err(e) => { eprintln!("CUDA init failed: {e}"); std::process::exit(1); }
         };
 
-        let sharded = warp_loader::safetensors_loader::ShardedSafeTensorsLoader::open_dir(model_path)
-            .unwrap_or_else(|e| { eprintln!("Failed to open SafeTensors: {e}"); std::process::exit(1); });
-
-        println!("\nLoading Gemma 4 weights (Q4 quantization on load)...");
+        // Check for .warp cache first (instant loading)
+        let warp_path = model_path.join("model.warp");
         let load_start = std::time::Instant::now();
-        let model = match warp_loader::GemmaModelQ4::load(&sharded, &gemma_hf, &device) {
-            Ok(m) => m,
-            Err(e) => { eprintln!("Failed to load model: {e}"); std::process::exit(1); }
+        let model = if warp_path.exists() {
+            println!("\nLoading from .warp cache (fast path)...");
+            match warp_loader::GemmaModelQ4::load_from_warp(&warp_path, &gemma_hf, &device) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("Cache load failed: {e}, falling back to SafeTensors...");
+                    let sharded = warp_loader::safetensors_loader::ShardedSafeTensorsLoader::open_dir(model_path)
+                        .unwrap_or_else(|e| { eprintln!("Failed to open SafeTensors: {e}"); std::process::exit(1); });
+                    warp_loader::GemmaModelQ4::load(&sharded, &gemma_hf, &device)
+                        .unwrap_or_else(|e| { eprintln!("Failed to load model: {e}"); std::process::exit(1); })
+                }
+            }
+        } else {
+            println!("\nLoading Gemma 4 weights (Q4 quantization on load — first time, will cache)...");
+            let sharded = warp_loader::safetensors_loader::ShardedSafeTensorsLoader::open_dir(model_path)
+                .unwrap_or_else(|e| { eprintln!("Failed to open SafeTensors: {e}"); std::process::exit(1); });
+            let m = warp_loader::GemmaModelQ4::load(&sharded, &gemma_hf, &device)
+                .unwrap_or_else(|e| { eprintln!("Failed to load model: {e}"); std::process::exit(1); });
+
+            // Save .warp cache for next time
+            if let Err(e) = m.save_warp_cache(&warp_path, &device, &config_json) {
+                eprintln!("[warp] Failed to save cache: {e} (non-fatal, will retry next time)");
+            }
+            m
         };
         device.synchronize().unwrap();
         println!("Loaded in {:.1}s", load_start.elapsed().as_secs_f64());

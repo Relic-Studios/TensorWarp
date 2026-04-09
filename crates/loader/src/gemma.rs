@@ -278,6 +278,193 @@ impl GemmaModelQ4 {
             cache: KernelCache::new(),
         })
     }
+
+    /// Save all weights to a .warp cache file for instant loading next time.
+    pub fn save_warp_cache(&self, path: &std::path::Path, device: &WarpDevice, config_json: &str) -> Result<(), LoaderError> {
+        use crate::warp_cache;
+
+        eprintln!("[warp] Saving .warp cache to {}...", path.display());
+        let start = std::time::Instant::now();
+
+        let config_json = config_json;
+
+        let mut tensors: Vec<(&str, u32, Vec<usize>, Vec<u8>)> = Vec::new();
+
+        // Embedding (F16 = dtype 1)
+        let embed_host = self.embed_tokens.to_host(device).map_err(|e| LoaderError::Device(e.to_string()))?;
+        let embed_bytes: Vec<u8> = embed_host.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+        tensors.push(("embed_tokens", 1, vec![self.config.vocab_size as usize, self.config.hidden_size as usize], embed_bytes));
+
+        // Final norm (F32 = dtype 0)
+        let norm_host = self.final_norm.to_host(device).map_err(|e| LoaderError::Device(e.to_string()))?;
+        let norm_bytes: Vec<u8> = norm_host.iter().flat_map(|v| v.to_le_bytes()).collect();
+        tensors.push(("final_norm", 0, vec![self.config.hidden_size as usize], norm_bytes));
+
+        // Per-layer weights
+        for (i, layer) in self.layers.iter().enumerate() {
+            let save_f32 = |name: &str, t: &GpuTensor<f32>| -> Result<(String, u32, Vec<usize>, Vec<u8>), LoaderError> {
+                let host = t.to_host(device).map_err(|e| LoaderError::Device(e.to_string()))?;
+                let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let shape: Vec<usize> = t.shape.dims().iter().map(|d| d.static_val().unwrap_or(0)).collect();
+                Ok((format!("layer.{i}.{name}"), 0, shape, bytes))
+            };
+            let save_u8 = |name: &str, t: &GpuTensor<u8>| -> Result<(String, u32, Vec<usize>, Vec<u8>), LoaderError> {
+                let host = t.to_host(device).map_err(|e| LoaderError::Device(e.to_string()))?;
+                let shape = vec![host.len()];
+                Ok((format!("layer.{i}.{name}"), 2, shape, host))
+            };
+
+            // Norms (F32)
+            let (n, d, s, b) = save_f32("attn_norm", &layer.attn_norm)?;
+            tensors.push((Box::leak(n.into_boxed_str()), d, s, b));
+            let (n, d, s, b) = save_f32("ffn_norm", &layer.ffn_norm)?;
+            tensors.push((Box::leak(n.into_boxed_str()), d, s, b));
+
+            if let Some(ref t) = layer.q_norm {
+                let (n, d, s, b) = save_f32("q_norm", t)?;
+                tensors.push((Box::leak(n.into_boxed_str()), d, s, b));
+            }
+            if let Some(ref t) = layer.k_norm {
+                let (n, d, s, b) = save_f32("k_norm", t)?;
+                tensors.push((Box::leak(n.into_boxed_str()), d, s, b));
+            }
+            if let Some(ref t) = layer.pre_ffn_norm {
+                let (n, d, s, b) = save_f32("pre_ffn_norm", t)?;
+                tensors.push((Box::leak(n.into_boxed_str()), d, s, b));
+            }
+            if let Some(ref t) = layer.post_ffn_norm {
+                let (n, d, s, b) = save_f32("post_ffn_norm", t)?;
+                tensors.push((Box::leak(n.into_boxed_str()), d, s, b));
+            }
+
+            // Q4 weights (U8)
+            for (wname, w) in [("wq", &layer.wq), ("wk", &layer.wk), ("wv", &layer.wv),
+                               ("wo", &layer.wo), ("w_gate", &layer.w_gate),
+                               ("w_up", &layer.w_up), ("w_down", &layer.w_down)] {
+                let (n, d, s, b) = save_u8(wname, w)?;
+                tensors.push((Box::leak(n.into_boxed_str()), d, s, b));
+            }
+
+            if i % 10 == 0 {
+                eprintln!("[warp] Saving layer {}/{}...", i, self.layers.len());
+            }
+        }
+
+        let tensor_refs: Vec<(&str, u32, &[usize], &[u8])> = tensors.iter()
+            .map(|(n, d, s, b)| (*n, *d, s.as_slice(), b.as_slice()))
+            .collect();
+
+        warp_cache::save_warp_cache(path, &config_json, &tensor_refs)
+            .map_err(|e| LoaderError::Io(e.to_string()))?;
+
+        let size_mb = std::fs::metadata(path).map(|m| m.len() as f64 / 1e6).unwrap_or(0.0);
+        eprintln!("[warp] Saved {:.0} MB in {:.1}s", size_mb, start.elapsed().as_secs_f64());
+        Ok(())
+    }
+
+    /// Load from a .warp cache file (instant loading, no quantization).
+    pub fn load_from_warp(
+        path: &std::path::Path,
+        hf_config: &GemmaHFConfig,
+        device: &WarpDevice,
+    ) -> Result<Self, LoaderError> {
+        use crate::warp_cache;
+
+        eprintln!("[warp] Loading from cache: {}", path.display());
+        let start = std::time::Instant::now();
+
+        let (_config_json, tensors) = warp_cache::load_warp_cache(path)
+            .map_err(|e| LoaderError::Io(e.to_string()))?;
+
+        let config = hf_config.to_gemma_config();
+        let layer_configs = config.layer_configs();
+
+        // Build tensor lookup
+        let tensor_map: std::collections::HashMap<&str, &warp_cache::WarpTensor> =
+            tensors.iter().map(|t| (t.name.as_str(), t)).collect();
+
+        let get_f32 = |name: &str| -> Result<GpuTensor<f32>, LoaderError> {
+            let t = tensor_map.get(name)
+                .ok_or_else(|| LoaderError::Config(format!(".warp missing tensor: {name}")))?;
+            let floats: Vec<f32> = t.data.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let shape = Shape::from_static(&t.shape);
+            GpuTensor::from_host(device, &floats, shape, DType::F32)
+                .map_err(|e| LoaderError::Device(e.to_string()))
+        };
+
+        let get_f16 = |name: &str| -> Result<GpuTensor<half::f16>, LoaderError> {
+            let t = tensor_map.get(name)
+                .ok_or_else(|| LoaderError::Config(format!(".warp missing tensor: {name}")))?;
+            let halfs: Vec<half::f16> = t.data.chunks_exact(2)
+                .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])))
+                .collect();
+            let shape = Shape::from_static(&t.shape);
+            GpuTensor::from_host(device, &halfs, shape, DType::F16)
+                .map_err(|e| LoaderError::Device(e.to_string()))
+        };
+
+        let get_u8 = |name: &str| -> Result<GpuTensor<u8>, LoaderError> {
+            let t = tensor_map.get(name)
+                .ok_or_else(|| LoaderError::Config(format!(".warp missing tensor: {name}")))?;
+            let shape = Shape::from_static(&t.shape);
+            GpuTensor::from_host(device, &t.data, shape, DType::U8)
+                .map_err(|e| LoaderError::Device(e.to_string()))
+        };
+
+        let get_f32_opt = |name: &str| -> Option<GpuTensor<f32>> {
+            get_f32(name).ok()
+        };
+
+        // Embedding
+        let embed_tokens = get_f16("embed_tokens")?;
+        eprintln!("[warp] Embedding loaded ({:.1} MB)", embed_tokens.size_bytes() as f64 / 1e6);
+
+        // Final norm
+        let final_norm = get_f32("final_norm")?;
+
+        // Layers
+        let mut layers = Vec::with_capacity(config.num_layers as usize);
+        for i in 0..config.num_layers as usize {
+            if i % 10 == 0 { eprintln!("[warp] Loading layer {}/{}...", i, config.num_layers); }
+
+            let layer_scalar = tensor_map.get(format!("layer.{i}.layer_scalar").as_str())
+                .and_then(|t| t.data.chunks_exact(4).next())
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+
+            layers.push(QuantizedBlockWeights {
+                attn_norm: get_f32(&format!("layer.{i}.attn_norm"))?,
+                wq: get_u8(&format!("layer.{i}.wq"))?,
+                wk: get_u8(&format!("layer.{i}.wk"))?,
+                wv: get_u8(&format!("layer.{i}.wv"))?,
+                wo: get_u8(&format!("layer.{i}.wo"))?,
+                ffn_norm: get_f32(&format!("layer.{i}.ffn_norm"))?,
+                w_gate: get_u8(&format!("layer.{i}.w_gate"))?,
+                w_up: get_u8(&format!("layer.{i}.w_up"))?,
+                w_down: get_u8(&format!("layer.{i}.w_down"))?,
+                bq: None, bk: None, bv: None,
+                q_norm: get_f32_opt(&format!("layer.{i}.q_norm")),
+                k_norm: get_f32_opt(&format!("layer.{i}.k_norm")),
+                pre_ffn_norm: get_f32_opt(&format!("layer.{i}.pre_ffn_norm")),
+                post_ffn_norm: get_f32_opt(&format!("layer.{i}.post_ffn_norm")),
+                layer_scalar,
+                wq_bm: None, wk_bm: None, wv_bm: None, wo_bm: None,
+                w_gate_bm: None, w_up_bm: None, w_down_bm: None,
+            });
+        }
+
+        // Placeholder LM head (tied embeddings)
+        let lm_head = GpuTensor::from_host(device, &[0.0f32], Shape::from_static(&[1]), DType::F32)
+            .map_err(|e| LoaderError::Device(e.to_string()))?;
+
+        eprintln!("[warp] Loaded in {:.1}s", start.elapsed().as_secs_f64());
+
+        Ok(Self {
+            config, layer_configs, embed_tokens, layers, final_norm, lm_head,
+            cache: KernelCache::new(),
+        })
+    }
 }
 
 /// Load a single Gemma layer with Q4 quantization.
