@@ -167,6 +167,73 @@ pub fn rope_partial(
     Ok(())
 }
 
+/// RoPE with device-side position (for CUDA graph capture).
+/// Reads pos from a device pointer instead of a kernel argument.
+const ROPE_DEVICE_POS_SRC: &str = r#"
+extern "C" __global__ void warp_rope_device_pos(
+    float *out,
+    const float *input,
+    const unsigned int *pos_buf,  // device pointer to current position
+    unsigned int B,
+    unsigned int N,
+    unsigned int D,
+    float base
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = B * N * (D / 2);
+    if (idx >= total) return;
+
+    unsigned int pair = idx % (D / 2);
+    unsigned int pos_in_seq = (idx / (D / 2)) % N;
+    unsigned int b = idx / (N * (D / 2));
+
+    unsigned int pos = pos_in_seq + pos_buf[0];
+
+    float freq = 1.0f / powf(base, 2.0f * (float)pair / (float)D);
+    float theta = (float)pos * freq;
+    float cos_t = cosf(theta);
+    float sin_t = sinf(theta);
+
+    unsigned int base_offset = b * N * D + pos_in_seq * D;
+    float x0 = input[base_offset + pair];
+    float x1 = input[base_offset + pair + D / 2];
+
+    out[base_offset + pair]         = x0 * cos_t - x1 * sin_t;
+    out[base_offset + pair + D / 2] = x0 * sin_t + x1 * cos_t;
+}
+"#;
+
+/// RoPE reading position from a device buffer (graph-capturable).
+pub fn rope_device_pos(
+    cache: &crate::cache::KernelCache,
+    device: &crate::device::WarpDevice,
+    input: &crate::tensor::GpuTensor<f32>,
+    out: &mut crate::tensor::GpuTensor<f32>,
+    batch: u32,
+    seq_len: u32,
+    head_dim: u32,
+    base: f32,
+    pos_buf: &cudarc::driver::CudaSlice<u32>,
+) -> Result<(), crate::device::DeviceError> {
+    assert!(head_dim % 2 == 0);
+    let f = cache.get_or_compile(device, ROPE_DEVICE_POS_SRC, "warp_rope_device_pos")?;
+    let total = batch * seq_len * (head_dim / 2);
+    let cfg = cudarc::driver::LaunchConfig::for_num_elems(total);
+    unsafe {
+        device.stream.launch_builder(&f)
+            .arg(&mut out.data)
+            .arg(&input.data)
+            .arg(pos_buf)
+            .arg(&batch)
+            .arg(&seq_len)
+            .arg(&head_dim)
+            .arg(&base)
+            .launch(cfg)
+            .map_err(|e: cudarc::driver::result::DriverError| crate::device::DeviceError::Launch(e.to_string()))?;
+    }
+    Ok(())
+}
+
 /// CPU reference RoPE.
 pub fn cpu_rope(
     input: &[f32], out: &mut [f32],

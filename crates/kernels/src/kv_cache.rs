@@ -207,6 +207,61 @@ extern "C" __global__ void warp_kv_cache_prefill_offset(
         Ok(())
     }
 
+    /// Graph-capturable KV append: reads position from device buffer, computes cache offset.
+    /// For sliding window: offset = pos_buf[0] % window_size. For global: offset = pos_buf[0].
+    pub fn append_device_pos(
+        &mut self,
+        kernel_cache: &KernelCache,
+        device: &WarpDevice,
+        k_new: &GpuTensor<f32>,
+        v_new: &GpuTensor<f32>,
+        pos_buf: &cudarc::driver::CudaSlice<u32>,
+        window_size: u32,  // 0 = no window (global)
+    ) -> Result<(), DeviceError> {
+        let src = r#"
+extern "C" __global__ void warp_kv_append_device_pos(
+    float *cache, const float *src,
+    const unsigned int *pos_buf,
+    unsigned int dim, unsigned int max_seq, unsigned int window_size
+) {
+    unsigned int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= dim) return;
+    unsigned int pos = pos_buf[0];
+    unsigned int offset = (window_size > 0) ? (pos % window_size) : pos;
+    if (offset >= max_seq) return;
+    cache[offset * dim + d] = src[d];
+}
+"#;
+        let f = kernel_cache.get_or_compile(device, src, "warp_kv_append_device_pos")?;
+        let cfg = LaunchConfig::for_num_elems(self.kv_dim);
+
+        unsafe {
+            device.stream.launch_builder(&f)
+                .arg(&mut self.k.data)
+                .arg(&k_new.data)
+                .arg(pos_buf)
+                .arg(&self.kv_dim)
+                .arg(&self.max_seq_len)
+                .arg(&window_size)
+                .launch(cfg)
+                .map_err(|e: cudarc::driver::result::DriverError| DeviceError::Launch(e.to_string()))?;
+        }
+        unsafe {
+            device.stream.launch_builder(&f)
+                .arg(&mut self.v.data)
+                .arg(&v_new.data)
+                .arg(pos_buf)
+                .arg(&self.kv_dim)
+                .arg(&self.max_seq_len)
+                .arg(&window_size)
+                .launch(cfg)
+                .map_err(|e: cudarc::driver::result::DriverError| DeviceError::Launch(e.to_string()))?;
+        }
+
+        // Note: len is managed by CPU side before graph replay
+        Ok(())
+    }
+
     /// Append K and V vectors for one new token position.
     /// Uses a fused kernel to write both K and V in a single launch.
     pub fn append(

@@ -51,6 +51,8 @@ pub struct GemmaDecodeBuffers {
     pub layers: Vec<GemmaLayerBuffers>,
     /// Pre-allocated device-side cache_len buffers (one per layer) — avoids 60 cudaMalloc per token
     pub cache_len_bufs: Vec<cudarc::driver::CudaSlice<u32>>,
+    /// Device-side position buffer for CUDA graph capture
+    pub pos_buf: cudarc::driver::CudaSlice<u32>,
 }
 
 /// Gemma generation engine with Q4 quantized weights.
@@ -172,6 +174,7 @@ impl GemmaGenerationEngine {
             logits: GpuTensor::zeros(device, Shape::from_static(&[1, vocab]), DType::F32)?,
             layers,
             cache_len_bufs,
+            pos_buf: device.alloc_zeros::<u32>(1)?,
         })
     }
 
@@ -410,6 +413,142 @@ impl GemmaGenerationEngine {
         // The sampling function handles this via temperature scaling.
         // No per-step normalization needed — the relative ordering is correct.
 
+        Ok(())
+    }
+
+    /// Graph-capturable decode step: all position-dependent ops read from device buffers.
+    /// Call this inside a CUDA graph capture closure.
+    fn forward_decode_graph_capturable(
+        &self,
+        device: &WarpDevice,
+        buffers: &mut GemmaDecodeBuffers,
+        kv_caches: &mut [LayerKVCache],
+    ) -> Result<(), DeviceError> {
+        let h = self.config.hidden_size;
+        let ffn = self.config.ffn_dim;
+
+        // Embedding + scaling
+        sampling::embedding_f16(&self.cache, device, &self.embed_tokens, &buffers.ids,
+            &mut buffers.hidden, 1, h)?;
+        let embed_scale = (h as f32).sqrt();
+        ops::mul_scalar(&self.cache, device, &buffers.hidden, &mut buffers.hidden_scaled, embed_scale)?;
+
+        for i in 0..self.layer_configs.len() {
+            let lc = &self.layer_configs[i];
+            let kv_dim = self.config.kv_dim_for_layer(lc);
+            let d = lc.head_dim;
+            let num_q_heads = self.config.num_heads;
+            let num_kv_heads = lc.num_kv_heads;
+            let q_dim = num_q_heads * d;
+
+            let x_ptr: *const GpuTensor<f32> = if i == 0 {
+                &buffers.hidden_scaled as *const _
+            } else {
+                unsafe { &(*buffers.layers.as_ptr().add(i - 1)).output as *const _ }
+            };
+            let x: &GpuTensor<f32> = unsafe { &*x_ptr };
+            let lb = &mut buffers.layers[i];
+            let layer = &self.layers[i]; // for norms (Q4 weights are placeholders after TW-Marlin conversion)
+            let ml = self.marlin_layers.as_ref().map(|m| &m[i]);
+
+            ops::rmsnorm(&self.cache, device, x, &layer.attn_norm, &mut lb.normed, h, self.config.norm_eps)?;
+
+            // Q, K projections (TW-Marlin)
+            if let Some(ml) = ml {
+                crate::quantize::gemm_tw_marlin_m1(&self.cache, device, &lb.normed, &ml.wq_p, &ml.wq_s, &mut lb.q, q_dim, h)?;
+                crate::quantize::gemm_tw_marlin_m1(&self.cache, device, &lb.normed, &ml.wk_p, &ml.wk_s, &mut lb.k, kv_dim, h)?;
+            } else {
+                crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.normed, &layer.wq, &mut lb.q, q_dim, h)?;
+                crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.normed, &layer.wk, &mut lb.k, kv_dim, h)?;
+            }
+
+            // V
+            if self.config.k_eq_v {
+                ops::mul_scalar(&self.cache, device, &lb.k, &mut lb.v, 1.0)?;
+            } else if let Some(ml) = ml {
+                crate::quantize::gemm_tw_marlin_m1(&self.cache, device, &lb.normed, &ml.wv_p, &ml.wv_s, &mut lb.v, kv_dim, h)?;
+            } else {
+                crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.normed, &layer.wv, &mut lb.v, kv_dim, h)?;
+            }
+
+            // RoPE with device-pos (graph-capturable)
+            crate::rope::rope_device_pos(&self.cache, device, &lb.q, &mut lb.q_rope,
+                num_q_heads, 1, d, lc.rope_theta, &buffers.pos_buf)?;
+            crate::rope::rope_device_pos(&self.cache, device, &lb.k, &mut lb.k_rope,
+                num_kv_heads, 1, d, lc.rope_theta, &buffers.pos_buf)?;
+
+            // QK-norm
+            if let Some(ref qn) = layer.q_norm {
+                ops::rmsnorm(&self.cache, device, &lb.q_rope, qn, &mut lb.q_norm, d, self.config.norm_eps)?;
+            } else {
+                ops::rmsnorm_no_weight(&self.cache, device, &lb.q_rope, &mut lb.q_norm, d, self.config.norm_eps)?;
+            }
+            if let Some(ref kn) = layer.k_norm {
+                ops::rmsnorm(&self.cache, device, &lb.k_rope, kn, &mut lb.k_norm, d, self.config.norm_eps)?;
+            } else {
+                ops::rmsnorm_no_weight(&self.cache, device, &lb.k_rope, &mut lb.k_norm, d, self.config.norm_eps)?;
+            }
+
+            // KV cache append with device-pos
+            let kv_cache = &mut kv_caches[i];
+            let window = if lc.window_size > 0 { lc.window_size } else { 0 };
+            kv_cache.append_device_pos(&self.cache, device, &lb.k_norm, &lb.v,
+                &buffers.pos_buf, window)?;
+
+            // Attention
+            crate::kv_cache::decode_attention_flash_device_len_window(
+                &self.cache, device, &lb.q_norm, kv_cache, &mut lb.attn_out,
+                num_q_heads, num_kv_heads, d,
+                &buffers.cache_len_bufs[i], window,
+            )?;
+
+            // Output projection
+            if let Some(ml) = ml {
+                crate::quantize::gemm_tw_marlin_m1(&self.cache, device, &lb.attn_out, &ml.wo_p, &ml.wo_s, &mut lb.attn_proj, h, q_dim)?;
+            } else {
+                crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.attn_out, &layer.wo, &mut lb.attn_proj, h, q_dim)?;
+            }
+
+            // Post-attention norm + residual (Gemma architecture)
+            ops::rmsnorm(&self.cache, device, &lb.attn_proj, &layer.ffn_norm,
+                &mut lb.ffn_normed, h, self.config.norm_eps)?;
+            ops::add(&self.cache, device, x, &lb.ffn_normed, &mut lb.residual)?;
+
+            // Pre-FFN norm
+            if let Some(ref pre_norm) = layer.pre_ffn_norm {
+                ops::rmsnorm(&self.cache, device, &lb.residual, pre_norm,
+                    &mut lb.ffn_normed, h, self.config.norm_eps)?;
+            } else {
+                ops::mul_scalar(&self.cache, device, &lb.residual, &mut lb.ffn_normed, 1.0)?;
+            }
+
+            // Gate + Up + GeGLU + Down
+            if let Some(ml) = ml {
+                crate::quantize::gemm_tw_marlin_m1(&self.cache, device, &lb.ffn_normed, &ml.wg_p, &ml.wg_s, &mut lb.gate, ffn, h)?;
+                crate::quantize::gemm_tw_marlin_m1(&self.cache, device, &lb.ffn_normed, &ml.wu_p, &ml.wu_s, &mut lb.up, ffn, h)?;
+            } else {
+                crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.ffn_normed, &layer.w_gate, &mut lb.gate, ffn, h)?;
+                crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.ffn_normed, &layer.w_up, &mut lb.up, ffn, h)?;
+            }
+            ops::fused_gelu_mul(&self.cache, device, &lb.gate, &lb.up, &mut lb.geglu)?;
+
+            if let Some(ml) = ml {
+                crate::quantize::gemm_tw_marlin_m1(&self.cache, device, &lb.geglu, &ml.wd_p, &ml.wd_s, &mut lb.ffn_out, h, ffn)?;
+            } else {
+                crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.geglu, &layer.w_down, &mut lb.ffn_out, h, ffn)?;
+            }
+
+            // Post-FFN norm + residual
+            if let Some(ref post_norm) = layer.post_ffn_norm {
+                ops::rmsnorm(&self.cache, device, &lb.ffn_out, post_norm,
+                    &mut lb.geglu, h, self.config.norm_eps)?;
+                ops::add(&self.cache, device, &lb.residual, &lb.geglu, &mut lb.output)?;
+            } else {
+                ops::add(&self.cache, device, &lb.residual, &lb.ffn_out, &mut lb.output)?;
+            }
+        }
+
+        // Final norm (runs outside graph — LM head needs cuBLAS which may not graph-capture)
         Ok(())
     }
 
@@ -722,7 +861,81 @@ impl GemmaGenerationEngine {
             acc.wrapping_mul(6364136223846793005).wrapping_add(t as u64)
         });
 
-        for step in 0..gen_config.max_tokens {
+        // Step 0: warmup decode (compiles all kernels, no graph yet)
+        {
+            let rng_seed = base_seed;
+            let next_token = sample_token(&last_logits, gen_config, &generated, rng_seed);
+            if let Some(eos) = gen_config.eos_token_id {
+                if next_token == eos {
+                    let decode_time = decode_start.elapsed();
+                    let kv_bytes: usize = kv_caches.iter().map(|kv| kv.k.size_bytes() + kv.v.size_bytes()).sum();
+                    return Ok(GenerationResult {
+                        tokens: vec![], prefill_time, decode_time, tokens_generated: 0,
+                        prefill_tokens: prompt_ids.len(), tokens_per_sec: 0.0,
+                        kv_cache_memory_bytes: kv_bytes,
+                    });
+                }
+            }
+            generated.push(next_token);
+            device.htod_copy(&[next_token], &mut buffers.ids.data)?;
+            device.htod_copy(&[pos], &mut buffers.pos_buf)?;
+            for (i, kv) in kv_caches.iter().enumerate() {
+                device.htod_copy(&[kv.len], &mut buffers.cache_len_bufs[i])?;
+            }
+            self.forward_decode_graph_capturable(device, &mut buffers, &mut kv_caches)?;
+            // LM head (outside graph)
+            let h = self.config.hidden_size;
+            let last = self.layer_configs.len() - 1;
+            ops::rmsnorm(&self.cache, device, &buffers.layers[last].output,
+                &self.final_norm, &mut buffers.normed_final, h, self.config.norm_eps)?;
+            if self.config.tie_word_embeddings && self.lm_head.numel <= 1 {
+                let mut normed_f16 = GpuTensor::<half::f16>::zeros(device,
+                    Shape::from_static(&[1, h as usize]), DType::F16)?;
+                crate::fp16::cast_f32_to_f16(&self.cache, device, &buffers.normed_final, &mut normed_f16)?;
+                let mut logits_f16 = GpuTensor::<half::f16>::zeros(device,
+                    Shape::from_static(&[1, self.config.vocab_size as usize]), DType::F16)?;
+                crate::cublas_gemm::gemm_cublas_f16_transB(device,
+                    &normed_f16, &self.embed_tokens, &mut logits_f16, 1, self.config.vocab_size, h)?;
+                crate::fp16::cast_f16_to_f32(&self.cache, device, &logits_f16, &mut buffers.logits)?;
+            } else {
+                ops::gemm(&self.cache, device, &buffers.normed_final, &self.lm_head,
+                    &mut buffers.logits, 1, self.config.vocab_size, h)?;
+            }
+            device.synchronize()?;
+            for kv in &mut kv_caches { kv.len = (pos + 1).min(kv.max_seq_len); }
+            last_logits = buffers.logits.to_host(device)?;
+            pos += 1;
+        }
+
+        // Capture CUDA graph
+        device.synchronize()?;
+        let capture_stream = device.ctx.new_stream()
+            .map_err(|e| DeviceError::Launch(format!("capture stream: {e}")))?;
+        let graph_device = device.with_stream(capture_stream.clone());
+
+        // Pre-compile on capture stream
+        graph_device.htod_copy(&[generated.last().copied().unwrap_or(0)], &mut buffers.ids.data)?;
+        graph_device.htod_copy(&[pos], &mut buffers.pos_buf)?;
+        for (i, kv) in kv_caches.iter().enumerate() {
+            graph_device.htod_copy(&[kv.len], &mut buffers.cache_len_bufs[i])?;
+        }
+        graph_device.synchronize()?;
+        self.forward_decode_graph_capturable(&graph_device, &mut buffers, &mut kv_caches)?;
+        graph_device.synchronize()?;
+        for kv in &mut kv_caches { kv.len = pos; } // undo pre-compile append
+
+        // NOW capture
+        let graph = crate::cuda_graph::GraphCapture::record_with_device(
+            &graph_device, &capture_stream,
+            || {
+                self.forward_decode_graph_capturable(&graph_device, &mut buffers, &mut kv_caches)?;
+                Ok(())
+            },
+        )?;
+        eprintln!("[gemma] CUDA graph captured!");
+
+        // Decode loop with graph replay
+        for step in 1..gen_config.max_tokens {
             let rng_seed = base_seed.wrapping_add(step as u64);
             let next_token = sample_token(&last_logits, gen_config, &generated, rng_seed);
 
@@ -735,9 +948,37 @@ impl GemmaGenerationEngine {
                 && matches_stop_sequence(&generated, &gen_config.stop_sequences)
             { break; }
 
-            device.htod_copy(&[next_token], &mut buffers.ids.data)?;
-            self.forward_decode_prealloc(device, &mut buffers, &mut kv_caches, pos)?;
-            device.synchronize()?;
+            // Update device buffers
+            graph_device.htod_copy(&[next_token], &mut buffers.ids.data)?;
+            graph_device.htod_copy(&[pos], &mut buffers.pos_buf)?;
+            for (i, kv) in kv_caches.iter().enumerate() {
+                graph_device.htod_copy(&[kv.len], &mut buffers.cache_len_bufs[i])?;
+            }
+
+            // Replay graph (transformer layers)
+            graph.replay()?;
+
+            // LM head (outside graph — cuBLAS)
+            let h = self.config.hidden_size;
+            let last = self.layer_configs.len() - 1;
+            ops::rmsnorm(&self.cache, &graph_device, &buffers.layers[last].output,
+                &self.final_norm, &mut buffers.normed_final, h, self.config.norm_eps)?;
+            if self.config.tie_word_embeddings && self.lm_head.numel <= 1 {
+                let mut normed_f16 = GpuTensor::<half::f16>::zeros(&graph_device,
+                    Shape::from_static(&[1, h as usize]), DType::F16)?;
+                crate::fp16::cast_f32_to_f16(&self.cache, &graph_device, &buffers.normed_final, &mut normed_f16)?;
+                let mut logits_f16 = GpuTensor::<half::f16>::zeros(&graph_device,
+                    Shape::from_static(&[1, self.config.vocab_size as usize]), DType::F16)?;
+                crate::cublas_gemm::gemm_cublas_f16_transB(&graph_device,
+                    &normed_f16, &self.embed_tokens, &mut logits_f16, 1, self.config.vocab_size, h)?;
+                crate::fp16::cast_f16_to_f32(&self.cache, &graph_device, &logits_f16, &mut buffers.logits)?;
+            } else {
+                ops::gemm(&self.cache, &graph_device, &buffers.normed_final, &self.lm_head,
+                    &mut buffers.logits, 1, self.config.vocab_size, h)?;
+            }
+            graph_device.synchronize()?;
+
+            for kv in &mut kv_caches { kv.len = (pos + 1).min(kv.max_seq_len); }
             last_logits = buffers.logits.to_host(device)?;
             pos += 1;
         }
