@@ -369,10 +369,21 @@ impl GemmaGenerationEngine {
             }
         }
 
-        // Logit softcapping — DISABLED for now because Q4 quantization produces
-        // logits in the hundreds which all saturate at ±30, destroying the distribution.
-        // The raw logits still have useful relative ordering.
-        // TODO: re-enable when using higher-precision quantization (Q8, FP8, or TW-Marlin)
+        // Adaptive logit normalization for Q4 models.
+        // Q4 quantization through 60 layers produces logits in hundreds instead of [-10,10].
+        // Scale them to a reasonable range before sampling.
+        // This is equivalent to a dynamic temperature based on logit magnitude.
+        {
+            let raw = buffers.logits.to_host(device)?;
+            let max_abs = raw.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            if max_abs > 50.0 {
+                // Normalize to roughly [-30, 30] range
+                let scale = 30.0 / max_abs;
+                let mut scaled = GpuTensor::<f32>::zeros(device, buffers.logits.shape.clone(), DType::F32)?;
+                ops::mul_scalar(&self.cache, device, &buffers.logits, &mut scaled, scale)?;
+                buffers.logits = scaled;
+            }
+        }
 
         Ok(())
     }
