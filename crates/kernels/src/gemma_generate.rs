@@ -201,8 +201,35 @@ impl GemmaGenerationEngine {
 
             ops::rmsnorm(&self.cache, device, x, &layer.attn_norm, &mut lb.normed, h, self.config.norm_eps)?;
 
+            // Debug: compare layer 0 intermediate values against PyTorch reference
+            if i == 0 && pos == 0 {
+                let x_host = x.to_host(device)?;
+                eprintln!("[ref] scaled_emb: min={:.4}, max={:.4}, mean={:.4}",
+                    x_host.iter().cloned().fold(f32::INFINITY, f32::min),
+                    x_host.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+                    x_host.iter().sum::<f32>() / x_host.len() as f32);
+                let n_host = lb.normed.to_host(device)?;
+                eprintln!("[ref] after_norm: min={:.4}, max={:.4}, mean={:.4}, first8={:?}",
+                    n_host.iter().cloned().fold(f32::INFINITY, f32::min),
+                    n_host.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+                    n_host.iter().sum::<f32>() / n_host.len() as f32,
+                    &n_host[..8].iter().map(|v| format!("{:.4}", v)).collect::<Vec<_>>());
+                // PyTorch ref: after_norm min=-210.33, max=107.53, mean=-0.0670
+                // first8: [7.4203, 2.3646, 7.8419, 5.9251, 7.5541, 3.2455, 4.3227, -2.3455]
+            }
+
             // Q, K projections
             crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.normed, &layer.wq, &mut lb.q, q_dim, h)?;
+            if i == 0 && pos == 0 {
+                let q_host = lb.q.to_host(device)?;
+                eprintln!("[ref] Q proj: min={:.4}, max={:.4}, mean={:.4}, first8={:?}",
+                    q_host.iter().cloned().fold(f32::INFINITY, f32::min),
+                    q_host.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+                    q_host.iter().sum::<f32>() / q_host.len() as f32,
+                    &q_host[..8].iter().map(|v| format!("{:.4}", v)).collect::<Vec<_>>());
+                // PyTorch ref: Q min=-171.12, max=187.93, mean=0.61
+                // first8: [104.54, -15.10, -32.97, -60.36, 15.88, -0.98, -8.24, 15.06]
+            }
             crate::quantize::gemm_q4_0_m1(&self.cache, device, &lb.normed, &layer.wk, &mut lb.k, kv_dim, h)?;
 
             // V = K (shared projection)
@@ -342,13 +369,10 @@ impl GemmaGenerationEngine {
             }
         }
 
-        // Logit softcapping
-        if self.config.final_logit_softcapping > 0.0 {
-            let mut capped = GpuTensor::<f32>::zeros(device, buffers.logits.shape.clone(), DType::F32)?;
-            ops::logit_softcap(&self.cache, device, &buffers.logits, &mut capped,
-                self.config.final_logit_softcapping)?;
-            buffers.logits = capped;
-        }
+        // Logit softcapping — DISABLED for now because Q4 quantization produces
+        // logits in the hundreds which all saturate at ±30, destroying the distribution.
+        // The raw logits still have useful relative ordering.
+        // TODO: re-enable when using higher-precision quantization (Q8, FP8, or TW-Marlin)
 
         Ok(())
     }
