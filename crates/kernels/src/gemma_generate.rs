@@ -53,6 +53,9 @@ pub struct GemmaDecodeBuffers {
     pub cache_len_bufs: Vec<cudarc::driver::CudaSlice<u32>>,
     /// Device-side position buffer for CUDA graph capture
     pub pos_buf: cudarc::driver::CudaSlice<u32>,
+    /// Pre-allocated F16 buffers for LM head (avoid per-step allocation)
+    pub normed_f16: GpuTensor<half::f16>,
+    pub logits_f16: GpuTensor<half::f16>,
 }
 
 /// Gemma generation engine with Q4 quantized weights.
@@ -175,6 +178,8 @@ impl GemmaGenerationEngine {
             layers,
             cache_len_bufs,
             pos_buf: device.alloc_zeros::<u32>(1)?,
+            normed_f16: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F16)?,
+            logits_f16: GpuTensor::zeros(device, Shape::from_static(&[1, vocab]), DType::F16)?,
         })
     }
 
@@ -388,20 +393,10 @@ impl GemmaGenerationEngine {
         // LM head: cuBLAS F16 HGEMM with transB (embed_tokens is [V, H] F16)
         // logits[1,V] = normed[1,H] × embed^T[H,V]
         if self.config.tie_word_embeddings && self.lm_head.numel <= 1 {
-            let vocab = self.config.vocab_size;
-            // Cast normed F32 → F16
-            let mut normed_f16 = GpuTensor::<half::f16>::zeros(device,
-                Shape::from_static(&[1, h as usize]), DType::F16)?;
-            crate::fp16::cast_f32_to_f16(&self.cache, device, &buffers.normed_final, &mut normed_f16)?;
-
-            // cuBLAS HGEMM transB
-            let mut logits_f16 = GpuTensor::<half::f16>::zeros(device,
-                Shape::from_static(&[1, vocab as usize]), DType::F16)?;
+            crate::fp16::cast_f32_to_f16(&self.cache, device, &buffers.normed_final, &mut buffers.normed_f16)?;
             crate::cublas_gemm::gemm_cublas_f16_transB(device,
-                &normed_f16, &self.embed_tokens, &mut logits_f16, 1, vocab, h)?;
-
-            // Cast logits F16 → F32
-            crate::fp16::cast_f16_to_f32(&self.cache, device, &logits_f16, &mut buffers.logits)?;
+                &buffers.normed_f16, &self.embed_tokens, &mut buffers.logits_f16, 1, self.config.vocab_size, h)?;
+            crate::fp16::cast_f16_to_f32(&self.cache, device, &buffers.logits_f16, &mut buffers.logits)?;
         } else {
             ops::gemm(&self.cache, device, &buffers.normed_final, &self.lm_head,
                 &mut buffers.logits, 1, self.config.vocab_size, h)?;
@@ -889,14 +884,10 @@ impl GemmaGenerationEngine {
             ops::rmsnorm(&self.cache, device, &buffers.layers[last].output,
                 &self.final_norm, &mut buffers.normed_final, h, self.config.norm_eps)?;
             if self.config.tie_word_embeddings && self.lm_head.numel <= 1 {
-                let mut normed_f16 = GpuTensor::<half::f16>::zeros(device,
-                    Shape::from_static(&[1, h as usize]), DType::F16)?;
-                crate::fp16::cast_f32_to_f16(&self.cache, device, &buffers.normed_final, &mut normed_f16)?;
-                let mut logits_f16 = GpuTensor::<half::f16>::zeros(device,
-                    Shape::from_static(&[1, self.config.vocab_size as usize]), DType::F16)?;
+                crate::fp16::cast_f32_to_f16(&self.cache, device, &buffers.normed_final, &mut buffers.normed_f16)?;
                 crate::cublas_gemm::gemm_cublas_f16_transB(device,
-                    &normed_f16, &self.embed_tokens, &mut logits_f16, 1, self.config.vocab_size, h)?;
-                crate::fp16::cast_f16_to_f32(&self.cache, device, &logits_f16, &mut buffers.logits)?;
+                    &buffers.normed_f16, &self.embed_tokens, &mut buffers.logits_f16, 1, self.config.vocab_size, h)?;
+                crate::fp16::cast_f16_to_f32(&self.cache, device, &buffers.logits_f16, &mut buffers.logits)?;
             } else {
                 ops::gemm(&self.cache, device, &buffers.normed_final, &self.lm_head,
                     &mut buffers.logits, 1, self.config.vocab_size, h)?;
@@ -964,14 +955,10 @@ impl GemmaGenerationEngine {
             ops::rmsnorm(&self.cache, &graph_device, &buffers.layers[last].output,
                 &self.final_norm, &mut buffers.normed_final, h, self.config.norm_eps)?;
             if self.config.tie_word_embeddings && self.lm_head.numel <= 1 {
-                let mut normed_f16 = GpuTensor::<half::f16>::zeros(&graph_device,
-                    Shape::from_static(&[1, h as usize]), DType::F16)?;
-                crate::fp16::cast_f32_to_f16(&self.cache, &graph_device, &buffers.normed_final, &mut normed_f16)?;
-                let mut logits_f16 = GpuTensor::<half::f16>::zeros(&graph_device,
-                    Shape::from_static(&[1, self.config.vocab_size as usize]), DType::F16)?;
+                crate::fp16::cast_f32_to_f16(&self.cache, &graph_device, &buffers.normed_final, &mut buffers.normed_f16)?;
                 crate::cublas_gemm::gemm_cublas_f16_transB(&graph_device,
-                    &normed_f16, &self.embed_tokens, &mut logits_f16, 1, self.config.vocab_size, h)?;
-                crate::fp16::cast_f16_to_f32(&self.cache, &graph_device, &logits_f16, &mut buffers.logits)?;
+                    &buffers.normed_f16, &self.embed_tokens, &mut buffers.logits_f16, 1, self.config.vocab_size, h)?;
+                crate::fp16::cast_f16_to_f32(&self.cache, &graph_device, &buffers.logits_f16, &mut buffers.logits)?;
             } else {
                 ops::gemm(&self.cache, &graph_device, &buffers.normed_final, &self.lm_head,
                     &mut buffers.logits, 1, self.config.vocab_size, h)?;
