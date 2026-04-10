@@ -213,16 +213,9 @@ impl MoEGenerationEngine {
             if i == 0 {
                 device.synchronize()?;
                 let x_h = x.to_host(device)?;
-                eprintln!("[ref] scaled_emb: min={:.4}, max={:.4}, mean={:.6}",
-                    x_h.iter().cloned().fold(f32::INFINITY, f32::min),
-                    x_h.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
-                    x_h.iter().sum::<f32>() / x_h.len() as f32);
-                let n_h = b.normed.to_host(device)?;
-                eprintln!("[ref] normed: min={:.4}, max={:.4}, first4={:.4},{:.4},{:.4},{:.4}",
-                    n_h.iter().cloned().fold(f32::INFINITY, f32::min),
-                    n_h.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
-                    n_h[0], n_h[1], n_h[2], n_h[3]);
-                // PyTorch: normed first4: 0.1679, -0.1301, 1.5021, 0.8670
+                eprintln!("[ref] L0 input first4={:.4},{:.4},{:.4},{:.4}",
+                    x_h[0], x_h[1], x_h[2], x_h[3]);
+                // HF ref for token 563: -0.2704, -0.7093, 0.2624, 0.0798
             }
             // F16 attention: cast normed → F16, HGEMM with F16 weights, cast back → F32
             crate::fp16::cast_f32_to_f16(&self.cache, device, &b.normed, &mut b.normed_f16)?;
@@ -230,6 +223,12 @@ impl MoEGenerationEngine {
             crate::fp16::cast_f16_to_f32(&self.cache, device, &b.q_f16, &mut b.q)?;
             crate::cublas_gemm::gemm_cublas_f16_transB(device, &b.normed_f16, &layer.wk, &mut b.k_f16, 1, kv_dim, h)?;
             crate::fp16::cast_f16_to_f32(&self.cache, device, &b.k_f16, &mut b.k)?;
+            if i == 0 {
+                device.synchronize()?;
+                let q_h = b.q.to_host(device)?;
+                eprintln!("[ref] L0 Q first4={:.4},{:.4},{:.4},{:.4} (HF: TBD)",
+                    q_h[0], q_h[1], q_h[2], q_h[3]);
+            }
             if self.config.k_eq_v {
                 ops::mul_scalar(&self.cache, device, &b.k, &mut b.v, 1.0)?;
             } else {
@@ -261,6 +260,15 @@ impl MoEGenerationEngine {
 
             ops::rmsnorm(&self.cache, device, &b.attn_proj, &layer.post_attn_norm, &mut b.post_attn, h, self.config.norm_eps)?;
             ops::add(&self.cache, device, x, &b.post_attn, &mut b.residual)?;
+
+            if i == 0 {
+                device.synchronize()?;
+                let r = b.residual.to_host(device)?;
+                eprintln!("[ref] Layer 0 residual (after attn): min={:.4}, max={:.4}, first4={:.4},{:.4},{:.4},{:.4}",
+                    r.iter().cloned().fold(f32::INFINITY, f32::min),
+                    r.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+                    r[0], r[1], r[2], r[3]);
+            }
 
             // Dense MLP (F16 HGEMM)
             ops::rmsnorm(&self.cache, device, &b.residual, &layer.pre_ffn_norm, &mut b.ffn_in, h, self.config.norm_eps)?;
@@ -344,6 +352,21 @@ impl MoEGenerationEngine {
             ops::rmsnorm(&self.cache, device, &b.combined, &layer.post_ffn_norm, &mut b.final_normed, h, self.config.norm_eps)?;
             ops::add(&self.cache, device, &b.residual, &b.final_normed, &mut b.output)?;
             ops::mul_scalar(&self.cache, device, &b.output, &mut b.output_scaled, layer.layer_scalar)?;
+
+            if i == 0 {
+                device.synchronize()?;
+                let h_out = b.output_scaled.to_host(device)?;
+                // Use last token position (for multi-token prefill, last is the important one)
+                let n = h_out.len();
+                let last_start = n - (h as usize);
+                let last = &h_out[last_start..];
+                eprintln!("[ref] Layer 0 output: min={:.4}, max={:.4}, mean={:.6}, first8={:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4}",
+                    last.iter().cloned().fold(f32::INFINITY, f32::min),
+                    last.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+                    last.iter().sum::<f32>() / last.len() as f32,
+                    last[0], last[1], last[2], last[3], last[4], last[5], last[6], last[7]);
+                // HF ref: min=-53.5, max=22.75, mean=-0.039, first8: 0.1289,0.0554,0.0291,-0.1187,...
+            }
         }
 
         // Final norm + GPU LM head (cuBLAS F16 HGEMM transB with tied embedding)

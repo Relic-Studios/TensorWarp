@@ -52,10 +52,11 @@ pub fn route_experts(
         Shape::from_static(&[1, hidden_size as usize]), DType::F32)?;
     ops::mul_scalar(cache, device, &scaled, &mut scaled2, scalar_root)?;
 
-    // 3. Linear projection → expert logits
+    // 3. Linear projection → expert logits (router_proj is [E, H], use transB)
     let mut logits = GpuTensor::<f32>::zeros(device,
         Shape::from_static(&[1, num_experts as usize]), DType::F32)?;
-    ops::gemm(cache, device, &scaled2, router_proj, &mut logits, 1, num_experts, hidden_size)?;
+    crate::cublas_gemm::gemm_cublas_f32_transB(device,
+        &scaled2, router_proj, &mut logits, 1, num_experts, hidden_size)?;
 
     // 4. Softmax
     let mut probs = GpuTensor::<f32>::zeros(device,

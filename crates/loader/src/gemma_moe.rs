@@ -161,23 +161,35 @@ impl GemmaMoEModel {
                 .ok().and_then(|t| t.to_host(device).ok())
                 .and_then(|v| v.first().copied()).unwrap_or(1.0);
 
-            // Attention F16 (higher precision → correct router outputs)
-            let wq = loader.load_f16_transposed(&format!("{lp}.self_attn.q_proj.weight"), device)?;
-            let wk = loader.load_f16_transposed(&format!("{lp}.self_attn.k_proj.weight"), device)?;
-            let wv = match loader.load_f16_transposed(&format!("{lp}.self_attn.v_proj.weight"), device) {
-                Ok(v) => v,
-                Err(_) => loader.load_f16_transposed(&format!("{lp}.self_attn.k_proj.weight"), device)?,
+            // Attention F16 — load WITHOUT transposing! gemm_cublas_f16_transB handles transpose.
+            // HF stores as [out, in]. transB does x @ W^T = x[1,in] @ W^T[in,out] where W=[out,in].
+            let load_f16_notranspose = |name: &str| -> Result<GpuTensor<half::f16>, LoaderError> {
+                // Use load_f16 which doesn't transpose (just BF16→F16 conversion)
+                let f32_tensor = loader.load_f32(name, device)?;
+                let f32_host = f32_tensor.to_host(device).map_err(|e| LoaderError::Device(e.to_string()))?;
+                let f16_host: Vec<half::f16> = f32_host.iter().map(|v| half::f16::from_f32(*v)).collect();
+                let shape = f32_tensor.shape.clone();
+                drop(f32_tensor);
+                GpuTensor::from_host(device, &f16_host, shape, DType::F16)
+                    .map_err(|e| LoaderError::Device(e.to_string()))
             };
-            let wo = loader.load_f16_transposed(&format!("{lp}.self_attn.o_proj.weight"), device)?;
+            let wq = load_f16_notranspose(&format!("{lp}.self_attn.q_proj.weight"))?;
+            let wk = load_f16_notranspose(&format!("{lp}.self_attn.k_proj.weight"))?;
+            let wv = match load_f16_notranspose(&format!("{lp}.self_attn.v_proj.weight")) {
+                Ok(v) => v,
+                Err(_) => load_f16_notranspose(&format!("{lp}.self_attn.k_proj.weight"))?,
+            };
+            let wo = load_f16_notranspose(&format!("{lp}.self_attn.o_proj.weight"))?;
 
-            // Dense MLP F16 (higher precision for correct output)
+            // Dense MLP F16 — NO transpose (transB handles it)
             let dense_ffn = config.ffn_dim;
-            let w_gate = loader.load_f16_transposed(&format!("{lp}.mlp.gate_proj.weight"), device)?;
-            let w_up = loader.load_f16_transposed(&format!("{lp}.mlp.up_proj.weight"), device)?;
-            let w_down = loader.load_f16_transposed(&format!("{lp}.mlp.down_proj.weight"), device)?;
+            let w_gate = load_f16_notranspose(&format!("{lp}.mlp.gate_proj.weight"))?;
+            let w_up = load_f16_notranspose(&format!("{lp}.mlp.up_proj.weight"))?;
+            let w_down = load_f16_notranspose(&format!("{lp}.mlp.down_proj.weight"))?;
 
             // Router (F32 — small)
-            let router_proj = loader.load_f32_transposed(&format!("{lp}.router.proj.weight"), device)?;
+            // Router proj: [128, 2816] — don't transpose, use F.linear style (x @ W^T)
+            let router_proj = loader.load_f32(&format!("{lp}.router.proj.weight"), device)?;
             let router_scale_raw = loader.load_f32(&format!("{lp}.router.scale"), device)?;
             // Router scale gets +1 offset too (it's RMSNorm-like)
             let mut rs_host = router_scale_raw.to_host(device).map_err(|e| LoaderError::Device(e.to_string()))?;
