@@ -2,6 +2,7 @@
 //!
 //! Expert weights live in RAM, streamed to GPU per-token.
 //! Attention + dense MLP + norms stay in VRAM permanently.
+//! All intermediate tensors pre-allocated for zero-allocation decode.
 
 use warp_ir::{DType, Shape};
 use crate::cache::KernelCache;
@@ -13,28 +14,8 @@ use crate::sampling;
 use crate::tensor::GpuTensor;
 use crate::transformer::{GemmaConfig, GemmaLayerAttentionConfig};
 
-/// MoE generation engine.
-pub struct MoEGenerationEngine {
-    pub config: GemmaConfig,
-    pub layer_configs: Vec<GemmaLayerAttentionConfig>,
-    pub embed_tokens: GpuTensor<half::f16>,
-    pub final_norm: GpuTensor<f32>,
-    pub cache: KernelCache,
-
-    // Per-layer permanent VRAM weights
-    pub layers: Vec<MoELayerVRAM>,
-
-    // Per-layer RAM-hosted expert weights (streamed per-token)
-    pub expert_gate_up_host: Vec<Vec<half::f16>>,  // [layer][128 * 2*704 * 2816]
-    pub expert_down_host: Vec<Vec<half::f16>>,      // [layer][128 * 2816 * 704]
-
-    // Cached host embedding for LM head
-    pub embed_host_f32: Option<Vec<f32>>,
-}
-
 /// Per-layer weights stored permanently in VRAM.
 pub struct MoELayerVRAM {
-    // Norms (F32 with Gemma +1)
     pub attn_norm: GpuTensor<f32>,
     pub post_attn_norm: GpuTensor<f32>,
     pub pre_ffn_norm: GpuTensor<f32>,
@@ -45,39 +26,289 @@ pub struct MoELayerVRAM {
     pub q_norm: GpuTensor<f32>,
     pub k_norm: GpuTensor<f32>,
     pub layer_scalar: f32,
-
-    // Attention Q4
     pub wq: GpuTensor<u8>,
     pub wk: GpuTensor<u8>,
     pub wv: GpuTensor<u8>,
     pub wo: GpuTensor<u8>,
-
-    // Dense MLP Q4
     pub w_gate: GpuTensor<u8>,
     pub w_up: GpuTensor<u8>,
     pub w_down: GpuTensor<u8>,
-
-    // Router F32
     pub router_proj: GpuTensor<f32>,
     pub router_scale: GpuTensor<f32>,
     pub per_expert_scale: GpuTensor<f32>,
 }
 
+/// Pre-allocated decode buffers — ZERO allocation during generation.
+struct MoEDecodeBuffers {
+    // Global
+    hidden: GpuTensor<f32>,
+    hidden_scaled: GpuTensor<f32>,
+
+    // Per-layer attention
+    normed: GpuTensor<f32>,
+    q: GpuTensor<f32>,     // max q_dim across layers
+    k: GpuTensor<f32>,     // max kv_dim
+    v: GpuTensor<f32>,
+    q_rope: GpuTensor<f32>,
+    k_rope: GpuTensor<f32>,
+    q_n: GpuTensor<f32>,
+    k_n: GpuTensor<f32>,
+    attn_out: GpuTensor<f32>,
+    attn_proj: GpuTensor<f32>,
+    post_attn: GpuTensor<f32>,
+    residual: GpuTensor<f32>,
+    cache_len_buf: cudarc::driver::CudaSlice<u32>,
+
+    // Dense MLP
+    ffn_in: GpuTensor<f32>,
+    dense_gate: GpuTensor<f32>,
+    dense_up: GpuTensor<f32>,
+    dense_geglu: GpuTensor<f32>,
+    dense_out: GpuTensor<f32>,
+
+    // MoE
+    moe_in: GpuTensor<f32>,
+    moe_accumulated: GpuTensor<f32>,
+
+    // Expert reusable buffers
+    expert_gu_gpu: GpuTensor<half::f16>,    // [2*704, 2816]
+    expert_down_gpu: GpuTensor<half::f16>,  // [2816, 704]
+    moe_in_f16: GpuTensor<half::f16>,
+    gate_up_f16: GpuTensor<half::f16>,
+    gate_up_f32: GpuTensor<f32>,
+    expert_gate: GpuTensor<f32>,
+    expert_up: GpuTensor<f32>,
+    expert_geglu: GpuTensor<f32>,
+    expert_geglu_f16: GpuTensor<half::f16>,
+    expert_out_f16: GpuTensor<half::f16>,
+    expert_out: GpuTensor<f32>,
+    expert_weighted: GpuTensor<f32>,
+    expert_new_acc: GpuTensor<f32>,
+
+    // Combine
+    dense_normed: GpuTensor<f32>,
+    moe_normed: GpuTensor<f32>,
+    combined: GpuTensor<f32>,
+    final_normed: GpuTensor<f32>,
+    output: GpuTensor<f32>,
+    output_scaled: GpuTensor<f32>,
+
+    // LM head
+    lm_normed: GpuTensor<f32>,
+}
+
+/// MoE generation engine.
+pub struct MoEGenerationEngine {
+    pub config: GemmaConfig,
+    pub layer_configs: Vec<GemmaLayerAttentionConfig>,
+    pub embed_tokens: GpuTensor<half::f16>,
+    pub final_norm: GpuTensor<f32>,
+    pub cache: KernelCache,
+    pub layers: Vec<MoELayerVRAM>,
+    pub expert_gate_up_host: Vec<Vec<half::f16>>,
+    pub expert_down_host: Vec<Vec<half::f16>>,
+    pub embed_host_f32: Option<Vec<f32>>,
+}
+
 impl MoEGenerationEngine {
-    pub fn generate(
-        &mut self,
-        device: &WarpDevice,
-        prompt_ids: &[i32],
-        gen_config: &GenerateConfig,
-        max_seq_len: u32,
-    ) -> Result<GenerationResult, DeviceError> {
+    fn allocate_buffers(&self, device: &WarpDevice) -> Result<MoEDecodeBuffers, DeviceError> {
+        let h = self.config.hidden_size as usize;
+        let max_q_dim = self.layer_configs.iter().map(|lc| (self.config.num_heads * lc.head_dim) as usize).max().unwrap_or(h);
+        let max_kv_dim = self.layer_configs.iter().map(|lc| self.config.kv_dim_for_layer(lc) as usize).max().unwrap_or(h);
+        let dense_ffn = self.config.ffn_dim as usize;
+        let moe_dim = 704usize;
+
+        Ok(MoEDecodeBuffers {
+            hidden: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F32)?,
+            hidden_scaled: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F32)?,
+            normed: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F32)?,
+            q: GpuTensor::zeros(device, Shape::from_static(&[1, max_q_dim]), DType::F32)?,
+            k: GpuTensor::zeros(device, Shape::from_static(&[1, max_kv_dim]), DType::F32)?,
+            v: GpuTensor::zeros(device, Shape::from_static(&[1, max_kv_dim]), DType::F32)?,
+            q_rope: GpuTensor::zeros(device, Shape::from_static(&[1, max_q_dim]), DType::F32)?,
+            k_rope: GpuTensor::zeros(device, Shape::from_static(&[1, max_kv_dim]), DType::F32)?,
+            q_n: GpuTensor::zeros(device, Shape::from_static(&[1, max_q_dim]), DType::F32)?,
+            k_n: GpuTensor::zeros(device, Shape::from_static(&[1, max_kv_dim]), DType::F32)?,
+            attn_out: GpuTensor::zeros(device, Shape::from_static(&[1, max_q_dim]), DType::F32)?,
+            attn_proj: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F32)?,
+            post_attn: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F32)?,
+            residual: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F32)?,
+            cache_len_buf: device.alloc_zeros::<u32>(1)?,
+            ffn_in: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F32)?,
+            dense_gate: GpuTensor::zeros(device, Shape::from_static(&[1, dense_ffn]), DType::F32)?,
+            dense_up: GpuTensor::zeros(device, Shape::from_static(&[1, dense_ffn]), DType::F32)?,
+            dense_geglu: GpuTensor::zeros(device, Shape::from_static(&[1, dense_ffn]), DType::F32)?,
+            dense_out: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F32)?,
+            moe_in: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F32)?,
+            moe_accumulated: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F32)?,
+            expert_gu_gpu: GpuTensor::zeros(device, Shape::from_static(&[2*moe_dim, h]), DType::F16)?,
+            expert_down_gpu: GpuTensor::zeros(device, Shape::from_static(&[h, moe_dim]), DType::F16)?,
+            moe_in_f16: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F16)?,
+            gate_up_f16: GpuTensor::zeros(device, Shape::from_static(&[1, 2*moe_dim]), DType::F16)?,
+            gate_up_f32: GpuTensor::zeros(device, Shape::from_static(&[1, 2*moe_dim]), DType::F32)?,
+            expert_gate: GpuTensor::zeros(device, Shape::from_static(&[1, moe_dim]), DType::F32)?,
+            expert_up: GpuTensor::zeros(device, Shape::from_static(&[1, moe_dim]), DType::F32)?,
+            expert_geglu: GpuTensor::zeros(device, Shape::from_static(&[1, moe_dim]), DType::F32)?,
+            expert_geglu_f16: GpuTensor::zeros(device, Shape::from_static(&[1, moe_dim]), DType::F16)?,
+            expert_out_f16: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F16)?,
+            expert_out: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F32)?,
+            expert_weighted: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F32)?,
+            expert_new_acc: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F32)?,
+            dense_normed: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F32)?,
+            moe_normed: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F32)?,
+            combined: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F32)?,
+            final_normed: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F32)?,
+            output: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F32)?,
+            output_scaled: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F32)?,
+            lm_normed: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F32)?,
+        })
+    }
+
+    fn forward_prealloc(
+        &self, device: &WarpDevice, b: &mut MoEDecodeBuffers,
+        kv_caches: &mut [LayerKVCache], pos: u32,
+    ) -> Result<Vec<f32>, DeviceError> {
         let h = self.config.hidden_size;
         let dense_ffn = self.config.ffn_dim;
-        let moe_dim = 704u32; // moe_intermediate_size
+        let moe_dim = 704u32;
         let num_experts = 128u32;
         let top_k = 8u32;
 
-        // Cache host embedding for LM head
+        // Embedding + scale
+        let embed_scale = (h as f32).sqrt();
+        ops::mul_scalar(&self.cache, device, &b.hidden, &mut b.hidden_scaled, embed_scale)?;
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            let lc = &self.layer_configs[i];
+            let kv_dim = self.config.kv_dim_for_layer(lc);
+            let d = lc.head_dim;
+            let num_q_heads = self.config.num_heads;
+            let num_kv_heads = lc.num_kv_heads;
+            let q_dim = num_q_heads * d;
+
+            let x_data = if i == 0 { &b.hidden_scaled.data } else { &b.output_scaled.data };
+
+            // Attention
+            ops::rmsnorm(&self.cache, device, unsafe { &*(x_data as *const _ as *const GpuTensor<f32>) },
+                &layer.attn_norm, &mut b.normed, h, self.config.norm_eps)?;
+
+            crate::quantize::gemm_q4_0_m1(&self.cache, device, &b.normed, &layer.wq, &mut b.q, q_dim, h)?;
+            crate::quantize::gemm_q4_0_m1(&self.cache, device, &b.normed, &layer.wk, &mut b.k, kv_dim, h)?;
+            if self.config.k_eq_v {
+                ops::mul_scalar(&self.cache, device, &b.k, &mut b.v, 1.0)?;
+            } else {
+                crate::quantize::gemm_q4_0_m1(&self.cache, device, &b.normed, &layer.wv, &mut b.v, kv_dim, h)?;
+            }
+
+            crate::rope::rope(&self.cache, device, &b.q, &mut b.q_rope, num_q_heads, 1, d, lc.rope_theta, pos)?;
+            crate::rope::rope(&self.cache, device, &b.k, &mut b.k_rope, num_kv_heads, 1, d, lc.rope_theta, pos)?;
+
+            ops::rmsnorm(&self.cache, device, &b.q_rope, &layer.q_norm, &mut b.q_n, d, self.config.norm_eps)?;
+            ops::rmsnorm(&self.cache, device, &b.k_rope, &layer.k_norm, &mut b.k_n, d, self.config.norm_eps)?;
+
+            let kv = &mut kv_caches[i];
+            let cache_pos = if lc.window_size > 0 { pos % lc.window_size } else { pos };
+            kv.prefill_at_offset(&self.cache, device, &b.k_n, &b.v, 1, cache_pos)?;
+            kv.len = (pos + 1).min(kv.max_seq_len);
+
+            let window = if lc.window_size > 0 { lc.window_size } else { 0 };
+            device.htod_copy(&[kv.len], &mut b.cache_len_buf)?;
+            crate::kv_cache::decode_attention_flash_device_len_window(
+                &self.cache, device, &b.q_n, kv, &mut b.attn_out,
+                num_q_heads, num_kv_heads, d, &b.cache_len_buf, window)?;
+
+            crate::quantize::gemm_q4_0_m1(&self.cache, device, &b.attn_out, &layer.wo, &mut b.attn_proj, h, q_dim)?;
+
+            ops::rmsnorm(&self.cache, device, &b.attn_proj, &layer.post_attn_norm, &mut b.post_attn, h, self.config.norm_eps)?;
+            let x_ref: &GpuTensor<f32> = if i == 0 { &b.hidden_scaled } else { &b.output_scaled };
+            ops::add(&self.cache, device, x_ref, &b.post_attn, &mut b.residual)?;
+
+            // Dense MLP
+            ops::rmsnorm(&self.cache, device, &b.residual, &layer.pre_ffn_norm, &mut b.ffn_in, h, self.config.norm_eps)?;
+            crate::quantize::gemm_q4_0_m1(&self.cache, device, &b.ffn_in, &layer.w_gate, &mut b.dense_gate, dense_ffn, h)?;
+            crate::quantize::gemm_q4_0_m1(&self.cache, device, &b.ffn_in, &layer.w_up, &mut b.dense_up, dense_ffn, h)?;
+            ops::fused_gelu_mul(&self.cache, device, &b.dense_gate, &b.dense_up, &mut b.dense_geglu)?;
+            crate::quantize::gemm_q4_0_m1(&self.cache, device, &b.dense_geglu, &layer.w_down, &mut b.dense_out, h, dense_ffn)?;
+
+            // MoE: route
+            let (expert_ids, expert_weights) = crate::moe::route_experts(
+                &self.cache, device, &b.residual, &layer.router_proj, &layer.router_scale,
+                &layer.per_expert_scale, h, num_experts, top_k, self.config.norm_eps)?;
+
+            // MoE input
+            ops::rmsnorm(&self.cache, device, &b.residual, &layer.pre_ffn_norm_2, &mut b.moe_in, h, self.config.norm_eps)?;
+
+            // Cast moe_in to F16 once (reused for all experts)
+            crate::fp16::cast_f32_to_f16(&self.cache, device, &b.moe_in, &mut b.moe_in_f16)?;
+
+            // Zero accumulator
+            let zero_host = vec![0.0f32; h as usize];
+            device.htod_copy(&zero_host, &mut b.moe_accumulated.data)?;
+
+            let gu_per = 2 * moe_dim as usize * h as usize;
+            let d_per = h as usize * moe_dim as usize;
+
+            for (_, (&eid, &weight)) in expert_ids.iter().zip(expert_weights.iter()).enumerate() {
+                let eid = eid as usize;
+                let gu_off = eid * gu_per;
+                let d_off = eid * d_per;
+
+                // Upload expert weights to pre-allocated GPU buffers
+                device.htod_copy(&self.expert_gate_up_host[i][gu_off..gu_off + gu_per], &mut b.expert_gu_gpu.data)?;
+                device.htod_copy(&self.expert_down_host[i][d_off..d_off + d_per], &mut b.expert_down_gpu.data)?;
+
+                // gate_up HGEMM transB
+                crate::cublas_gemm::gemm_cublas_f16_transB(device,
+                    &b.moe_in_f16, &b.expert_gu_gpu, &mut b.gate_up_f16, 1, 2*moe_dim, h)?;
+                crate::fp16::cast_f16_to_f32(&self.cache, device, &b.gate_up_f16, &mut b.gate_up_f32)?;
+
+                ops::split_gate_up(&self.cache, device, &b.gate_up_f32, &mut b.expert_gate, &mut b.expert_up, moe_dim, 1)?;
+                ops::fused_gelu_mul(&self.cache, device, &b.expert_gate, &b.expert_up, &mut b.expert_geglu)?;
+
+                // down HGEMM transB
+                crate::fp16::cast_f32_to_f16(&self.cache, device, &b.expert_geglu, &mut b.expert_geglu_f16)?;
+                crate::cublas_gemm::gemm_cublas_f16_transB(device,
+                    &b.expert_geglu_f16, &b.expert_down_gpu, &mut b.expert_out_f16, 1, h, moe_dim)?;
+                crate::fp16::cast_f16_to_f32(&self.cache, device, &b.expert_out_f16, &mut b.expert_out)?;
+
+                // Accumulate
+                ops::mul_scalar(&self.cache, device, &b.expert_out, &mut b.expert_weighted, weight)?;
+                ops::add(&self.cache, device, &b.moe_accumulated, &b.expert_weighted, &mut b.expert_new_acc)?;
+                // Swap: accumulated = new_acc (pointer swap would be ideal, but copy for now)
+                ops::mul_scalar(&self.cache, device, &b.expert_new_acc, &mut b.moe_accumulated, 1.0)?;
+            }
+
+            // Combine dense + MoE
+            ops::rmsnorm(&self.cache, device, &b.dense_out, &layer.post_ffn_norm_1, &mut b.dense_normed, h, self.config.norm_eps)?;
+            ops::rmsnorm(&self.cache, device, &b.moe_accumulated, &layer.post_ffn_norm_2, &mut b.moe_normed, h, self.config.norm_eps)?;
+            ops::add(&self.cache, device, &b.dense_normed, &b.moe_normed, &mut b.combined)?;
+
+            ops::rmsnorm(&self.cache, device, &b.combined, &layer.post_ffn_norm, &mut b.final_normed, h, self.config.norm_eps)?;
+            ops::add(&self.cache, device, &b.residual, &b.final_normed, &mut b.output)?;
+            ops::mul_scalar(&self.cache, device, &b.output, &mut b.output_scaled, layer.layer_scalar)?;
+        }
+
+        // Final norm + LM head (CPU with cached embedding)
+        ops::rmsnorm(&self.cache, device, &b.output_scaled, &self.final_norm, &mut b.lm_normed, h, self.config.norm_eps)?;
+        let normed_host = b.lm_normed.to_host(device)?;
+        let embed = self.embed_host_f32.as_ref().unwrap();
+        let vocab = self.config.vocab_size as usize;
+        let mut logits = vec![0.0f32; vocab];
+        for v in 0..vocab {
+            let mut dot = 0.0f32;
+            for d in 0..h as usize {
+                dot += normed_host[d] * embed[v * h as usize + d];
+            }
+            logits[v] = dot;
+        }
+        Ok(logits)
+    }
+
+    pub fn generate(
+        &mut self, device: &WarpDevice, prompt_ids: &[i32],
+        gen_config: &GenerateConfig, max_seq_len: u32,
+    ) -> Result<GenerationResult, DeviceError> {
+        // Cache embedding for LM head
         if self.embed_host_f32.is_none() && self.config.tie_word_embeddings {
             let raw = self.embed_tokens.to_host(device)?;
             self.embed_host_f32 = Some(raw.iter().map(|h| h.to_f32()).collect());
@@ -90,17 +321,19 @@ impl MoEGenerationEngine {
             LayerKVCache::new(device, cache_len, kv_dim).unwrap()
         }).collect();
 
-        // Pre-allocated expert GPU buffer (reused per layer)
-        let expert_gu_size = 2 * moe_dim as usize * h as usize;
-        let expert_d_size = h as usize * moe_dim as usize;
+        // Pre-allocate ALL decode buffers
+        let mut bufs = self.allocate_buffers(device)?;
+        eprintln!("[moe] Pre-allocated decode buffers");
 
+        let h = self.config.hidden_size;
         let prefill_start = std::time::Instant::now();
 
-        // Process each prompt token
+        // Prefill
         let mut last_logits = Vec::new();
         for (t, &token) in prompt_ids.iter().enumerate() {
-            last_logits = self.forward_one_token(device, token, t as u32, &mut kv_caches,
-                h, dense_ffn, moe_dim, num_experts, top_k)?;
+            let ids = GpuTensor::from_host(device, &[token], Shape::from_static(&[1]), DType::I32)?;
+            sampling::embedding_f16(&self.cache, device, &self.embed_tokens, &ids, &mut bufs.hidden, 1, h)?;
+            last_logits = self.forward_prealloc(device, &mut bufs, &mut kv_caches, t as u32)?;
         }
         device.synchronize()?;
         let prefill_time = prefill_start.elapsed();
@@ -114,18 +347,14 @@ impl MoEGenerationEngine {
         });
 
         for step in 0..gen_config.max_tokens {
-            let next_token = sample_token(&last_logits, gen_config, &generated,
-                base_seed.wrapping_add(step as u64));
-            if let Some(eos) = gen_config.eos_token_id {
-                if next_token == eos { break; }
-            }
-            generated.push(next_token);
-            if !gen_config.stop_sequences.is_empty()
-                && matches_stop_sequence(&generated, &gen_config.stop_sequences)
-            { break; }
+            let next = sample_token(&last_logits, gen_config, &generated, base_seed.wrapping_add(step as u64));
+            if let Some(eos) = gen_config.eos_token_id { if next == eos { break; } }
+            generated.push(next);
+            if !gen_config.stop_sequences.is_empty() && matches_stop_sequence(&generated, &gen_config.stop_sequences) { break; }
 
-            last_logits = self.forward_one_token(device, next_token, pos, &mut kv_caches,
-                h, dense_ffn, moe_dim, num_experts, top_k)?;
+            let ids = GpuTensor::from_host(device, &[next], Shape::from_static(&[1]), DType::I32)?;
+            sampling::embedding_f16(&self.cache, device, &self.embed_tokens, &ids, &mut bufs.hidden, 1, h)?;
+            last_logits = self.forward_prealloc(device, &mut bufs, &mut kv_caches, pos)?;
             device.synchronize()?;
             pos += 1;
         }
@@ -141,232 +370,5 @@ impl MoEGenerationEngine {
             } else { 0.0 },
             kv_cache_memory_bytes: kv_bytes,
         })
-    }
-
-    /// Hidden state buffer — stored between calls
-    fn forward_one_token(
-        &self,
-        device: &WarpDevice,
-        token_id: i32,
-        pos: u32,
-        kv_caches: &mut [LayerKVCache],
-        h: u32,
-        dense_ffn: u32,
-        moe_dim: u32,
-        num_experts: u32,
-        top_k: u32,
-    ) -> Result<Vec<f32>, DeviceError> {
-        let ids = GpuTensor::from_host(device, &[token_id],
-            Shape::from_static(&[1]), DType::I32)?;
-        let mut hidden = GpuTensor::<f32>::zeros(device,
-            Shape::from_static(&[1, h as usize]), DType::F32)?;
-        sampling::embedding_f16(&self.cache, device, &self.embed_tokens, &ids,
-            &mut hidden, 1, h)?;
-
-        // Scale by sqrt(hidden_size) — Gemma convention
-        let mut scaled = GpuTensor::<f32>::zeros(device,
-            Shape::from_static(&[1, h as usize]), DType::F32)?;
-        ops::mul_scalar(&self.cache, device, &hidden, &mut scaled, (h as f32).sqrt())?;
-        hidden = scaled;
-
-        for (i, layer) in self.layers.iter().enumerate() {
-            let lc = &self.layer_configs[i];
-            let kv_dim = self.config.kv_dim_for_layer(lc);
-            let d = lc.head_dim;
-            let num_q_heads = self.config.num_heads;
-            let num_kv_heads = lc.num_kv_heads;
-            let q_dim = num_q_heads * d;
-
-            // 1. Attention
-            let mut normed = GpuTensor::<f32>::zeros(device, Shape::from_static(&[1, h as usize]), DType::F32)?;
-            ops::rmsnorm(&self.cache, device, &hidden, &layer.attn_norm, &mut normed, h, self.config.norm_eps)?;
-
-            let mut q = GpuTensor::<f32>::zeros(device, Shape::from_static(&[1, q_dim as usize]), DType::F32)?;
-            let mut k = GpuTensor::<f32>::zeros(device, Shape::from_static(&[1, kv_dim as usize]), DType::F32)?;
-            let mut v = GpuTensor::<f32>::zeros(device, Shape::from_static(&[1, kv_dim as usize]), DType::F32)?;
-            crate::quantize::gemm_q4_0_m1(&self.cache, device, &normed, &layer.wq, &mut q, q_dim, h)?;
-            crate::quantize::gemm_q4_0_m1(&self.cache, device, &normed, &layer.wk, &mut k, kv_dim, h)?;
-            if self.config.k_eq_v {
-                ops::mul_scalar(&self.cache, device, &k, &mut v, 1.0)?;
-            } else {
-                crate::quantize::gemm_q4_0_m1(&self.cache, device, &normed, &layer.wv, &mut v, kv_dim, h)?;
-            }
-
-            // RoPE
-            let mut q_rope = GpuTensor::<f32>::zeros(device, q.shape.clone(), DType::F32)?;
-            let mut k_rope = GpuTensor::<f32>::zeros(device, k.shape.clone(), DType::F32)?;
-            crate::rope::rope(&self.cache, device, &q, &mut q_rope, num_q_heads, 1, d, lc.rope_theta, pos)?;
-            crate::rope::rope(&self.cache, device, &k, &mut k_rope, num_kv_heads, 1, d, lc.rope_theta, pos)?;
-
-            // QK-norm (learned weights)
-            let mut q_n = GpuTensor::<f32>::zeros(device, q_rope.shape.clone(), DType::F32)?;
-            let mut k_n = GpuTensor::<f32>::zeros(device, k_rope.shape.clone(), DType::F32)?;
-            ops::rmsnorm(&self.cache, device, &q_rope, &layer.q_norm, &mut q_n, d, self.config.norm_eps)?;
-            ops::rmsnorm(&self.cache, device, &k_rope, &layer.k_norm, &mut k_n, d, self.config.norm_eps)?;
-
-            // KV append + attention
-            let kv_cache = &mut kv_caches[i];
-            let cache_pos = if lc.window_size > 0 { pos % lc.window_size } else { pos };
-            kv_cache.prefill_at_offset(&self.cache, device, &k_n, &v, 1, cache_pos)?;
-            kv_cache.len = (pos + 1).min(kv_cache.max_seq_len);
-
-            let window = if lc.window_size > 0 { lc.window_size } else { 0 };
-            let cache_len_buf = device.htod(&[kv_cache.len])?;
-            let mut attn_out = GpuTensor::<f32>::zeros(device, Shape::from_static(&[1, q_dim as usize]), DType::F32)?;
-            crate::kv_cache::decode_attention_flash_device_len_window(
-                &self.cache, device, &q_n, kv_cache, &mut attn_out,
-                num_q_heads, num_kv_heads, d, &cache_len_buf, window)?;
-
-            // Output projection
-            let mut attn_proj = GpuTensor::<f32>::zeros(device, Shape::from_static(&[1, h as usize]), DType::F32)?;
-            crate::quantize::gemm_q4_0_m1(&self.cache, device, &attn_out, &layer.wo, &mut attn_proj, h, q_dim)?;
-
-            // Post-attention norm + residual
-            let mut post_attn = GpuTensor::<f32>::zeros(device, Shape::from_static(&[1, h as usize]), DType::F32)?;
-            ops::rmsnorm(&self.cache, device, &attn_proj, &layer.post_attn_norm, &mut post_attn, h, self.config.norm_eps)?;
-            let mut residual = GpuTensor::<f32>::zeros(device, Shape::from_static(&[1, h as usize]), DType::F32)?;
-            ops::add(&self.cache, device, &hidden, &post_attn, &mut residual)?;
-
-            // 2. Dense MLP
-            let mut ffn_in = GpuTensor::<f32>::zeros(device, Shape::from_static(&[1, h as usize]), DType::F32)?;
-            ops::rmsnorm(&self.cache, device, &residual, &layer.pre_ffn_norm, &mut ffn_in, h, self.config.norm_eps)?;
-
-            let mut gate = GpuTensor::<f32>::zeros(device, Shape::from_static(&[1, dense_ffn as usize]), DType::F32)?;
-            let mut up = GpuTensor::<f32>::zeros(device, Shape::from_static(&[1, dense_ffn as usize]), DType::F32)?;
-            crate::quantize::gemm_q4_0_m1(&self.cache, device, &ffn_in, &layer.w_gate, &mut gate, dense_ffn, h)?;
-            crate::quantize::gemm_q4_0_m1(&self.cache, device, &ffn_in, &layer.w_up, &mut up, dense_ffn, h)?;
-            let mut geglu = GpuTensor::<f32>::zeros(device, Shape::from_static(&[1, dense_ffn as usize]), DType::F32)?;
-            ops::fused_gelu_mul(&self.cache, device, &gate, &up, &mut geglu)?;
-            let mut dense_out = GpuTensor::<f32>::zeros(device, Shape::from_static(&[1, h as usize]), DType::F32)?;
-            crate::quantize::gemm_q4_0_m1(&self.cache, device, &geglu, &layer.w_down, &mut dense_out, h, dense_ffn)?;
-
-            // 3. MoE path (parallel with dense MLP — uses residual, not ffn_in)
-            // Router
-            let (expert_ids, expert_weights) = crate::moe::route_experts(
-                &self.cache, device, &residual, &layer.router_proj, &layer.router_scale,
-                &layer.per_expert_scale, h, num_experts, top_k, self.config.norm_eps)?;
-
-            // MoE input: pre_feedforward_layernorm_2(residual)
-            let mut moe_in = GpuTensor::<f32>::zeros(device, Shape::from_static(&[1, h as usize]), DType::F32)?;
-            ops::rmsnorm(&self.cache, device, &residual, &layer.pre_ffn_norm_2, &mut moe_in, h, self.config.norm_eps)?;
-
-            // Run 8 active experts (stream from RAM)
-            let gu_per_expert = 2 * moe_dim as usize * h as usize;
-            let d_per_expert = h as usize * moe_dim as usize;
-            let mut moe_accumulated = GpuTensor::<f32>::zeros(device, Shape::from_static(&[1, h as usize]), DType::F32)?;
-
-            for (idx, (&eid, &weight)) in expert_ids.iter().zip(expert_weights.iter()).enumerate() {
-                let eid = eid as usize;
-
-                // Slice expert weights from host RAM
-                let gu_offset = eid * gu_per_expert;
-                let gu_slice = &self.expert_gate_up_host[i][gu_offset..gu_offset + gu_per_expert];
-
-                let d_offset = eid * d_per_expert;
-                let d_slice = &self.expert_down_host[i][d_offset..d_offset + d_per_expert];
-
-                // Upload expert to GPU as F16, then run with cuBLAS
-                let expert_gu = GpuTensor::from_host(device, gu_slice,
-                    Shape::from_static(&[2 * moe_dim as usize, h as usize]), DType::F16)?;
-                let expert_down = GpuTensor::from_host(device, d_slice,
-                    Shape::from_static(&[h as usize, moe_dim as usize]), DType::F16)?;
-
-                // Cast input to F16 for HGEMM
-                let mut moe_in_f16 = GpuTensor::<half::f16>::zeros(device,
-                    Shape::from_static(&[1, h as usize]), DType::F16)?;
-                crate::fp16::cast_f32_to_f16(&self.cache, device, &moe_in, &mut moe_in_f16)?;
-
-                // gate_up = moe_in @ expert_gu^T (F16 HGEMM transB)
-                let mut gate_up_f16 = GpuTensor::<half::f16>::zeros(device,
-                    Shape::from_static(&[1, (2 * moe_dim) as usize]), DType::F16)?;
-                crate::cublas_gemm::gemm_cublas_f16_transB(device,
-                    &moe_in_f16, &expert_gu, &mut gate_up_f16, 1, 2 * moe_dim, h)?;
-
-                // Cast back to F32 for split + GeGLU
-                let mut gate_up_f32 = GpuTensor::<f32>::zeros(device,
-                    Shape::from_static(&[1, (2 * moe_dim) as usize]), DType::F32)?;
-                crate::fp16::cast_f16_to_f32(&self.cache, device, &gate_up_f16, &mut gate_up_f32)?;
-
-                let mut g = GpuTensor::<f32>::zeros(device, Shape::from_static(&[1, moe_dim as usize]), DType::F32)?;
-                let mut u = GpuTensor::<f32>::zeros(device, Shape::from_static(&[1, moe_dim as usize]), DType::F32)?;
-                ops::split_gate_up(&self.cache, device, &gate_up_f32, &mut g, &mut u, moe_dim, 1)?;
-
-                let mut gg = GpuTensor::<f32>::zeros(device, Shape::from_static(&[1, moe_dim as usize]), DType::F32)?;
-                ops::fused_gelu_mul(&self.cache, device, &g, &u, &mut gg)?;
-
-                // down = gg @ expert_down^T (F16)
-                let mut gg_f16 = GpuTensor::<half::f16>::zeros(device,
-                    Shape::from_static(&[1, moe_dim as usize]), DType::F16)?;
-                crate::fp16::cast_f32_to_f16(&self.cache, device, &gg, &mut gg_f16)?;
-
-                let mut expert_out_f16 = GpuTensor::<half::f16>::zeros(device,
-                    Shape::from_static(&[1, h as usize]), DType::F16)?;
-                crate::cublas_gemm::gemm_cublas_f16_transB(device,
-                    &gg_f16, &expert_down, &mut expert_out_f16, 1, h, moe_dim)?;
-
-                let mut expert_out = GpuTensor::<f32>::zeros(device,
-                    Shape::from_static(&[1, h as usize]), DType::F32)?;
-                crate::fp16::cast_f16_to_f32(&self.cache, device, &expert_out_f16, &mut expert_out)?;
-
-                // Accumulate: moe_accumulated += weight * expert_out
-                let mut weighted = GpuTensor::<f32>::zeros(device,
-                    Shape::from_static(&[1, h as usize]), DType::F32)?;
-                ops::mul_scalar(&self.cache, device, &expert_out, &mut weighted, weight)?;
-                let mut new_acc = GpuTensor::<f32>::zeros(device,
-                    Shape::from_static(&[1, h as usize]), DType::F32)?;
-                ops::add(&self.cache, device, &moe_accumulated, &weighted, &mut new_acc)?;
-                moe_accumulated = new_acc;
-            }
-
-            // 4. Combine dense + MoE
-            let mut dense_normed = GpuTensor::<f32>::zeros(device, Shape::from_static(&[1, h as usize]), DType::F32)?;
-            ops::rmsnorm(&self.cache, device, &dense_out, &layer.post_ffn_norm_1, &mut dense_normed, h, self.config.norm_eps)?;
-
-            let mut moe_normed = GpuTensor::<f32>::zeros(device, Shape::from_static(&[1, h as usize]), DType::F32)?;
-            ops::rmsnorm(&self.cache, device, &moe_accumulated, &layer.post_ffn_norm_2, &mut moe_normed, h, self.config.norm_eps)?;
-
-            let mut combined = GpuTensor::<f32>::zeros(device, Shape::from_static(&[1, h as usize]), DType::F32)?;
-            ops::add(&self.cache, device, &dense_normed, &moe_normed, &mut combined)?;
-
-            // 5. Final norm + residual + layer_scalar
-            let mut final_normed = GpuTensor::<f32>::zeros(device, Shape::from_static(&[1, h as usize]), DType::F32)?;
-            ops::rmsnorm(&self.cache, device, &combined, &layer.post_ffn_norm, &mut final_normed, h, self.config.norm_eps)?;
-
-            let mut output = GpuTensor::<f32>::zeros(device, Shape::from_static(&[1, h as usize]), DType::F32)?;
-            ops::add(&self.cache, device, &residual, &final_normed, &mut output)?;
-
-            // *= layer_scalar
-            let mut output_scaled = GpuTensor::<f32>::zeros(device, Shape::from_static(&[1, h as usize]), DType::F32)?;
-            ops::mul_scalar(&self.cache, device, &output, &mut output_scaled, layer.layer_scalar)?;
-
-            hidden = output_scaled;
-        }
-
-        // Return final hidden state for LM head
-        // Store in self.last_hidden via interior mutability... or just return it
-        // Actually, return it — the caller manages it
-        // We need to restructure: forward_one_token should return the hidden state
-        // Let's use a simple Output struct
-
-        // Final norm
-        let mut normed = GpuTensor::<f32>::zeros(device,
-            Shape::from_static(&[1, h as usize]), DType::F32)?;
-        ops::rmsnorm(&self.cache, device, &hidden, &self.final_norm, &mut normed, h, self.config.norm_eps)?;
-
-        // LM head: CPU matmul with cached F32 embedding
-        let normed_host = normed.to_host(device)?;
-        let embed_host = self.embed_host_f32.as_ref()
-            .ok_or_else(|| DeviceError::Memory("embed_host_f32 not cached".into()))?;
-        let vocab = self.config.vocab_size as usize;
-        let mut logits = vec![0.0f32; vocab];
-        for v in 0..vocab {
-            let mut dot = 0.0f32;
-            for d in 0..h as usize {
-                dot += normed_host[d] * embed_host[v * h as usize + d];
-            }
-            logits[v] = dot;
-        }
-
-        Ok(logits)
     }
 }
