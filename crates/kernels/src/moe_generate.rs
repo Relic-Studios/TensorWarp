@@ -353,6 +353,21 @@ impl MoEGenerationEngine {
             ops::add(&self.cache, device, &b.residual, &b.final_normed, &mut b.output)?;
             ops::mul_scalar(&self.cache, device, &b.output, &mut b.output_scaled, layer.layer_scalar)?;
 
+            // NaN check
+            {
+                let h_out = b.output_scaled.to_host(device)?;
+                let has_nan = h_out.iter().any(|v| v.is_nan());
+                let has_inf = h_out.iter().any(|v| v.is_infinite());
+                if has_nan || has_inf {
+                    eprintln!("[BUG] Layer {i} output has NaN={has_nan} Inf={has_inf}! layer_scalar={}", layer.layer_scalar);
+                    // Print the residual and combined to find where NaN enters
+                    let res = b.residual.to_host(device)?;
+                    let comb = b.combined.to_host(device)?;
+                    eprintln!("  residual has_nan={}", res.iter().any(|v| v.is_nan()));
+                    eprintln!("  combined has_nan={}", comb.iter().any(|v| v.is_nan()));
+                }
+            }
+
             if i == 0 {
                 device.synchronize()?;
                 let h_out = b.output_scaled.to_host(device)?;

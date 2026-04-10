@@ -700,9 +700,10 @@ extern "C" __global__ void warp_flash_decode_chunk(
     float *smem_O = smem + head_dim + chunk_size; // [head_dim]
 
     // Load Q for this head
-    if (tid < head_dim) {
-        smem_Q[tid] = Q[q_head * head_dim + tid];
-        smem_O[tid] = 0.0f;
+    // Load Q and zero O — use loop for head_dim > blockDim.x (e.g. 512 > 256)
+    for (unsigned int d = tid; d < head_dim; d += blockDim.x) {
+        smem_Q[d] = Q[q_head * head_dim + d];
+        smem_O[d] = 0.0f;
     }
     __syncthreads();
 
@@ -985,8 +986,8 @@ extern "C" __global__ void warp_flash_decode_chunk_dl(
     // Empty chunk or entirely outside sliding window — write sentinel values
     if (chunk_start >= cache_len || chunk_end <= win_start) {
         unsigned int out_base = q_head * max_chunks;
-        if (tid < head_dim) {
-            partial_O[(q_head * max_chunks + chunk_idx) * head_dim + tid] = 0.0f;
+        for (unsigned int d = tid; d < head_dim; d += blockDim.x) {
+            partial_O[(q_head * max_chunks + chunk_idx) * head_dim + d] = 0.0f;
         }
         if (tid == 0) {
             partial_m[out_base + chunk_idx] = -1e30f;
@@ -1003,9 +1004,10 @@ extern "C" __global__ void warp_flash_decode_chunk_dl(
     float *smem_scores = smem + head_dim;
     float *smem_O = smem + head_dim + chunk_size;
 
-    if (tid < head_dim) {
-        smem_Q[tid] = Q[q_head * head_dim + tid];
-        smem_O[tid] = 0.0f;
+    // Load Q and zero O — use loop for head_dim > blockDim.x (e.g. 512 > 256)
+    for (unsigned int d = tid; d < head_dim; d += blockDim.x) {
+        smem_Q[d] = Q[q_head * head_dim + d];
+        smem_O[d] = 0.0f;
     }
     __syncthreads();
 
@@ -1057,8 +1059,8 @@ extern "C" __global__ void warp_flash_decode_chunk_dl(
     __syncthreads();
 
     unsigned int out_base = q_head * max_chunks;
-    if (tid < head_dim) {
-        partial_O[(q_head * max_chunks + chunk_idx) * head_dim + tid] = smem_O[tid];
+    for (unsigned int d = tid; d < head_dim; d += blockDim.x) {
+        partial_O[(q_head * max_chunks + chunk_idx) * head_dim + d] = smem_O[d];
     }
     if (tid == 0) {
         partial_m[out_base + chunk_idx] = block_max;
