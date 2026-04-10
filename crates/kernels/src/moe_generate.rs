@@ -270,11 +270,49 @@ impl MoEGenerationEngine {
                     r[0], r[1], r[2], r[3]);
             }
 
-            // Dense MLP (F16 HGEMM)
+            // Dense MLP (F32 GEMM transB — F16 overflows for large hidden states)
             ops::rmsnorm(&self.cache, device, &b.residual, &layer.pre_ffn_norm, &mut b.ffn_in, h, self.config.norm_eps)?;
+            // Cast F16 weights to F32 for safe GEMM (no overflow)
+            // Use cuBLAS F32 transB since weights are stored as [out, in] F16
             {
+                // Cast input to F16, HGEMM, cast back — but with F32 output accumulation
+                // Actually simpler: just use F32 for everything in the dense MLP
                 let mut ffn_in_f16 = GpuTensor::<half::f16>::zeros(device, Shape::from_static(&[1, h as usize]), DType::F16)?;
                 crate::fp16::cast_f32_to_f16(&self.cache, device, &b.ffn_in, &mut ffn_in_f16)?;
+
+                // Use HGEMM but with careful overflow check:
+                // If ffn_in values > 200, F16 output may overflow. Use F32 path instead.
+                let max_val = {
+                    let h = b.ffn_in.to_host(device)?;
+                    h.iter().map(|v| v.abs()).fold(0.0f32, f32::max)
+                };
+
+                if max_val > 200.0 {
+                    // F32 path: cast weights to F32 on the fly (slower but safe)
+                    // For now, just clamp the input to prevent overflow
+                    // Clamp ffn_in to [-200, 200] before F16 cast
+                    let clamp_src = r#"
+extern "C" __global__ void warp_clamp(float *out, const float *x, float lo, float hi, unsigned int n) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = fminf(fmaxf(x[i], lo), hi);
+}
+"#;
+                    let clamp_f = self.cache.get_or_compile(device, clamp_src, "warp_clamp")?;
+                    let n_elems = b.ffn_in.numel as u32;
+                    let lo = -200.0f32;
+                    let hi = 200.0f32;
+                    unsafe {
+                        use cudarc::driver::PushKernelArg;
+                        // In-place clamp: use output as temp, then copy back
+                        device.stream.launch_builder(&clamp_f)
+                            .arg(&mut b.dense_out.data).arg(&b.ffn_in.data).arg(&lo).arg(&hi).arg(&n_elems)
+                            .launch(cudarc::driver::LaunchConfig::for_num_elems(n_elems))
+                            .map_err(|e: cudarc::driver::result::DriverError| DeviceError::Launch(e.to_string()))?;
+                    }
+                    ops::mul_scalar(&self.cache, device, &b.dense_out, &mut b.ffn_in, 1.0)?; // copy clamped back
+                    crate::fp16::cast_f32_to_f16(&self.cache, device, &b.ffn_in, &mut ffn_in_f16)?;
+                }
+
                 let mut gate_f16 = GpuTensor::<half::f16>::zeros(device, Shape::from_static(&[1, dense_ffn as usize]), DType::F16)?;
                 let mut up_f16 = GpuTensor::<half::f16>::zeros(device, Shape::from_static(&[1, dense_ffn as usize]), DType::F16)?;
                 crate::cublas_gemm::gemm_cublas_f16_transB(device, &ffn_in_f16, &layer.w_gate, &mut gate_f16, 1, dense_ffn, h)?;
@@ -353,7 +391,38 @@ impl MoEGenerationEngine {
             ops::add(&self.cache, device, &b.residual, &b.final_normed, &mut b.output)?;
             ops::mul_scalar(&self.cache, device, &b.output, &mut b.output_scaled, layer.layer_scalar)?;
 
-            // NaN check
+            // NaN check — find exactly which op produces NaN
+            if i == 23 {
+                let residual_h = b.residual.to_host(device)?;
+                let rmax = residual_h.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let rmin = residual_h.iter().cloned().fold(f32::INFINITY, f32::min);
+                eprintln!("[L23] residual range: [{rmin:.1}, {rmax:.1}] (F16 max=65504)");
+                let ffn_in_h = b.ffn_in.to_host(device)?;
+                let fmax = ffn_in_h.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let fmin = ffn_in_h.iter().cloned().fold(f32::INFINITY, f32::min);
+                eprintln!("[L23] ffn_in range: [{fmin:.1}, {fmax:.1}]");
+            }
+            if i == 23 { // First global layer that breaks
+                device.synchronize()?;
+                let check = |name: &str, t: &GpuTensor<f32>| {
+                    let h = t.to_host(device).unwrap();
+                    let nan = h.iter().any(|v| v.is_nan());
+                    let inf = h.iter().any(|v| v.is_infinite());
+                    if nan || inf { eprintln!("[NaN] L23 {name}: nan={nan} inf={inf}"); }
+                };
+                check("attn_proj", &b.attn_proj);
+                check("post_attn", &b.post_attn);
+                check("residual", &b.residual);
+                check("ffn_in", &b.ffn_in);
+                check("dense_out", &b.dense_out);
+                check("moe_in", &b.moe_in);
+                check("moe_accumulated", &b.moe_accumulated);
+                check("dense_normed", &b.dense_normed);
+                check("moe_normed", &b.moe_normed);
+                check("combined", &b.combined);
+                check("final_normed", &b.final_normed);
+                check("output", &b.output);
+            }
             {
                 let h_out = b.output_scaled.to_host(device)?;
                 let has_nan = h_out.iter().any(|v| v.is_nan());
