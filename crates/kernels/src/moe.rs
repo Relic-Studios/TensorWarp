@@ -65,12 +65,14 @@ pub fn route_experts(
 
     // 5+6+7. Top-K + normalize + per_expert_scale (on CPU — E=128 is tiny)
     let probs_host = probs.to_host(device)?;
-    let per_expert_host = per_expert_scale.to_host(device)?;
+    let per_expert_host = per_expert_scale.to_host(device).map_err(|e| {
+        DeviceError::Memory(format!("per_expert_scale to_host: {e}"))
+    })?;
 
     let mut indexed: Vec<(u32, f32)> = probs_host.iter().enumerate()
         .map(|(i, &v)| (i as u32, v))
         .collect();
-    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     let top_ids: Vec<u32> = indexed[..top_k as usize].iter().map(|(id, _)| *id).collect();
     let top_weights: Vec<f32> = indexed[..top_k as usize].iter().map(|(_, w)| *w).collect();
