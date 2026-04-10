@@ -270,63 +270,21 @@ impl MoEGenerationEngine {
                     r[0], r[1], r[2], r[3]);
             }
 
-            // Dense MLP (F32 GEMM transB — F16 overflows for large hidden states)
+            // Dense MLP — use F32 cuBLAS SGEMM transB (F16 overflows at layer 23+)
+            // Weights are F16, cast to F32 on the fly per-layer (small: 2112×2816 each)
             ops::rmsnorm(&self.cache, device, &b.residual, &layer.pre_ffn_norm, &mut b.ffn_in, h, self.config.norm_eps)?;
-            // Cast F16 weights to F32 for safe GEMM (no overflow)
-            // Use cuBLAS F32 transB since weights are stored as [out, in] F16
             {
-                // Cast input to F16, HGEMM, cast back — but with F32 output accumulation
-                // Actually simpler: just use F32 for everything in the dense MLP
-                let mut ffn_in_f16 = GpuTensor::<half::f16>::zeros(device, Shape::from_static(&[1, h as usize]), DType::F16)?;
-                crate::fp16::cast_f32_to_f16(&self.cache, device, &b.ffn_in, &mut ffn_in_f16)?;
+                let mut gate_f32 = GpuTensor::<f32>::zeros(device, Shape::from_static(&[dense_ffn as usize, h as usize]), DType::F32)?;
+                let mut up_f32 = GpuTensor::<f32>::zeros(device, Shape::from_static(&[dense_ffn as usize, h as usize]), DType::F32)?;
+                let mut down_f32 = GpuTensor::<f32>::zeros(device, Shape::from_static(&[h as usize, dense_ffn as usize]), DType::F32)?;
+                crate::fp16::cast_f16_to_f32(&self.cache, device, &layer.w_gate, &mut gate_f32)?;
+                crate::fp16::cast_f16_to_f32(&self.cache, device, &layer.w_up, &mut up_f32)?;
+                crate::fp16::cast_f16_to_f32(&self.cache, device, &layer.w_down, &mut down_f32)?;
 
-                // Use HGEMM but with careful overflow check:
-                // If ffn_in values > 200, F16 output may overflow. Use F32 path instead.
-                let max_val = {
-                    let h = b.ffn_in.to_host(device)?;
-                    h.iter().map(|v| v.abs()).fold(0.0f32, f32::max)
-                };
-
-                if max_val > 200.0 {
-                    // F32 path: cast weights to F32 on the fly (slower but safe)
-                    // For now, just clamp the input to prevent overflow
-                    // Clamp ffn_in to [-200, 200] before F16 cast
-                    let clamp_src = r#"
-extern "C" __global__ void warp_clamp(float *out, const float *x, float lo, float hi, unsigned int n) {
-    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = fminf(fmaxf(x[i], lo), hi);
-}
-"#;
-                    let clamp_f = self.cache.get_or_compile(device, clamp_src, "warp_clamp")?;
-                    let n_elems = b.ffn_in.numel as u32;
-                    let lo = -200.0f32;
-                    let hi = 200.0f32;
-                    unsafe {
-                        use cudarc::driver::PushKernelArg;
-                        // In-place clamp: use output as temp, then copy back
-                        device.stream.launch_builder(&clamp_f)
-                            .arg(&mut b.dense_out.data).arg(&b.ffn_in.data).arg(&lo).arg(&hi).arg(&n_elems)
-                            .launch(cudarc::driver::LaunchConfig::for_num_elems(n_elems))
-                            .map_err(|e: cudarc::driver::result::DriverError| DeviceError::Launch(e.to_string()))?;
-                    }
-                    ops::mul_scalar(&self.cache, device, &b.dense_out, &mut b.ffn_in, 1.0)?; // copy clamped back
-                    crate::fp16::cast_f32_to_f16(&self.cache, device, &b.ffn_in, &mut ffn_in_f16)?;
-                }
-
-                let mut gate_f16 = GpuTensor::<half::f16>::zeros(device, Shape::from_static(&[1, dense_ffn as usize]), DType::F16)?;
-                let mut up_f16 = GpuTensor::<half::f16>::zeros(device, Shape::from_static(&[1, dense_ffn as usize]), DType::F16)?;
-                crate::cublas_gemm::gemm_cublas_f16_transB(device, &ffn_in_f16, &layer.w_gate, &mut gate_f16, 1, dense_ffn, h)?;
-                crate::cublas_gemm::gemm_cublas_f16_transB(device, &ffn_in_f16, &layer.w_up, &mut up_f16, 1, dense_ffn, h)?;
-                crate::fp16::cast_f16_to_f32(&self.cache, device, &gate_f16, &mut b.dense_gate)?;
-                crate::fp16::cast_f16_to_f32(&self.cache, device, &up_f16, &mut b.dense_up)?;
-            }
-            ops::fused_gelu_mul(&self.cache, device, &b.dense_gate, &b.dense_up, &mut b.dense_geglu)?;
-            {
-                let mut geglu_f16 = GpuTensor::<half::f16>::zeros(device, Shape::from_static(&[1, dense_ffn as usize]), DType::F16)?;
-                crate::fp16::cast_f32_to_f16(&self.cache, device, &b.dense_geglu, &mut geglu_f16)?;
-                let mut down_f16 = GpuTensor::<half::f16>::zeros(device, Shape::from_static(&[1, h as usize]), DType::F16)?;
-                crate::cublas_gemm::gemm_cublas_f16_transB(device, &geglu_f16, &layer.w_down, &mut down_f16, 1, h, dense_ffn)?;
-                crate::fp16::cast_f16_to_f32(&self.cache, device, &down_f16, &mut b.dense_out)?;
+                crate::cublas_gemm::gemm_cublas_f32_transB(device, &b.ffn_in, &gate_f32, &mut b.dense_gate, 1, dense_ffn, h)?;
+                crate::cublas_gemm::gemm_cublas_f32_transB(device, &b.ffn_in, &up_f32, &mut b.dense_up, 1, dense_ffn, h)?;
+                ops::fused_gelu_mul(&self.cache, device, &b.dense_gate, &b.dense_up, &mut b.dense_geglu)?;
+                crate::cublas_gemm::gemm_cublas_f32_transB(device, &b.dense_geglu, &down_f32, &mut b.dense_out, 1, h, dense_ffn)?;
             }
 
             // MoE: route
