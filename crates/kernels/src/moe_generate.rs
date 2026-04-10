@@ -291,31 +291,32 @@ impl MoEGenerationEngine {
             ops::mul_scalar(&self.cache, device, &b.output, &mut b.output_scaled, layer.layer_scalar)?;
         }
 
-        // Final norm + LM head (CPU with cached embedding)
+        // Final norm + GPU LM head (cuBLAS F16 HGEMM transB with tied embedding)
         ops::rmsnorm(&self.cache, device, &b.output_scaled, &self.final_norm, &mut b.lm_normed, h, self.config.norm_eps)?;
-        let normed_host = b.lm_normed.to_host(device)?;
-        let embed = self.embed_host_f32.as_ref().unwrap();
-        let vocab = self.config.vocab_size as usize;
-        let mut logits = vec![0.0f32; vocab];
-        for v in 0..vocab {
-            let mut dot = 0.0f32;
-            for d in 0..h as usize {
-                dot += normed_host[d] * embed[v * h as usize + d];
-            }
-            logits[v] = dot;
-        }
-        Ok(logits)
+
+        // Cast normed to F16, HGEMM with F16 embed, cast result to F32
+        let mut normed_f16 = GpuTensor::<half::f16>::zeros(device,
+            Shape::from_static(&[1, h as usize]), DType::F16)?;
+        crate::fp16::cast_f32_to_f16(&self.cache, device, &b.lm_normed, &mut normed_f16)?;
+
+        let vocab = self.config.vocab_size;
+        let mut logits_f16 = GpuTensor::<half::f16>::zeros(device,
+            Shape::from_static(&[1, vocab as usize]), DType::F16)?;
+        crate::cublas_gemm::gemm_cublas_f16_transB(device,
+            &normed_f16, &self.embed_tokens, &mut logits_f16, 1, vocab, h)?;
+
+        let mut logits_gpu = GpuTensor::<f32>::zeros(device,
+            Shape::from_static(&[1, vocab as usize]), DType::F32)?;
+        crate::fp16::cast_f16_to_f32(&self.cache, device, &logits_f16, &mut logits_gpu)?;
+
+        logits_gpu.to_host(device)
     }
 
     pub fn generate(
         &mut self, device: &WarpDevice, prompt_ids: &[i32],
         gen_config: &GenerateConfig, max_seq_len: u32,
     ) -> Result<GenerationResult, DeviceError> {
-        // Cache embedding for LM head
-        if self.embed_host_f32.is_none() && self.config.tie_word_embeddings {
-            let raw = self.embed_tokens.to_host(device)?;
-            self.embed_host_f32 = Some(raw.iter().map(|h| h.to_f32()).collect());
-        }
+        // GPU LM head uses embed_tokens directly — no host cache needed
 
         // KV caches
         let mut kv_caches: Vec<LayerKVCache> = self.layer_configs.iter().map(|lc| {
