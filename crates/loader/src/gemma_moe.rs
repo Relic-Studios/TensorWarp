@@ -39,9 +39,9 @@ pub struct GemmaMoELayerWeights {
     pub wo: GpuTensor<u8>,
 
     // Dense MLP (Q4 quantized)
-    pub w_gate: GpuTensor<u8>,
-    pub w_up: GpuTensor<u8>,
-    pub w_down: GpuTensor<u8>,
+    pub w_gate: GpuTensor<half::f16>,
+    pub w_up: GpuTensor<half::f16>,
+    pub w_down: GpuTensor<half::f16>,
 
     // Router
     pub router_proj: GpuTensor<f32>,        // [hidden_size, num_experts]
@@ -80,9 +80,9 @@ pub struct GemmaMoELayerVRAM {
     pub wk: GpuTensor<half::f16>,
     pub wv: GpuTensor<half::f16>,
     pub wo: GpuTensor<half::f16>,
-    pub w_gate: GpuTensor<u8>,
-    pub w_up: GpuTensor<u8>,
-    pub w_down: GpuTensor<u8>,
+    pub w_gate: GpuTensor<half::f16>,
+    pub w_up: GpuTensor<half::f16>,
+    pub w_down: GpuTensor<half::f16>,
     pub router_proj: GpuTensor<f32>,
     pub router_scale: GpuTensor<f32>,
     pub per_expert_scale: GpuTensor<f32>,
@@ -170,11 +170,11 @@ impl GemmaMoEModel {
             };
             let wo = loader.load_f16_transposed(&format!("{lp}.self_attn.o_proj.weight"), device)?;
 
-            // Dense MLP Q4
+            // Dense MLP F16 (higher precision for correct output)
             let dense_ffn = config.ffn_dim;
-            let w_gate = load_q4(&format!("{lp}.mlp.gate_proj.weight"), h, dense_ffn)?;
-            let w_up = load_q4(&format!("{lp}.mlp.up_proj.weight"), h, dense_ffn)?;
-            let w_down = load_q4(&format!("{lp}.mlp.down_proj.weight"), dense_ffn, h)?;
+            let w_gate = loader.load_f16_transposed(&format!("{lp}.mlp.gate_proj.weight"), device)?;
+            let w_up = loader.load_f16_transposed(&format!("{lp}.mlp.up_proj.weight"), device)?;
+            let w_down = loader.load_f16_transposed(&format!("{lp}.mlp.down_proj.weight"), device)?;
 
             // Router (F32 — small)
             let router_proj = loader.load_f32_transposed(&format!("{lp}.router.proj.weight"), device)?;

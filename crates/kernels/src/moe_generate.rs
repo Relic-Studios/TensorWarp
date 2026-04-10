@@ -30,9 +30,9 @@ pub struct MoELayerVRAM {
     pub wk: GpuTensor<half::f16>,
     pub wv: GpuTensor<half::f16>,
     pub wo: GpuTensor<half::f16>,
-    pub w_gate: GpuTensor<u8>,
-    pub w_up: GpuTensor<u8>,
-    pub w_down: GpuTensor<u8>,
+    pub w_gate: GpuTensor<half::f16>,
+    pub w_up: GpuTensor<half::f16>,
+    pub w_down: GpuTensor<half::f16>,
     pub router_proj: GpuTensor<f32>,
     pub router_scale: GpuTensor<f32>,
     pub per_expert_scale: GpuTensor<f32>,
@@ -262,12 +262,26 @@ impl MoEGenerationEngine {
             ops::rmsnorm(&self.cache, device, &b.attn_proj, &layer.post_attn_norm, &mut b.post_attn, h, self.config.norm_eps)?;
             ops::add(&self.cache, device, x, &b.post_attn, &mut b.residual)?;
 
-            // Dense MLP
+            // Dense MLP (F16 HGEMM)
             ops::rmsnorm(&self.cache, device, &b.residual, &layer.pre_ffn_norm, &mut b.ffn_in, h, self.config.norm_eps)?;
-            crate::quantize::gemm_q4_0_m1(&self.cache, device, &b.ffn_in, &layer.w_gate, &mut b.dense_gate, dense_ffn, h)?;
-            crate::quantize::gemm_q4_0_m1(&self.cache, device, &b.ffn_in, &layer.w_up, &mut b.dense_up, dense_ffn, h)?;
+            {
+                let mut ffn_in_f16 = GpuTensor::<half::f16>::zeros(device, Shape::from_static(&[1, h as usize]), DType::F16)?;
+                crate::fp16::cast_f32_to_f16(&self.cache, device, &b.ffn_in, &mut ffn_in_f16)?;
+                let mut gate_f16 = GpuTensor::<half::f16>::zeros(device, Shape::from_static(&[1, dense_ffn as usize]), DType::F16)?;
+                let mut up_f16 = GpuTensor::<half::f16>::zeros(device, Shape::from_static(&[1, dense_ffn as usize]), DType::F16)?;
+                crate::cublas_gemm::gemm_cublas_f16_transB(device, &ffn_in_f16, &layer.w_gate, &mut gate_f16, 1, dense_ffn, h)?;
+                crate::cublas_gemm::gemm_cublas_f16_transB(device, &ffn_in_f16, &layer.w_up, &mut up_f16, 1, dense_ffn, h)?;
+                crate::fp16::cast_f16_to_f32(&self.cache, device, &gate_f16, &mut b.dense_gate)?;
+                crate::fp16::cast_f16_to_f32(&self.cache, device, &up_f16, &mut b.dense_up)?;
+            }
             ops::fused_gelu_mul(&self.cache, device, &b.dense_gate, &b.dense_up, &mut b.dense_geglu)?;
-            crate::quantize::gemm_q4_0_m1(&self.cache, device, &b.dense_geglu, &layer.w_down, &mut b.dense_out, h, dense_ffn)?;
+            {
+                let mut geglu_f16 = GpuTensor::<half::f16>::zeros(device, Shape::from_static(&[1, dense_ffn as usize]), DType::F16)?;
+                crate::fp16::cast_f32_to_f16(&self.cache, device, &b.dense_geglu, &mut geglu_f16)?;
+                let mut down_f16 = GpuTensor::<half::f16>::zeros(device, Shape::from_static(&[1, h as usize]), DType::F16)?;
+                crate::cublas_gemm::gemm_cublas_f16_transB(device, &geglu_f16, &layer.w_down, &mut down_f16, 1, h, dense_ffn)?;
+                crate::fp16::cast_f16_to_f32(&self.cache, device, &down_f16, &mut b.dense_out)?;
+            }
 
             // MoE: route
             let (expert_ids, expert_weights) = crate::moe::route_experts(
