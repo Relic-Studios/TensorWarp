@@ -48,17 +48,44 @@ pub struct GemmaMoELayerWeights {
     pub router_scale: GpuTensor<f32>,       // [hidden_size]
     pub per_expert_scale: GpuTensor<f32>,   // [num_experts]
 
-    // Expert weights (F32 — 3D tensors, too complex for Q4)
-    pub experts_gate_up: GpuTensor<f32>,    // [128, 2*704, 2816]
-    pub experts_down: GpuTensor<f32>,       // [128, 2816, 704]
+    // Expert weights stored on HOST (RAM) as F16 — too large for VRAM (60 GB at F32)
+    // Streamed to GPU per-token: only 8 active experts copied per layer
+    pub experts_gate_up_host: Vec<half::f16>,  // [128, 2*704, 2816] flattened on CPU
+    pub experts_down_host: Vec<half::f16>,     // [128, 2816, 704] flattened on CPU
 }
 
-/// Loaded MoE model.
+/// Loaded MoE model — split into VRAM and RAM components.
 pub struct GemmaMoEModel {
     pub config: GemmaConfig,
     pub embed_tokens: GpuTensor<half::f16>,
-    pub layers: Vec<GemmaMoELayerWeights>,
+    pub layers_vram: Vec<GemmaMoELayerVRAM>,
+    pub expert_gate_up_host: Vec<Vec<half::f16>>,  // [layer][128 * 2*704 * 2816]
+    pub expert_down_host: Vec<Vec<half::f16>>,     // [layer][128 * 2816 * 704]
     pub final_norm: GpuTensor<f32>,
+}
+
+/// Per-layer VRAM-resident weights (no experts).
+pub struct GemmaMoELayerVRAM {
+    pub attn_norm: GpuTensor<f32>,
+    pub post_attn_norm: GpuTensor<f32>,
+    pub pre_ffn_norm: GpuTensor<f32>,
+    pub post_ffn_norm: GpuTensor<f32>,
+    pub post_ffn_norm_1: GpuTensor<f32>,
+    pub pre_ffn_norm_2: GpuTensor<f32>,
+    pub post_ffn_norm_2: GpuTensor<f32>,
+    pub q_norm: GpuTensor<f32>,
+    pub k_norm: GpuTensor<f32>,
+    pub layer_scalar: f32,
+    pub wq: GpuTensor<u8>,
+    pub wk: GpuTensor<u8>,
+    pub wv: GpuTensor<u8>,
+    pub wo: GpuTensor<u8>,
+    pub w_gate: GpuTensor<u8>,
+    pub w_up: GpuTensor<u8>,
+    pub w_down: GpuTensor<u8>,
+    pub router_proj: GpuTensor<f32>,
+    pub router_scale: GpuTensor<f32>,
+    pub per_expert_scale: GpuTensor<f32>,
 }
 
 impl GemmaMoEModel {
@@ -107,7 +134,9 @@ impl GemmaMoEModel {
         };
 
         // Layers
-        let mut layers = Vec::with_capacity(config.num_layers as usize);
+        let mut layers_vram = Vec::with_capacity(config.num_layers as usize);
+        let mut all_expert_gu = Vec::with_capacity(config.num_layers as usize);
+        let mut all_expert_d = Vec::with_capacity(config.num_layers as usize);
         for i in 0..config.num_layers {
             let lc = &layer_configs[i as usize];
             let q_dim = config.num_heads * lc.head_dim;
@@ -158,19 +187,30 @@ impl GemmaMoEModel {
                 .map_err(|e| LoaderError::Device(e.to_string()))?;
             let per_expert_scale = loader.load_f32(&format!("{lp}.router.per_expert_scale"), device)?;
 
-            // Expert weights (F32 — 3D tensors loaded directly)
-            eprintln!("[moe]   Loading experts (128 × gate_up + down)...");
-            let experts_gate_up = loader.load_f32(&format!("{lp}.experts.gate_up_proj"), device)?;
-            let experts_down = loader.load_f32(&format!("{lp}.experts.down_proj"), device)?;
+            // Expert weights — load to HOST as F16 (too large for VRAM: 2 GB/layer × 30 = 60 GB)
+            // Will stream only 8 active experts to GPU per-token
+            eprintln!("[moe]   Loading experts to RAM (128 × gate_up + down)...");
+            let experts_gate_up_f32 = loader.load_f32(&format!("{lp}.experts.gate_up_proj"), device)?;
+            let gu_host_f32 = experts_gate_up_f32.to_host(device).map_err(|e| LoaderError::Device(e.to_string()))?;
+            drop(experts_gate_up_f32); // free VRAM immediately
+            let experts_gate_up_host: Vec<half::f16> = gu_host_f32.iter().map(|v| half::f16::from_f32(*v)).collect();
+            drop(gu_host_f32);
 
-            layers.push(GemmaMoELayerWeights {
+            let experts_down_f32 = loader.load_f32(&format!("{lp}.experts.down_proj"), device)?;
+            let d_host_f32 = experts_down_f32.to_host(device).map_err(|e| LoaderError::Device(e.to_string()))?;
+            drop(experts_down_f32);
+            let experts_down_host: Vec<half::f16> = d_host_f32.iter().map(|v| half::f16::from_f32(*v)).collect();
+            drop(d_host_f32);
+
+            layers_vram.push(GemmaMoELayerVRAM {
                 attn_norm, post_attn_norm, pre_ffn_norm, post_ffn_norm,
                 post_ffn_norm_1, pre_ffn_norm_2, post_ffn_norm_2,
                 q_norm, k_norm, layer_scalar,
                 wq, wk, wv, wo, w_gate, w_up, w_down,
                 router_proj, router_scale, per_expert_scale,
-                experts_gate_up, experts_down,
             });
+            all_expert_gu.push(experts_gate_up_host);
+            all_expert_d.push(experts_down_host);
 
             device.synchronize().map_err(|e| LoaderError::Device(e.to_string()))?;
         }
@@ -179,6 +219,12 @@ impl GemmaMoEModel {
         let final_norm = load_norm(&format!("{prefix}.norm.weight"))?;
 
         eprintln!("[moe] Model loaded!");
-        Ok(Self { config, embed_tokens, layers, final_norm })
+        Ok(Self {
+            config, embed_tokens,
+            layers_vram,
+            expert_gate_up_host: all_expert_gu,
+            expert_down_host: all_expert_d,
+            final_norm,
+        })
     }
 }

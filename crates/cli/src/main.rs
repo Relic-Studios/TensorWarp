@@ -593,6 +593,7 @@ fn run_safetensors(
             Ok(cfg) => cfg,
             Err(e) => { eprintln!("Failed to parse Gemma config: {e}"); std::process::exit(1); }
         };
+        let is_moe = config_json.contains("\"enable_moe_block\": true") || config_json.contains("\"enable_moe_block\":true");
         let gc = gemma_hf.to_gemma_config();
         println!("Gemma Config: {} layers, H={}, vocab={}, GQA={}/{}, head_dim={}",
             gc.num_layers, gc.hidden_size, gc.vocab_size,
@@ -600,12 +601,83 @@ fn run_safetensors(
         println!("  Sliding window: {}, pattern: 1 global per {} layers",
             gc.sliding_window, gc.sliding_window_pattern);
         println!("  K=V sharing: {}, GeGLU: true, softcapping: {}", gc.k_eq_v, gc.final_logit_softcapping);
+        if is_moe { println!("  MoE: 128 experts, top-8 active (experts streamed from RAM)"); }
 
         // Load model
         let device = match WarpDevice::new(0) {
             Ok(d) => { println!("GPU: {}", d.summary()); d }
             Err(e) => { eprintln!("CUDA init failed: {e}"); std::process::exit(1); }
         };
+
+        // MoE model path
+        if is_moe {
+            let sharded = warp_loader::safetensors_loader::ShardedSafeTensorsLoader::open_dir(model_path)
+                .unwrap_or_else(|e| { eprintln!("Failed to open SafeTensors: {e}"); std::process::exit(1); });
+            println!("\nLoading MoE model (experts → RAM, attention+dense → VRAM)...");
+            let load_start_moe = std::time::Instant::now();
+            let moe_model = match warp_loader::GemmaMoEModel::load(&sharded, &gemma_hf, &device) {
+                Ok(m) => m,
+                Err(e) => { eprintln!("Failed to load MoE model: {e}"); std::process::exit(1); }
+            };
+            device.synchronize().unwrap();
+            println!("MoE model loaded in {:.1}s", load_start_moe.elapsed().as_secs_f64());
+
+            // Build MoE generation engine directly from loaded model
+            let layer_configs = moe_model.config.layer_configs();
+            let mut moe_engine = warp_kernels::moe_generate::MoEGenerationEngine {
+                config: moe_model.config,
+                layer_configs,
+                embed_tokens: moe_model.embed_tokens,
+                final_norm: moe_model.final_norm,
+                cache: warp_kernels::cache::KernelCache::new(),
+                layers: moe_model.layers_vram.into_iter().map(|l| {
+                    warp_kernels::moe_generate::MoELayerVRAM {
+                        attn_norm: l.attn_norm, post_attn_norm: l.post_attn_norm,
+                        pre_ffn_norm: l.pre_ffn_norm, post_ffn_norm: l.post_ffn_norm,
+                        post_ffn_norm_1: l.post_ffn_norm_1, pre_ffn_norm_2: l.pre_ffn_norm_2,
+                        post_ffn_norm_2: l.post_ffn_norm_2,
+                        q_norm: l.q_norm, k_norm: l.k_norm, layer_scalar: l.layer_scalar,
+                        wq: l.wq, wk: l.wk, wv: l.wv, wo: l.wo,
+                        w_gate: l.w_gate, w_up: l.w_up, w_down: l.w_down,
+                        router_proj: l.router_proj, router_scale: l.router_scale,
+                        per_expert_scale: l.per_expert_scale,
+                    }
+                }).collect(),
+                expert_gate_up_host: moe_model.expert_gate_up_host,
+                expert_down_host: moe_model.expert_down_host,
+                embed_host_f32: None,
+            };
+
+            let gen_config = warp_kernels::generate::GenerateConfig {
+                max_tokens: max_tokens as usize,
+                temperature,
+                eos_token_id: Some(1),
+                greedy: greedy || temperature <= 0.01,
+                top_k, top_p,
+                repetition_penalty: rep_penalty,
+                stop_sequences: Vec::new(),
+            };
+
+            let prompt_text = if prompt.is_empty() { "Hello" } else { prompt };
+            let tokenizer_path = model_path.join("tokenizer.json");
+            let prompt_ids: Vec<i32> = if tokenizer_path.exists() {
+                match warp_loader::Tokenizer::from_file(tokenizer_path.to_str().unwrap_or("")) {
+                    Ok(tok) => {
+                        let ids: Vec<i32> = tok.encode(prompt_text).into_iter().map(|t| t as i32).collect();
+                        println!("Prompt: \"{}\" -> {} tokens", prompt_text, ids.len());
+                        ids
+                    }
+                    Err(_) => { println!("Tokenizer failed, using BOS [2]"); vec![2] }
+                }
+            } else { println!("No tokenizer, using BOS [2]"); vec![2] };
+
+            println!("\nGenerating (MoE, max_seq_len=2048)...");
+            match moe_engine.generate(&device, &prompt_ids, &gen_config, 2048) {
+                Ok(result) => { println!("\n{result}"); }
+                Err(e) => { eprintln!("\nGeneration failed: {e}"); }
+            }
+            std::process::exit(0);
+        }
 
         // Check for .warp cache first (instant loading)
         let warp_path = model_path.join("model.warp");
