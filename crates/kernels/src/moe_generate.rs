@@ -186,10 +186,14 @@ impl MoEGenerationEngine {
             let num_kv_heads = lc.num_kv_heads;
             let q_dim = num_q_heads * d;
 
-            let x_data = if i == 0 { &b.hidden_scaled.data } else { &b.output_scaled.data };
+            let x: &GpuTensor<f32> = if i == 0 {
+                &b.hidden_scaled
+            } else {
+                &b.output_scaled
+            };
 
             // Attention
-            ops::rmsnorm(&self.cache, device, unsafe { &*(x_data as *const _ as *const GpuTensor<f32>) },
+            ops::rmsnorm(&self.cache, device, x,
                 &layer.attn_norm, &mut b.normed, h, self.config.norm_eps)?;
 
             crate::quantize::gemm_q4_0_m1(&self.cache, device, &b.normed, &layer.wq, &mut b.q, q_dim, h)?;
@@ -220,8 +224,7 @@ impl MoEGenerationEngine {
             crate::quantize::gemm_q4_0_m1(&self.cache, device, &b.attn_out, &layer.wo, &mut b.attn_proj, h, q_dim)?;
 
             ops::rmsnorm(&self.cache, device, &b.attn_proj, &layer.post_attn_norm, &mut b.post_attn, h, self.config.norm_eps)?;
-            let x_ref: &GpuTensor<f32> = if i == 0 { &b.hidden_scaled } else { &b.output_scaled };
-            ops::add(&self.cache, device, x_ref, &b.post_attn, &mut b.residual)?;
+            ops::add(&self.cache, device, x, &b.post_attn, &mut b.residual)?;
 
             // Dense MLP
             ops::rmsnorm(&self.cache, device, &b.residual, &layer.pre_ffn_norm, &mut b.ffn_in, h, self.config.norm_eps)?;
