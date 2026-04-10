@@ -13,6 +13,7 @@
 pub mod safetensors_loader;
 pub mod llama;
 pub mod gemma;
+pub mod gemma_moe;
 pub mod warp_cache;
 pub mod onnx;
 pub mod onnx_compile;
@@ -28,6 +29,7 @@ pub mod debug_model;
 pub use safetensors_loader::SafeTensorsLoader;
 pub use llama::{LlamaConfig, LlamaModel, LlamaModelF16, LlamaModelQ4};
 pub use gemma::{GemmaHFConfig, GemmaModelQ4};
+pub use gemma_moe::GemmaMoEModel;
 pub use onnx::OnnxModel;
 pub use onnx_exec::OnnxExecutor;
 pub use graph_exec::GraphExecutor;

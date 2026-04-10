@@ -1,0 +1,184 @@
+//! Gemma 4 26B-A4B MoE model loader.
+//!
+//! Loads the Mixture of Experts model with:
+//! - Attention weights (Q4 for projections, F32 for norms)
+//! - Dense MLP weights (Q4)
+//! - Expert weights (stored as F32 3D tensors — too large for Q4 on 3D)
+//! - Router weights (F32)
+//!
+//! Total VRAM: ~18-20 GB at mixed Q4/F32 — fits 24 GB.
+
+use serde::Deserialize;
+use warp_ir::{DType, Shape};
+use warp_kernels::cache::KernelCache;
+use warp_kernels::device::WarpDevice;
+use warp_kernels::tensor::GpuTensor;
+use warp_kernels::transformer::GemmaConfig;
+
+use crate::gemma::GemmaHFConfig;
+use crate::safetensors_loader::{ShardedSafeTensorsLoader, LoaderError};
+
+/// Per-layer MoE weights.
+pub struct GemmaMoELayerWeights {
+    // Norms (F32, with Gemma +1 offset applied)
+    pub attn_norm: GpuTensor<f32>,
+    pub post_attn_norm: GpuTensor<f32>,
+    pub pre_ffn_norm: GpuTensor<f32>,       // for dense MLP
+    pub post_ffn_norm: GpuTensor<f32>,       // final post-FFN
+    pub post_ffn_norm_1: GpuTensor<f32>,     // for dense MLP output
+    pub pre_ffn_norm_2: GpuTensor<f32>,      // for MoE input
+    pub post_ffn_norm_2: GpuTensor<f32>,     // for MoE output
+    pub q_norm: GpuTensor<f32>,
+    pub k_norm: GpuTensor<f32>,
+    pub layer_scalar: f32,
+
+    // Attention projections (Q4 quantized)
+    pub wq: GpuTensor<u8>,
+    pub wk: GpuTensor<u8>,
+    pub wv: GpuTensor<u8>,  // may be same as wk for global layers
+    pub wo: GpuTensor<u8>,
+
+    // Dense MLP (Q4 quantized)
+    pub w_gate: GpuTensor<u8>,
+    pub w_up: GpuTensor<u8>,
+    pub w_down: GpuTensor<u8>,
+
+    // Router
+    pub router_proj: GpuTensor<f32>,        // [hidden_size, num_experts]
+    pub router_scale: GpuTensor<f32>,       // [hidden_size]
+    pub per_expert_scale: GpuTensor<f32>,   // [num_experts]
+
+    // Expert weights (F32 — 3D tensors, too complex for Q4)
+    pub experts_gate_up: GpuTensor<f32>,    // [128, 2*704, 2816]
+    pub experts_down: GpuTensor<f32>,       // [128, 2816, 704]
+}
+
+/// Loaded MoE model.
+pub struct GemmaMoEModel {
+    pub config: GemmaConfig,
+    pub embed_tokens: GpuTensor<half::f16>,
+    pub layers: Vec<GemmaMoELayerWeights>,
+    pub final_norm: GpuTensor<f32>,
+}
+
+impl GemmaMoEModel {
+    pub fn load(
+        loader: &ShardedSafeTensorsLoader,
+        hf_config: &GemmaHFConfig,
+        device: &WarpDevice,
+    ) -> Result<Self, LoaderError> {
+        let config = hf_config.to_gemma_config();
+        let h = config.hidden_size;
+        let layer_configs = config.layer_configs();
+
+        // Detect prefix
+        let prefix = if loader.load_f32("model.language_model.embed_tokens.weight", device).is_ok() {
+            "model.language_model"
+        } else {
+            "model"
+        };
+        eprintln!("[moe] Weight prefix: {prefix}");
+
+        // Embedding F16
+        eprintln!("[moe] Loading embedding as F16...");
+        let embed_f32 = loader.load_f32(&format!("{prefix}.embed_tokens.weight"), device)?;
+        let kcache = KernelCache::new();
+        let mut embed_tokens = GpuTensor::<half::f16>::zeros(device, embed_f32.shape.clone(), DType::F16)
+            .map_err(|e| LoaderError::Device(e.to_string()))?;
+        warp_kernels::fp16::cast_f32_to_f16(&kcache, device, &embed_f32, &mut embed_tokens)
+            .map_err(|e| LoaderError::Device(e.to_string()))?;
+        drop(embed_f32);
+        device.synchronize().map_err(|e| LoaderError::Device(e.to_string()))?;
+
+        // Gemma norm +1 offset helper
+        let load_norm = |name: &str| -> Result<GpuTensor<f32>, LoaderError> {
+            let t = loader.load_f32(name, device)?;
+            let mut host = t.to_host(device).map_err(|e| LoaderError::Device(e.to_string()))?;
+            for v in &mut host { *v += 1.0; }
+            GpuTensor::from_host(device, &host, t.shape.clone(), DType::F32)
+                .map_err(|e| LoaderError::Device(e.to_string()))
+        };
+
+        let load_q4 = |name: &str, k: u32, n: u32| -> Result<GpuTensor<u8>, LoaderError> {
+            let cache = KernelCache::new();
+            let w = loader.load_f32_transposed(name, device)?;
+            warp_kernels::quantize::quantize_weights_q4_0(&cache, device, &w, k, n)
+                .map_err(|e| LoaderError::Device(e.to_string()))
+        };
+
+        // Layers
+        let mut layers = Vec::with_capacity(config.num_layers as usize);
+        for i in 0..config.num_layers {
+            let lc = &layer_configs[i as usize];
+            let q_dim = config.num_heads * lc.head_dim;
+            let kv_dim = config.kv_dim_for_layer(lc);
+            let lp = format!("{prefix}.layers.{i}");
+
+            eprintln!("[moe] Loading layer {i}/{} ({})...",
+                config.num_layers, if lc.is_global { "global" } else { "sliding" });
+
+            // Norms
+            let attn_norm = load_norm(&format!("{lp}.input_layernorm.weight"))?;
+            let post_attn_norm = load_norm(&format!("{lp}.post_attention_layernorm.weight"))?;
+            let pre_ffn_norm = load_norm(&format!("{lp}.pre_feedforward_layernorm.weight"))?;
+            let post_ffn_norm = load_norm(&format!("{lp}.post_feedforward_layernorm.weight"))?;
+            let post_ffn_norm_1 = load_norm(&format!("{lp}.post_feedforward_layernorm_1.weight"))?;
+            let pre_ffn_norm_2 = load_norm(&format!("{lp}.pre_feedforward_layernorm_2.weight"))?;
+            let post_ffn_norm_2 = load_norm(&format!("{lp}.post_feedforward_layernorm_2.weight"))?;
+            let q_norm = load_norm(&format!("{lp}.self_attn.q_norm.weight"))?;
+            let k_norm = load_norm(&format!("{lp}.self_attn.k_norm.weight"))?;
+
+            let layer_scalar = loader.load_f32(&format!("{lp}.layer_scalar"), device)
+                .ok().and_then(|t| t.to_host(device).ok())
+                .and_then(|v| v.first().copied()).unwrap_or(1.0);
+
+            // Attention Q4
+            let wq = load_q4(&format!("{lp}.self_attn.q_proj.weight"), h, q_dim)?;
+            let wk = load_q4(&format!("{lp}.self_attn.k_proj.weight"), h, kv_dim)?;
+            let wv = match load_q4(&format!("{lp}.self_attn.v_proj.weight"), h, kv_dim) {
+                Ok(v) => v,
+                Err(_) => load_q4(&format!("{lp}.self_attn.k_proj.weight"), h, kv_dim)?,
+            };
+            let wo = load_q4(&format!("{lp}.self_attn.o_proj.weight"), q_dim, h)?;
+
+            // Dense MLP Q4
+            let dense_ffn = config.ffn_dim;
+            let w_gate = load_q4(&format!("{lp}.mlp.gate_proj.weight"), h, dense_ffn)?;
+            let w_up = load_q4(&format!("{lp}.mlp.up_proj.weight"), h, dense_ffn)?;
+            let w_down = load_q4(&format!("{lp}.mlp.down_proj.weight"), dense_ffn, h)?;
+
+            // Router (F32 — small)
+            let router_proj = loader.load_f32_transposed(&format!("{lp}.router.proj.weight"), device)?;
+            let router_scale_raw = loader.load_f32(&format!("{lp}.router.scale"), device)?;
+            // Router scale gets +1 offset too (it's RMSNorm-like)
+            let mut rs_host = router_scale_raw.to_host(device).map_err(|e| LoaderError::Device(e.to_string()))?;
+            // Actually router.scale is NOT a norm weight — it's a learned scale vector, no +1
+            let router_scale = GpuTensor::from_host(device, &rs_host,
+                router_scale_raw.shape.clone(), DType::F32)
+                .map_err(|e| LoaderError::Device(e.to_string()))?;
+            let per_expert_scale = loader.load_f32(&format!("{lp}.router.per_expert_scale"), device)?;
+
+            // Expert weights (F32 — 3D tensors loaded directly)
+            eprintln!("[moe]   Loading experts (128 × gate_up + down)...");
+            let experts_gate_up = loader.load_f32(&format!("{lp}.experts.gate_up_proj"), device)?;
+            let experts_down = loader.load_f32(&format!("{lp}.experts.down_proj"), device)?;
+
+            layers.push(GemmaMoELayerWeights {
+                attn_norm, post_attn_norm, pre_ffn_norm, post_ffn_norm,
+                post_ffn_norm_1, pre_ffn_norm_2, post_ffn_norm_2,
+                q_norm, k_norm, layer_scalar,
+                wq, wk, wv, wo, w_gate, w_up, w_down,
+                router_proj, router_scale, per_expert_scale,
+                experts_gate_up, experts_down,
+            });
+
+            device.synchronize().map_err(|e| LoaderError::Device(e.to_string()))?;
+        }
+
+        // Final norm
+        let final_norm = load_norm(&format!("{prefix}.norm.weight"))?;
+
+        eprintln!("[moe] Model loaded!");
+        Ok(Self { config, embed_tokens, layers, final_norm })
+    }
+}
