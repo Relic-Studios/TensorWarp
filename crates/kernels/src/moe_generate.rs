@@ -196,6 +196,20 @@ impl MoEGenerationEngine {
             ops::rmsnorm(&self.cache, device, x,
                 &layer.attn_norm, &mut b.normed, h, self.config.norm_eps)?;
 
+            if i == 0 {
+                device.synchronize()?;
+                let x_h = x.to_host(device)?;
+                eprintln!("[ref] scaled_emb: min={:.4}, max={:.4}, mean={:.6}",
+                    x_h.iter().cloned().fold(f32::INFINITY, f32::min),
+                    x_h.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+                    x_h.iter().sum::<f32>() / x_h.len() as f32);
+                let n_h = b.normed.to_host(device)?;
+                eprintln!("[ref] normed: min={:.4}, max={:.4}, first4={:.4},{:.4},{:.4},{:.4}",
+                    n_h.iter().cloned().fold(f32::INFINITY, f32::min),
+                    n_h.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+                    n_h[0], n_h[1], n_h[2], n_h[3]);
+                // PyTorch: normed first4: 0.1679, -0.1301, 1.5021, 0.8670
+            }
             crate::quantize::gemm_q4_0_m1(&self.cache, device, &b.normed, &layer.wq, &mut b.q, q_dim, h)?;
             crate::quantize::gemm_q4_0_m1(&self.cache, device, &b.normed, &layer.wk, &mut b.k, kv_dim, h)?;
             if self.config.k_eq_v {
@@ -237,6 +251,11 @@ impl MoEGenerationEngine {
             let (expert_ids, expert_weights) = crate::moe::route_experts(
                 &self.cache, device, &b.residual, &layer.router_proj, &layer.router_scale,
                 &layer.per_expert_scale, h, num_experts, top_k, self.config.norm_eps)?;
+
+            if i == 0 {
+                eprintln!("[ref] Router selected experts: {:?} weights: {:?}",
+                    expert_ids, expert_weights.iter().map(|w| format!("{:.3}", w)).collect::<Vec<_>>());
+            }
 
             // MoE input
             ops::rmsnorm(&self.cache, device, &b.residual, &layer.pre_ffn_norm_2, &mut b.moe_in, h, self.config.norm_eps)?;
