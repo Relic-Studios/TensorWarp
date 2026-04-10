@@ -26,10 +26,10 @@ pub struct MoELayerVRAM {
     pub q_norm: GpuTensor<f32>,
     pub k_norm: GpuTensor<f32>,
     pub layer_scalar: f32,
-    pub wq: GpuTensor<u8>,
-    pub wk: GpuTensor<u8>,
-    pub wv: GpuTensor<u8>,
-    pub wo: GpuTensor<u8>,
+    pub wq: GpuTensor<half::f16>,
+    pub wk: GpuTensor<half::f16>,
+    pub wv: GpuTensor<half::f16>,
+    pub wo: GpuTensor<half::f16>,
     pub w_gate: GpuTensor<u8>,
     pub w_up: GpuTensor<u8>,
     pub w_down: GpuTensor<u8>,
@@ -92,6 +92,14 @@ struct MoEDecodeBuffers {
     final_normed: GpuTensor<f32>,
     output: GpuTensor<f32>,
     output_scaled: GpuTensor<f32>,
+
+    // F16 attention intermediates
+    normed_f16: GpuTensor<half::f16>,
+    q_f16: GpuTensor<half::f16>,
+    k_f16: GpuTensor<half::f16>,
+    v_f16: GpuTensor<half::f16>,
+    attn_out_f16: GpuTensor<half::f16>,
+    attn_proj_f16: GpuTensor<half::f16>,
 
     // LM head
     lm_normed: GpuTensor<f32>,
@@ -160,6 +168,12 @@ impl MoEGenerationEngine {
             final_normed: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F32)?,
             output: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F32)?,
             output_scaled: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F32)?,
+            normed_f16: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F16)?,
+            q_f16: GpuTensor::zeros(device, Shape::from_static(&[1, max_q_dim]), DType::F16)?,
+            k_f16: GpuTensor::zeros(device, Shape::from_static(&[1, max_kv_dim]), DType::F16)?,
+            v_f16: GpuTensor::zeros(device, Shape::from_static(&[1, max_kv_dim]), DType::F16)?,
+            attn_out_f16: GpuTensor::zeros(device, Shape::from_static(&[1, max_q_dim]), DType::F16)?,
+            attn_proj_f16: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F16)?,
             lm_normed: GpuTensor::zeros(device, Shape::from_static(&[1, h]), DType::F32)?,
         })
     }
@@ -210,12 +224,17 @@ impl MoEGenerationEngine {
                     n_h[0], n_h[1], n_h[2], n_h[3]);
                 // PyTorch: normed first4: 0.1679, -0.1301, 1.5021, 0.8670
             }
-            crate::quantize::gemm_q4_0_m1(&self.cache, device, &b.normed, &layer.wq, &mut b.q, q_dim, h)?;
-            crate::quantize::gemm_q4_0_m1(&self.cache, device, &b.normed, &layer.wk, &mut b.k, kv_dim, h)?;
+            // F16 attention: cast normed → F16, HGEMM with F16 weights, cast back → F32
+            crate::fp16::cast_f32_to_f16(&self.cache, device, &b.normed, &mut b.normed_f16)?;
+            crate::cublas_gemm::gemm_cublas_f16_transB(device, &b.normed_f16, &layer.wq, &mut b.q_f16, 1, q_dim, h)?;
+            crate::fp16::cast_f16_to_f32(&self.cache, device, &b.q_f16, &mut b.q)?;
+            crate::cublas_gemm::gemm_cublas_f16_transB(device, &b.normed_f16, &layer.wk, &mut b.k_f16, 1, kv_dim, h)?;
+            crate::fp16::cast_f16_to_f32(&self.cache, device, &b.k_f16, &mut b.k)?;
             if self.config.k_eq_v {
                 ops::mul_scalar(&self.cache, device, &b.k, &mut b.v, 1.0)?;
             } else {
-                crate::quantize::gemm_q4_0_m1(&self.cache, device, &b.normed, &layer.wv, &mut b.v, kv_dim, h)?;
+                crate::cublas_gemm::gemm_cublas_f16_transB(device, &b.normed_f16, &layer.wv, &mut b.v_f16, 1, kv_dim, h)?;
+                crate::fp16::cast_f16_to_f32(&self.cache, device, &b.v_f16, &mut b.v)?;
             }
 
             crate::rope::rope(&self.cache, device, &b.q, &mut b.q_rope, num_q_heads, 1, d, lc.rope_theta, pos)?;
@@ -235,7 +254,10 @@ impl MoEGenerationEngine {
                 &self.cache, device, &b.q_n, kv, &mut b.attn_out,
                 num_q_heads, num_kv_heads, d, &b.cache_len_buf, window)?;
 
-            crate::quantize::gemm_q4_0_m1(&self.cache, device, &b.attn_out, &layer.wo, &mut b.attn_proj, h, q_dim)?;
+            // O projection: F16 HGEMM
+            crate::fp16::cast_f32_to_f16(&self.cache, device, &b.attn_out, &mut b.attn_out_f16)?;
+            crate::cublas_gemm::gemm_cublas_f16_transB(device, &b.attn_out_f16, &layer.wo, &mut b.attn_proj_f16, 1, h, q_dim)?;
+            crate::fp16::cast_f16_to_f32(&self.cache, device, &b.attn_proj_f16, &mut b.attn_proj)?;
 
             ops::rmsnorm(&self.cache, device, &b.attn_proj, &layer.post_attn_norm, &mut b.post_attn, h, self.config.norm_eps)?;
             ops::add(&self.cache, device, x, &b.post_attn, &mut b.residual)?;

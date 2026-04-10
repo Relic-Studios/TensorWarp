@@ -76,10 +76,10 @@ pub struct GemmaMoELayerVRAM {
     pub q_norm: GpuTensor<f32>,
     pub k_norm: GpuTensor<f32>,
     pub layer_scalar: f32,
-    pub wq: GpuTensor<u8>,
-    pub wk: GpuTensor<u8>,
-    pub wv: GpuTensor<u8>,
-    pub wo: GpuTensor<u8>,
+    pub wq: GpuTensor<half::f16>,
+    pub wk: GpuTensor<half::f16>,
+    pub wv: GpuTensor<half::f16>,
+    pub wo: GpuTensor<half::f16>,
     pub w_gate: GpuTensor<u8>,
     pub w_up: GpuTensor<u8>,
     pub w_down: GpuTensor<u8>,
@@ -161,14 +161,14 @@ impl GemmaMoEModel {
                 .ok().and_then(|t| t.to_host(device).ok())
                 .and_then(|v| v.first().copied()).unwrap_or(1.0);
 
-            // Attention Q4
-            let wq = load_q4(&format!("{lp}.self_attn.q_proj.weight"), h, q_dim)?;
-            let wk = load_q4(&format!("{lp}.self_attn.k_proj.weight"), h, kv_dim)?;
-            let wv = match load_q4(&format!("{lp}.self_attn.v_proj.weight"), h, kv_dim) {
+            // Attention F16 (higher precision → correct router outputs)
+            let wq = loader.load_f16_transposed(&format!("{lp}.self_attn.q_proj.weight"), device)?;
+            let wk = loader.load_f16_transposed(&format!("{lp}.self_attn.k_proj.weight"), device)?;
+            let wv = match loader.load_f16_transposed(&format!("{lp}.self_attn.v_proj.weight"), device) {
                 Ok(v) => v,
-                Err(_) => load_q4(&format!("{lp}.self_attn.k_proj.weight"), h, kv_dim)?,
+                Err(_) => loader.load_f16_transposed(&format!("{lp}.self_attn.k_proj.weight"), device)?,
             };
-            let wo = load_q4(&format!("{lp}.self_attn.o_proj.weight"), q_dim, h)?;
+            let wo = loader.load_f16_transposed(&format!("{lp}.self_attn.o_proj.weight"), device)?;
 
             // Dense MLP Q4
             let dense_ffn = config.ffn_dim;
