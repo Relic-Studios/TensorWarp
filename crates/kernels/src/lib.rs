@@ -40,6 +40,7 @@ pub mod gemm_small;
 pub mod generate;
 pub mod gemma_generate;
 pub mod mem_pool;
+pub mod moe;
 pub mod missing_ops;
 pub mod multi_gpu;
 pub mod gemm_fast;
