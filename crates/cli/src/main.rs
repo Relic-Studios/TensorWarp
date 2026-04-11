@@ -623,7 +623,65 @@ fn run_safetensors(
             };
             device.synchronize().unwrap();
             println!("NVFP4 model loaded in {:.1}s ({} layers)", load_start.elapsed().as_secs_f64(), model.layers.len());
-            println!("TODO: NVFP4 generation engine — dequant per-GEMM + F16 HGEMM");
+
+            // Build NVFP4 generation engine
+            let layer_configs = model.config.layer_configs();
+            let mut engine_layers = Vec::new();
+            for l in model.layers {
+                let (vp, vs, vgs, vr, vc) = match l.wv {
+                    Some(wv) => (Some(wv.packed), Some(wv.scales), wv.global_scale, wv.rows, wv.cols),
+                    None => (None, None, 0.0, 0, 0),
+                };
+                engine_layers.push(warp_kernels::nvfp4_generate::NVFP4LayerVRAM {
+                    attn_norm: l.attn_norm, post_attn_norm: l.post_attn_norm,
+                    pre_ffn_norm: l.pre_ffn_norm, post_ffn_norm: l.post_ffn_norm,
+                    q_norm: l.q_norm, k_norm: l.k_norm, layer_scalar: l.layer_scalar,
+                    wq_packed: l.wq.packed, wq_scales: l.wq.scales, wq_gs: l.wq.global_scale, wq_rows: l.wq.rows, wq_cols: l.wq.cols,
+                    wk_packed: l.wk.packed, wk_scales: l.wk.scales, wk_gs: l.wk.global_scale, wk_rows: l.wk.rows, wk_cols: l.wk.cols,
+                    wv_packed: vp, wv_scales: vs, wv_gs: vgs, wv_rows: vr, wv_cols: vc,
+                    wo_packed: l.wo.packed, wo_scales: l.wo.scales, wo_gs: l.wo.global_scale, wo_rows: l.wo.rows, wo_cols: l.wo.cols,
+                    wg_packed: l.w_gate.packed, wg_scales: l.w_gate.scales, wg_gs: l.w_gate.global_scale, wg_rows: l.w_gate.rows, wg_cols: l.w_gate.cols,
+                    wu_packed: l.w_up.packed, wu_scales: l.w_up.scales, wu_gs: l.w_up.global_scale, wu_rows: l.w_up.rows, wu_cols: l.w_up.cols,
+                    wd_packed: l.w_down.packed, wd_scales: l.w_down.scales, wd_gs: l.w_down.global_scale, wd_rows: l.w_down.rows, wd_cols: l.w_down.cols,
+                });
+            }
+            let engine = warp_kernels::nvfp4_generate::NVFP4GenerationEngine {
+                config: model.config,
+                layer_configs,
+                embed_tokens: model.embed_tokens,
+                final_norm: model.final_norm,
+                cache: warp_kernels::cache::KernelCache::new(),
+                layers: engine_layers,
+            };
+
+            let gen_config = warp_kernels::generate::GenerateConfig {
+                max_tokens: max_tokens as usize,
+                temperature,
+                eos_token_id: Some(1),
+                greedy: greedy || temperature <= 0.01,
+                top_k, top_p,
+                repetition_penalty: rep_penalty,
+                stop_sequences: Vec::new(),
+            };
+
+            let prompt_text = if prompt.is_empty() { "Hello" } else { prompt };
+            let tokenizer_path = model_path.join("tokenizer.json");
+            let prompt_ids: Vec<i32> = if tokenizer_path.exists() {
+                match warp_loader::Tokenizer::from_file(tokenizer_path.to_str().unwrap_or("")) {
+                    Ok(tok) => {
+                        let ids: Vec<i32> = tok.encode(prompt_text).into_iter().map(|t| t as i32).collect();
+                        println!("Prompt: \"{}\" -> {} tokens", prompt_text, ids.len());
+                        ids
+                    }
+                    Err(_) => { println!("Tokenizer failed, using BOS [2]"); vec![2] }
+                }
+            } else { println!("No tokenizer, using BOS [2]"); vec![2] };
+
+            println!("\nGenerating (NVFP4, max_seq_len=2048)...");
+            match engine.generate(&device, &prompt_ids, &gen_config, 2048) {
+                Ok(result) => { println!("\n{result}"); }
+                Err(e) => { eprintln!("\nGeneration failed: {e}"); }
+            }
             std::process::exit(0);
         }
 
