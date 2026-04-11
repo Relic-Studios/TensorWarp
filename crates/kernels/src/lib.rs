@@ -42,6 +42,7 @@ pub mod gemma_generate;
 pub mod mem_pool;
 pub mod moe;
 pub mod moe_generate;
+pub mod nvfp4;
 pub mod missing_ops;
 pub mod multi_gpu;
 pub mod gemm_fast;
