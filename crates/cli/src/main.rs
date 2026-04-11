@@ -594,6 +594,7 @@ fn run_safetensors(
             Err(e) => { eprintln!("Failed to parse Gemma config: {e}"); std::process::exit(1); }
         };
         let is_moe = config_json.contains("\"enable_moe_block\": true") || config_json.contains("\"enable_moe_block\":true");
+        let is_nvfp4 = config_json.contains("NVFP4") || config_json.contains("modelopt");
         let gc = gemma_hf.to_gemma_config();
         println!("Gemma Config: {} layers, H={}, vocab={}, GQA={}/{}, head_dim={}",
             gc.num_layers, gc.hidden_size, gc.vocab_size,
@@ -602,12 +603,29 @@ fn run_safetensors(
             gc.sliding_window, gc.sliding_window_pattern);
         println!("  K=V sharing: {}, GeGLU: true, softcapping: {}", gc.k_eq_v, gc.final_logit_softcapping);
         if is_moe { println!("  MoE: 128 experts, top-8 active (experts streamed from RAM)"); }
+        if is_nvfp4 { println!("  NVFP4: NVIDIA FP4 quantized (18.5 GB VRAM)"); }
 
         // Load model
         let device = match WarpDevice::new(0) {
             Ok(d) => { println!("GPU: {}", d.summary()); d }
             Err(e) => { eprintln!("CUDA init failed: {e}"); std::process::exit(1); }
         };
+
+        // NVFP4 model path
+        if is_nvfp4 && !is_moe {
+            let sharded = warp_loader::safetensors_loader::ShardedSafeTensorsLoader::open_dir(model_path)
+                .unwrap_or_else(|e| { eprintln!("Failed to open SafeTensors: {e}"); std::process::exit(1); });
+            println!("\nLoading NVFP4 model...");
+            let load_start = std::time::Instant::now();
+            let model = match warp_loader::GemmaNVFP4Model::load(&sharded, &gemma_hf, &device) {
+                Ok(m) => m,
+                Err(e) => { eprintln!("Failed to load NVFP4 model: {e}"); std::process::exit(1); }
+            };
+            device.synchronize().unwrap();
+            println!("NVFP4 model loaded in {:.1}s ({} layers)", load_start.elapsed().as_secs_f64(), model.layers.len());
+            println!("TODO: NVFP4 generation engine — dequant per-GEMM + F16 HGEMM");
+            std::process::exit(0);
+        }
 
         // MoE model path
         if is_moe {

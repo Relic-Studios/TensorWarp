@@ -110,6 +110,22 @@ impl SafeTensorsLoader {
         Ok(tensor)
     }
 
+    /// Load raw bytes as u8 tensor (for FP4/FP8 packed formats).
+    pub fn load_raw(
+        &self, name: &str, device: &WarpDevice,
+    ) -> Result<GpuTensor<u8>, LoaderError> {
+        let st = safetensors::SafeTensors::deserialize(&self.mmap)
+            .map_err(|e| LoaderError::Parse(e.to_string()))?;
+        let view = st.tensor(name)
+            .map_err(|e| LoaderError::TensorNotFound(name.to_string(), e.to_string()))?;
+
+        let shape: Vec<usize> = view.shape().to_vec();
+        let data = view.data().to_vec();
+        let warp_shape = Shape::from_static(&shape);
+        GpuTensor::from_host(device, &data, warp_shape, DType::U8)
+            .map_err(|e| LoaderError::Device(e.to_string()))
+    }
+
     /// Load a 2D weight tensor as F32, transposed from [out, in] to [in, out].
     ///
     /// HuggingFace stores linear weights as [out_features, in_features] (row-major).
@@ -429,6 +445,18 @@ impl ShardedSafeTensorsLoader {
     pub fn load_f16_transposed(&self, name: &str, device: &WarpDevice) -> Result<GpuTensor<half::f16>, LoaderError> {
         for shard in &self.shards {
             match shard.load_f16_transposed(name, device) {
+                Ok(t) => return Ok(t),
+                Err(LoaderError::TensorNotFound(_, _)) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(LoaderError::TensorNotFound(name.to_string(), "not found in any shard".to_string()))
+    }
+
+    /// Load raw bytes (for FP4/FP8 packed formats).
+    pub fn load_raw(&self, name: &str, device: &WarpDevice) -> Result<GpuTensor<u8>, LoaderError> {
+        for shard in &self.shards {
+            match shard.load_raw(name, device) {
                 Ok(t) => return Ok(t),
                 Err(LoaderError::TensorNotFound(_, _)) => continue,
                 Err(e) => return Err(e),
