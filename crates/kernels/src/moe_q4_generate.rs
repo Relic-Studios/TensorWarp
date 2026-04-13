@@ -201,9 +201,9 @@ impl MoEQ4Engine {
 
             ops::rmsnorm(&self.cache, device, &b.residual, &layer.pre_ffn_norm_2, &mut b.moe_in, h, self.config.norm_eps)?;
 
-            // Zero accumulator
-            let zeros = vec![0.0f32; h as usize];
-            device.htod_copy(&zeros, &mut b.moe_accumulated.data)?;
+            // Zero accumulator on GPU (no host roundtrip)
+            device.stream.memset_zeros(&mut b.moe_accumulated.data)
+                .map_err(|e| DeviceError::Memory(format!("memset: {e}")))?;
 
             // Run 8 active experts — ALL in VRAM, GPU-side buffer offset (ZERO copies)
             for (_, (&eid, &weight)) in expert_ids.iter().zip(expert_weights.iter()).enumerate() {
