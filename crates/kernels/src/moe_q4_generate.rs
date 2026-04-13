@@ -201,37 +201,20 @@ impl MoEQ4Engine {
             let zeros = vec![0.0f32; h as usize];
             device.htod_copy(&zeros, &mut b.moe_accumulated.data)?;
 
-            // Run 8 active experts — ALL weights in VRAM, just slice Q4 buffer
+            // Run 8 active experts — ALL in VRAM, GPU-side buffer offset (ZERO copies)
             for (_, (&eid, &weight)) in expert_ids.iter().zip(expert_weights.iter()).enumerate() {
                 let eid = eid as usize;
+                let gu_off = eid * layer.gu_q4_per_expert;
+                let d_off = eid * layer.d_q4_per_expert;
 
-                // Expert gate_up Q4: slice from contiguous buffer
-                let gu_offset = eid * layer.gu_q4_per_expert;
-                let gu_size = layer.gu_q4_per_expert;
-                // Expert down Q4
-                let d_offset = eid * layer.d_q4_per_expert;
-                let d_size = layer.d_q4_per_expert;
-
-                // Create views into the expert Q4 buffers
-                // TODO: proper GPU buffer slicing. For now, download slice + re-upload (temporary)
-                let gu_host = layer.experts_gu_q4.to_host(device)?;
-                let expert_gu = GpuTensor::from_host(device,
-                    &gu_host[gu_offset..gu_offset + gu_size],
-                    Shape::from_static(&[gu_size]), DType::U8)?;
-
-                let d_host = layer.experts_d_q4.to_host(device)?;
-                let expert_d = GpuTensor::from_host(device,
-                    &d_host[d_offset..d_offset + d_size],
-                    Shape::from_static(&[d_size]), DType::U8)?;
-
-                // Expert FFN: gate_up → split → GeGLU → down
-                crate::quantize::gemm_q4_0_m1(&self.cache, device, &b.moe_in, &expert_gu,
-                    &mut b.expert_gate_up, 2 * moe_dim, h)?;
+                // Expert FFN using buffer offset GEMM (no host roundtrip!)
+                crate::quantize::gemm_q4_0_m1_from_buffer(&self.cache, device, &b.moe_in,
+                    &layer.experts_gu_q4, gu_off, &mut b.expert_gate_up, 2 * moe_dim, h)?;
                 ops::split_gate_up(&self.cache, device, &b.expert_gate_up,
                     &mut b.expert_gate, &mut b.expert_up, moe_dim, 1)?;
                 ops::fused_gelu_mul(&self.cache, device, &b.expert_gate, &b.expert_up, &mut b.expert_geglu)?;
-                crate::quantize::gemm_q4_0_m1(&self.cache, device, &b.expert_geglu, &expert_d,
-                    &mut b.expert_out, h, moe_dim)?;
+                crate::quantize::gemm_q4_0_m1_from_buffer(&self.cache, device, &b.expert_geglu,
+                    &layer.experts_d_q4, d_off, &mut b.expert_out, h, moe_dim)?;
 
                 // Accumulate
                 ops::mul_scalar(&self.cache, device, &b.expert_out, &mut b.expert_weighted, weight)?;

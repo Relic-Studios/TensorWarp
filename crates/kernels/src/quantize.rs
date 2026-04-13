@@ -1628,6 +1628,40 @@ pub fn gemm_q4_0_m1(
     Ok(())
 }
 
+/// Same as gemm_q4_0_m1 but reads from an offset within a larger Q4 buffer.
+/// Used for MoE expert slicing — avoids host roundtrip.
+pub fn gemm_q4_0_m1_from_buffer(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    a: &GpuTensor<f32>,
+    buffer: &GpuTensor<u8>,    // large contiguous Q4 buffer
+    byte_offset: usize,        // start of this expert's Q4 data
+    c: &mut GpuTensor<f32>,
+    n: u32, k: u32,
+) -> Result<(), DeviceError> {
+    assert!(k % BLOCK_SIZE == 0);
+    let f = cache.get_or_compile(device, GEMM_Q4_0_M1_SRC, "warp_gemm_q4_0_m1")?;
+    let threads = 256u32;
+    let blocks = (n + threads - 1) / threads;
+    let cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+    let k_i = k as i32;
+    let n_i = n as i32;
+
+    // Create a view of the buffer starting at byte_offset
+    let view = buffer.data.slice(byte_offset..byte_offset + ((k / BLOCK_SIZE) * n * Q4_0_BLOCK_BYTES) as usize);
+
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut c.data)
+            .arg(&a.data)
+            .arg(&view)
+            .arg(&k_i)
+            .arg(&n_i)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
 /// W4A16 Quantized GEMM: C = A × dequant(B_q4)
 ///
 /// A: [M, K] f32 activations
