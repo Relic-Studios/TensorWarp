@@ -63,32 +63,34 @@ pub fn route_experts(
         Shape::from_static(&[1, num_experts as usize]), DType::F32)?;
     crate::sampling::softmax(cache, device, &logits, &mut probs, 1, num_experts)?;
 
-    // 5+6+7. Top-K + normalize + per_expert_scale (on CPU — E=128 is tiny)
+    // 5+6+7. Top-K + normalize + per_expert_scale
+    // Do this on CPU — 128 elements is tiny, the DtoH is the real cost
+    // Use a single combined readback: probs + per_expert_scale
+    let mut combined = vec![0.0f32; num_experts as usize * 2];
     let probs_host = probs.to_host(device)?;
-    let per_expert_host = per_expert_scale.to_host(device).map_err(|e| {
-        DeviceError::Memory(format!("per_expert_scale to_host: {e}"))
-    })?;
+    let per_expert_host = per_expert_scale.to_host(device)?;
+    combined[..num_experts as usize].copy_from_slice(&probs_host);
+    combined[num_experts as usize..].copy_from_slice(&per_expert_host);
 
-    let mut indexed: Vec<(u32, f32)> = probs_host.iter().enumerate()
-        .map(|(i, &v)| (i as u32, v))
-        .collect();
-    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let probs_h = &combined[..num_experts as usize];
+    let pes_h = &combined[num_experts as usize..];
 
-    let top_ids: Vec<u32> = indexed[..top_k as usize].iter().map(|(id, _)| *id).collect();
-    let top_weights: Vec<f32> = indexed[..top_k as usize].iter().map(|(_, w)| *w).collect();
+    // Partial sort — only need top K, not full sort (faster for K=8 out of 128)
+    let mut indices: Vec<u32> = (0..num_experts).collect();
+    indices.select_nth_unstable_by(top_k as usize - 1, |&a, &b| {
+        probs_h[b as usize].partial_cmp(&probs_h[a as usize]).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let top_ids: Vec<u32> = indices[..top_k as usize].to_vec();
+    let top_weights: Vec<f32> = top_ids.iter().map(|&id| probs_h[id as usize]).collect();
 
-    // Normalize to sum=1
     let sum: f32 = top_weights.iter().sum();
-    let mut normalized: Vec<f32> = if sum > 0.0 {
-        top_weights.iter().map(|w| w / sum).collect()
+    let normalized: Vec<f32> = if sum > 0.0 {
+        top_ids.iter().zip(top_weights.iter()).map(|(&eid, &w)| {
+            (w / sum) * pes_h[eid as usize]
+        }).collect()
     } else {
         vec![1.0 / top_k as f32; top_k as usize]
     };
-
-    // Apply per_expert_scale
-    for (i, &eid) in top_ids.iter().enumerate() {
-        normalized[i] *= per_expert_host[eid as usize];
-    }
 
     Ok((top_ids, normalized))
 }
