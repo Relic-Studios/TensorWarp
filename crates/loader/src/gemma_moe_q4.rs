@@ -102,42 +102,49 @@ pub fn load_moe_q4(
         let d_all = experts_d_f32.to_host(device).map_err(|e| LoaderError::Device(e.to_string()))?;
         drop(experts_d_f32);
 
-        // Q4 sizes per expert
+        // TW-Marlin format per expert
         let gu_k = h; let gu_n = 2 * moe_dim;
-        let gu_blocks = (gu_k / 32) * gu_n;
-        let gu_q4_per = (gu_blocks * 20) as usize;
+        let gu_num_groups = gu_k / 32;
+        let gu_packed_per = (gu_num_groups * gu_n * 16) as usize;
+        let gu_scales_per = (gu_num_groups * gu_n) as usize;
 
         let d_k = moe_dim; let d_n = h;
-        let d_blocks = (d_k / 32) * d_n;
-        let d_q4_per = (d_blocks * 20) as usize;
+        let d_num_groups = d_k / 32;
+        let d_packed_per = (d_num_groups * d_n * 16) as usize;
+        let d_scales_per = (d_num_groups * d_n) as usize;
 
-        let gu_f32_per = (gu_n * gu_k) as usize;  // elements per expert (row-major [gu_n, gu_k])
+        let gu_f32_per = (gu_n * gu_k) as usize;
         let d_f32_per = (d_n * d_k) as usize;
 
-        // Quantize each expert on CPU and concatenate
-        let mut all_gu_q4 = vec![0u8; 128 * gu_q4_per];
-        let mut all_d_q4 = vec![0u8; 128 * d_q4_per];
+        let mut all_gu_packed = vec![0u8; 128 * gu_packed_per];
+        let mut all_gu_scales = vec![half::f16::ZERO; 128 * gu_scales_per];
+        let mut all_d_packed = vec![0u8; 128 * d_packed_per];
+        let mut all_d_scales = vec![half::f16::ZERO; 128 * d_scales_per];
 
         for e in 0..128usize {
-            // Expert gate_up: stored as [gu_n, gu_k] row-major (= [1408, 2816])
-            // Q4 quantize column-major blocks: iterate cols, then K-blocks per col
             let gu_start = e * gu_f32_per;
-            let gu_f32 = &gu_all[gu_start..gu_start + gu_f32_per];
-            let gu_q4 = cpu_quantize_q4_col_major(gu_f32, gu_k, gu_n);
-            all_gu_q4[e * gu_q4_per..(e + 1) * gu_q4_per].copy_from_slice(&gu_q4);
+            let (gp, gs) = cpu_quantize_tw_marlin(&gu_all[gu_start..gu_start + gu_f32_per], gu_k, gu_n);
+            all_gu_packed[e * gu_packed_per..(e + 1) * gu_packed_per].copy_from_slice(&gp);
+            all_gu_scales[e * gu_scales_per..(e + 1) * gu_scales_per].copy_from_slice(&gs);
 
             let d_start = e * d_f32_per;
-            let d_f32 = &d_all[d_start..d_start + d_f32_per];
-            let d_q4 = cpu_quantize_q4_col_major(d_f32, d_k, d_n);
-            all_d_q4[e * d_q4_per..(e + 1) * d_q4_per].copy_from_slice(&d_q4);
+            let (dp, ds) = cpu_quantize_tw_marlin(&d_all[d_start..d_start + d_f32_per], d_k, d_n);
+            all_d_packed[e * d_packed_per..(e + 1) * d_packed_per].copy_from_slice(&dp);
+            all_d_scales[e * d_scales_per..(e + 1) * d_scales_per].copy_from_slice(&ds);
         }
         drop(gu_all); drop(d_all);
 
-        let experts_gu_q4 = GpuTensor::from_host(device, &all_gu_q4,
-            Shape::from_static(&[all_gu_q4.len()]), DType::U8)
+        let experts_gu_packed = GpuTensor::from_host(device, &all_gu_packed,
+            Shape::from_static(&[all_gu_packed.len()]), DType::U8)
             .map_err(|e| LoaderError::Device(e.to_string()))?;
-        let experts_d_q4 = GpuTensor::from_host(device, &all_d_q4,
-            Shape::from_static(&[all_d_q4.len()]), DType::U8)
+        let experts_gu_scales = GpuTensor::from_host(device, &all_gu_scales,
+            Shape::from_static(&[all_gu_scales.len()]), DType::F16)
+            .map_err(|e| LoaderError::Device(e.to_string()))?;
+        let experts_d_packed = GpuTensor::from_host(device, &all_d_packed,
+            Shape::from_static(&[all_d_packed.len()]), DType::U8)
+            .map_err(|e| LoaderError::Device(e.to_string()))?;
+        let experts_d_scales = GpuTensor::from_host(device, &all_d_scales,
+            Shape::from_static(&[all_d_scales.len()]), DType::F16)
             .map_err(|e| LoaderError::Device(e.to_string()))?;
 
         device.synchronize().map_err(|e| LoaderError::Device(e.to_string()))?;
@@ -148,9 +155,12 @@ pub fn load_moe_q4(
             q_norm, k_norm, layer_scalar,
             wq, wk, wv, wo, w_gate, w_up, w_down,
             router_proj, router_scale, per_expert_scale,
-            experts_gu_q4, experts_d_q4,
-            gu_q4_per_expert: gu_q4_per,
-            d_q4_per_expert: d_q4_per,
+            experts_gu_packed, experts_gu_scales,
+            experts_d_packed, experts_d_scales,
+            gu_packed_per_expert: gu_packed_per,
+            gu_scales_per_expert: gu_scales_per,
+            d_packed_per_expert: d_packed_per,
+            d_scales_per_expert: d_scales_per,
             expert_gu_k: gu_k, expert_gu_n: gu_n,
             expert_d_k: d_k, expert_d_n: d_n,
         });
@@ -165,7 +175,50 @@ pub fn load_moe_q4(
     })
 }
 
-/// CPU Q4 quantization for column-major blocks.
+/// CPU quantization to TW-Marlin separated format.
+/// Input: row-major [N, K] float32.
+/// Output: (packed_nibbles, scales_fp16) in TW-Marlin layout.
+/// packed: [num_k_groups][N][16] contiguous per group
+/// scales: [num_k_groups][N] as FP16
+fn cpu_quantize_tw_marlin(data: &[f32], k: u32, n: u32) -> (Vec<u8>, Vec<half::f16>) {
+    let num_k_groups = k / 32;
+    let packed_size = (num_k_groups * n * 16) as usize;
+    let scales_size = (num_k_groups * n) as usize;
+    let mut packed = vec![0u8; packed_size];
+    let mut scales = vec![half::f16::ZERO; scales_size];
+
+    for col in 0..n as usize {
+        for g in 0..num_k_groups as usize {
+            let k_start = g * 32;
+            // Gather 32 elements from column col, rows k_start..k_start+32
+            // Input is [N, K] row-major: element(n_idx, k_idx) = data[n_idx * K + k_idx]
+            let mut vals = [0.0f32; 32];
+            for i in 0..32 {
+                vals[i] = data[col * k as usize + k_start + i];
+            }
+
+            let amax = vals.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            let scale = amax / 7.0;
+            let inv_scale = if scale != 0.0 { 7.0 / amax } else { 0.0 };
+
+            // TW-Marlin layout: scales[g * N + col], packed[(g * N + col) * 16 .. + 16]
+            scales[g * n as usize + col] = half::f16::from_f32(scale);
+            let p_off = (g * n as usize + col) * 16;
+            for i in 0..16 {
+                let v0 = vals[2 * i];
+                let v1 = vals[2 * i + 1];
+                let mut q0 = (v0 * inv_scale).round() as i32 + 8;
+                let mut q1 = (v1 * inv_scale).round() as i32 + 8;
+                q0 = q0.clamp(0, 15);
+                q1 = q1.clamp(0, 15);
+                packed[p_off + i] = (q0 as u8) | ((q1 as u8) << 4);
+            }
+        }
+    }
+    (packed, scales)
+}
+
+/// CPU Q4 quantization for column-major blocks (legacy Q4_0 format).
 /// Input: row-major [N, K] float32. Output: Q4_0 column-major blocks.
 /// Each column has K/32 blocks of 20 bytes (4B scale + 16B packed nibbles).
 fn cpu_quantize_q4_col_major(data: &[f32], k: u32, n: u32) -> Vec<u8> {

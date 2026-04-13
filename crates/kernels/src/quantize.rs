@@ -1670,6 +1670,48 @@ pub fn gemm_q4_0_m1(
     Ok(())
 }
 
+/// TW-Marlin M=1 GEMM from buffer offsets (for MoE expert slicing).
+pub fn gemm_tw_marlin_m1_from_buffer(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    a: &GpuTensor<f32>,
+    packed_buf: &GpuTensor<u8>,
+    packed_offset: usize,
+    scales_buf: &GpuTensor<half::f16>,
+    scales_offset: usize,
+    c: &mut GpuTensor<f32>,
+    n: u32, k: u32,
+) -> Result<(), DeviceError> {
+    assert!(k % BLOCK_SIZE == 0);
+    let num_k_groups = k / BLOCK_SIZE;
+    let threads = 256u32;
+    let n_blocks = (n + threads - 1) / threads;
+    let splits = if k < 2048 || n_blocks >= 128 { 1 } else {
+        let max_splits = (num_k_groups / 8).max(1);
+        ((256u32 + n_blocks - 1) / n_blocks).max(1).min(max_splits)
+    };
+    let k_blocks_per_split = (num_k_groups + splits - 1) / splits;
+
+    let f = cache.get_or_compile(device, GEMM_TW_MARLIN_M1_SRC, "warp_gemm_tw_marlin_m1")?;
+    device.stream.memset_zeros(&mut c.data)
+        .map_err(|e| DeviceError::Memory(format!("memset: {e}")))?;
+
+    let packed_view = packed_buf.data.slice(packed_offset..packed_offset + (num_k_groups * n * 16) as usize);
+    let scales_view = scales_buf.data.slice(scales_offset..scales_offset + (num_k_groups * n) as usize);
+
+    let k_i = k as i32; let n_i = n as i32;
+    let nkg = num_k_groups as i32; let kbps = k_blocks_per_split as i32;
+    let cfg = LaunchConfig { grid_dim: (n_blocks, splits, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut c.data).arg(&a.data)
+            .arg(&packed_view).arg(&scales_view)
+            .arg(&k_i).arg(&n_i).arg(&nkg).arg(&kbps)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
 /// Same as gemm_q4_0_m1 but reads from an offset within a larger Q4 buffer.
 /// Used for MoE expert slicing — avoids host roundtrip.
 pub fn gemm_q4_0_m1_from_buffer(

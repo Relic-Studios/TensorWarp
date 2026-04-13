@@ -40,16 +40,19 @@ pub struct MoEQ4Layer {
     pub router_scale: GpuTensor<f32>,
     pub per_expert_scale: GpuTensor<f32>,
 
-    // Expert Q4 — ALL 128 experts contiguous in VRAM
-    pub experts_gu_q4: GpuTensor<u8>,    // Q4_0 column-major blocks, all experts concatenated
-    pub experts_d_q4: GpuTensor<u8>,
-    pub gu_q4_per_expert: usize,
-    pub d_q4_per_expert: usize,
-    // Dimensions for the expert FFN GEMMs
-    pub expert_gu_k: u32,  // K dimension for gate_up (= hidden_size)
-    pub expert_gu_n: u32,  // N dimension for gate_up (= 2 * moe_dim)
-    pub expert_d_k: u32,   // K dimension for down (= moe_dim)
-    pub expert_d_n: u32,   // N dimension for down (= hidden_size)
+    // Expert TW-Marlin — ALL 128 experts contiguous in VRAM (fastest GEMM)
+    pub experts_gu_packed: GpuTensor<u8>,          // packed nibbles, all experts concatenated
+    pub experts_gu_scales: GpuTensor<half::f16>,   // FP16 scales, all experts concatenated
+    pub experts_d_packed: GpuTensor<u8>,
+    pub experts_d_scales: GpuTensor<half::f16>,
+    pub gu_packed_per_expert: usize,  // packed bytes per expert
+    pub gu_scales_per_expert: usize,  // scale elements per expert
+    pub d_packed_per_expert: usize,
+    pub d_scales_per_expert: usize,
+    pub expert_gu_k: u32,
+    pub expert_gu_n: u32,
+    pub expert_d_k: u32,
+    pub expert_d_n: u32,
 }
 
 /// Pre-allocated decode buffers.
@@ -208,19 +211,24 @@ impl MoEQ4Engine {
             // Run 8 active experts — ALL in VRAM, GPU-side buffer offset (ZERO copies)
             for (_, (&eid, &weight)) in expert_ids.iter().zip(expert_weights.iter()).enumerate() {
                 let eid = eid as usize;
-                let gu_off = eid * layer.gu_q4_per_expert;
-                let d_off = eid * layer.d_q4_per_expert;
 
-                // Expert FFN using Split-K buffer offset GEMM (max occupancy, zero copies)
-                crate::quantize::gemm_q4_0_m1_splitk_from_buffer(&self.cache, device, &b.moe_in,
-                    &layer.experts_gu_q4, gu_off, &mut b.expert_gate_up,
-                    layer.expert_gu_n, layer.expert_gu_k)?;
+                // Expert FFN using TW-Marlin from buffer (fastest GEMM, zero copies)
+                let gu_p_off = eid * layer.gu_packed_per_expert;
+                let gu_s_off = eid * layer.gu_scales_per_expert;
+                let d_p_off = eid * layer.d_packed_per_expert;
+                let d_s_off = eid * layer.d_scales_per_expert;
+
+                crate::quantize::gemm_tw_marlin_m1_from_buffer(&self.cache, device, &b.moe_in,
+                    &layer.experts_gu_packed, gu_p_off,
+                    &layer.experts_gu_scales, gu_s_off,
+                    &mut b.expert_gate_up, layer.expert_gu_n, layer.expert_gu_k)?;
                 ops::split_gate_up(&self.cache, device, &b.expert_gate_up,
                     &mut b.expert_gate, &mut b.expert_up, moe_dim, 1)?;
                 ops::fused_gelu_mul(&self.cache, device, &b.expert_gate, &b.expert_up, &mut b.expert_geglu)?;
-                crate::quantize::gemm_q4_0_m1_splitk_from_buffer(&self.cache, device, &b.expert_geglu,
-                    &layer.experts_d_q4, d_off, &mut b.expert_out,
-                    layer.expert_d_n, layer.expert_d_k)?;
+                crate::quantize::gemm_tw_marlin_m1_from_buffer(&self.cache, device, &b.expert_geglu,
+                    &layer.experts_d_packed, d_p_off,
+                    &layer.experts_d_scales, d_s_off,
+                    &mut b.expert_out, layer.expert_d_n, layer.expert_d_k)?;
 
                 // Accumulate
                 ops::mul_scalar(&self.cache, device, &b.expert_out, &mut b.expert_weighted, weight)?;
