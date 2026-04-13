@@ -15,6 +15,7 @@ pub mod llama;
 pub mod gemma;
 pub mod gemma_moe;
 pub mod gemma_nvfp4;
+pub mod gemma_moe_q4;
 pub mod warp_cache;
 pub mod onnx;
 pub mod onnx_compile;

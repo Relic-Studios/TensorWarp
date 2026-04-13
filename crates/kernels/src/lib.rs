@@ -44,6 +44,7 @@ pub mod moe;
 pub mod moe_generate;
 pub mod nvfp4;
 pub mod nvfp4_generate;
+pub mod moe_q4_generate;
 pub mod missing_ops;
 pub mod multi_gpu;
 pub mod gemm_fast;

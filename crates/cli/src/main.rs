@@ -685,11 +685,50 @@ fn run_safetensors(
             std::process::exit(0);
         }
 
-        // MoE model path
+        // MoE model path — ALL Q4 IN VRAM
         if is_moe {
             let sharded = warp_loader::safetensors_loader::ShardedSafeTensorsLoader::open_dir(model_path)
                 .unwrap_or_else(|e| { eprintln!("Failed to open SafeTensors: {e}"); std::process::exit(1); });
-            println!("\nLoading MoE model (experts → RAM, attention+dense → VRAM)...");
+            println!("\nLoading MoE model (ALL Q4 in VRAM — 16.7 GB target)...");
+            let load_start_moe = std::time::Instant::now();
+
+            // Use the all-VRAM Q4 loader
+            let engine = match warp_loader::gemma_moe_q4::load_moe_q4(&sharded, &gemma_hf, &device) {
+                Ok(e) => e,
+                Err(e) => { eprintln!("Failed to load MoE Q4: {e}"); std::process::exit(1); }
+            };
+            device.synchronize().unwrap();
+            println!("MoE Q4 loaded in {:.1}s ({} layers, all VRAM)", load_start_moe.elapsed().as_secs_f64(), engine.layers.len());
+
+            let gen_config = warp_kernels::generate::GenerateConfig {
+                max_tokens: max_tokens as usize, temperature,
+                eos_token_id: Some(1),
+                greedy: greedy || temperature <= 0.01,
+                top_k, top_p, repetition_penalty: rep_penalty,
+                stop_sequences: Vec::new(),
+            };
+
+            let prompt_text = if prompt.is_empty() { "Hello" } else { prompt };
+            let tokenizer_path = model_path.join("tokenizer.json");
+            let prompt_ids: Vec<i32> = if tokenizer_path.exists() {
+                match warp_loader::Tokenizer::from_file(tokenizer_path.to_str().unwrap_or("")) {
+                    Ok(tok) => {
+                        let ids: Vec<i32> = tok.encode(prompt_text).into_iter().map(|t| t as i32).collect();
+                        println!("Prompt: \"{}\" -> {} tokens", prompt_text, ids.len());
+                        ids
+                    }
+                    Err(_) => { vec![2] }
+                }
+            } else { vec![2] };
+
+            println!("\nGenerating (MoE Q4 all-VRAM, target: 400 tok/sec)...");
+            match engine.generate(&device, &prompt_ids, &gen_config, 2048) {
+                Ok(result) => { println!("\n{result}"); }
+                Err(e) => { eprintln!("\nGeneration failed: {e}"); }
+            }
+            std::process::exit(0);
+
+            // Old MoE loader path (disabled)
             let load_start_moe = std::time::Instant::now();
             let moe_model = match warp_loader::GemmaMoEModel::load(&sharded, &gemma_hf, &device) {
                 Ok(m) => m,
