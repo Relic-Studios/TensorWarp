@@ -713,8 +713,11 @@ fn run_safetensors(
             let prompt_ids: Vec<i32> = if tokenizer_path.exists() {
                 match warp_loader::Tokenizer::from_file(tokenizer_path.to_str().unwrap_or("")) {
                     Ok(tok) => {
-                        let ids: Vec<i32> = tok.encode(prompt_text).into_iter().map(|t| t as i32).collect();
-                        println!("Prompt: \"{}\" -> {} tokens", prompt_text, ids.len());
+                        // Apply Gemma 4 chat template: <bos><|turn>user\n{prompt}<turn|>\n<|turn>model\n
+                        let chat_prompt = format!("<start_of_turn>user\n{}<end_of_turn>\n<start_of_turn>model\n", prompt_text);
+                        let mut ids: Vec<i32> = vec![2]; // BOS
+                        ids.extend(tok.encode(&chat_prompt).into_iter().map(|t| t as i32));
+                        println!("Prompt (chat template): {} tokens", ids.len());
                         ids
                     }
                     Err(_) => { vec![2] }
