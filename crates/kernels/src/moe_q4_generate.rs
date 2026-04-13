@@ -41,11 +41,15 @@ pub struct MoEQ4Layer {
     pub per_expert_scale: GpuTensor<f32>,
 
     // Expert Q4 — ALL 128 experts contiguous in VRAM
-    // gate_up: [128 * gu_q4_bytes] — each expert's Q4 data contiguous
-    pub experts_gu_q4: GpuTensor<u8>,
+    pub experts_gu_q4: GpuTensor<u8>,    // Q4_0 column-major blocks, all experts concatenated
     pub experts_d_q4: GpuTensor<u8>,
-    pub gu_q4_per_expert: usize,  // bytes per expert's gate_up Q4
-    pub d_q4_per_expert: usize,   // bytes per expert's down Q4
+    pub gu_q4_per_expert: usize,
+    pub d_q4_per_expert: usize,
+    // Dimensions for the expert FFN GEMMs
+    pub expert_gu_k: u32,  // K dimension for gate_up (= hidden_size)
+    pub expert_gu_n: u32,  // N dimension for gate_up (= 2 * moe_dim)
+    pub expert_d_k: u32,   // K dimension for down (= moe_dim)
+    pub expert_d_n: u32,   // N dimension for down (= hidden_size)
 }
 
 /// Pre-allocated decode buffers.
@@ -154,14 +158,14 @@ impl MoEQ4Engine {
             let kv_dim = self.config.kv_dim_for_layer(lc);
             let x = if i == 0 { &b.hidden_scaled } else { &b.output_scaled };
 
-            // 1. Attention
+            // 1. Attention (Split-K for better occupancy on small N)
             ops::rmsnorm(&self.cache, device, x, &layer.attn_norm, &mut b.normed, h, self.config.norm_eps)?;
-            crate::quantize::gemm_q4_0_m1(&self.cache, device, &b.normed, &layer.wq, &mut b.q, q_dim, h)?;
-            crate::quantize::gemm_q4_0_m1(&self.cache, device, &b.normed, &layer.wk, &mut b.k, kv_dim, h)?;
+            crate::quantize::gemm_q4_0_m1_splitk(&self.cache, device, &b.normed, &layer.wq, &mut b.q, q_dim, h)?;
+            crate::quantize::gemm_q4_0_m1_splitk(&self.cache, device, &b.normed, &layer.wk, &mut b.k, kv_dim, h)?;
             if self.config.k_eq_v {
                 ops::mul_scalar(&self.cache, device, &b.k, &mut b.v, 1.0)?;
             } else {
-                crate::quantize::gemm_q4_0_m1(&self.cache, device, &b.normed, &layer.wv, &mut b.v, kv_dim, h)?;
+                crate::quantize::gemm_q4_0_m1_splitk(&self.cache, device, &b.normed, &layer.wv, &mut b.v, kv_dim, h)?;
             }
 
             crate::rope::rope(&self.cache, device, &b.q, &mut b.q_rope, self.config.num_heads, 1, d, lc.rope_theta, pos)?;
@@ -179,16 +183,16 @@ impl MoEQ4Engine {
                 &self.cache, device, &b.q_n, kv, &mut b.attn_out,
                 self.config.num_heads, lc.num_kv_heads, d, &b.cache_len_buf, win)?;
 
-            crate::quantize::gemm_q4_0_m1(&self.cache, device, &b.attn_out, &layer.wo, &mut b.attn_proj, h, q_dim)?;
+            crate::quantize::gemm_q4_0_m1_splitk(&self.cache, device, &b.attn_out, &layer.wo, &mut b.attn_proj, h, q_dim)?;
             ops::rmsnorm(&self.cache, device, &b.attn_proj, &layer.post_attn_norm, &mut b.post_attn, h, self.config.norm_eps)?;
             ops::add(&self.cache, device, x, &b.post_attn, &mut b.residual)?;
 
             // 2. Dense MLP
             ops::rmsnorm(&self.cache, device, &b.residual, &layer.pre_ffn_norm, &mut b.ffn_in, h, self.config.norm_eps)?;
-            crate::quantize::gemm_q4_0_m1(&self.cache, device, &b.ffn_in, &layer.w_gate, &mut b.dense_gate, ffn, h)?;
-            crate::quantize::gemm_q4_0_m1(&self.cache, device, &b.ffn_in, &layer.w_up, &mut b.dense_up, ffn, h)?;
+            crate::quantize::gemm_q4_0_m1_splitk(&self.cache, device, &b.ffn_in, &layer.w_gate, &mut b.dense_gate, ffn, h)?;
+            crate::quantize::gemm_q4_0_m1_splitk(&self.cache, device, &b.ffn_in, &layer.w_up, &mut b.dense_up, ffn, h)?;
             ops::fused_gelu_mul(&self.cache, device, &b.dense_gate, &b.dense_up, &mut b.dense_geglu)?;
-            crate::quantize::gemm_q4_0_m1(&self.cache, device, &b.dense_geglu, &layer.w_down, &mut b.dense_out, h, ffn)?;
+            crate::quantize::gemm_q4_0_m1_splitk(&self.cache, device, &b.dense_geglu, &layer.w_down, &mut b.dense_out, h, ffn)?;
 
             // 3. MoE
             let (expert_ids, expert_weights) = crate::moe::route_experts(
@@ -207,14 +211,16 @@ impl MoEQ4Engine {
                 let gu_off = eid * layer.gu_q4_per_expert;
                 let d_off = eid * layer.d_q4_per_expert;
 
-                // Expert FFN using buffer offset GEMM (no host roundtrip!)
-                crate::quantize::gemm_q4_0_m1_from_buffer(&self.cache, device, &b.moe_in,
-                    &layer.experts_gu_q4, gu_off, &mut b.expert_gate_up, 2 * moe_dim, h)?;
+                // Expert FFN using Split-K buffer offset GEMM (max occupancy, zero copies)
+                crate::quantize::gemm_q4_0_m1_splitk_from_buffer(&self.cache, device, &b.moe_in,
+                    &layer.experts_gu_q4, gu_off, &mut b.expert_gate_up,
+                    layer.expert_gu_n, layer.expert_gu_k)?;
                 ops::split_gate_up(&self.cache, device, &b.expert_gate_up,
                     &mut b.expert_gate, &mut b.expert_up, moe_dim, 1)?;
                 ops::fused_gelu_mul(&self.cache, device, &b.expert_gate, &b.expert_up, &mut b.expert_geglu)?;
-                crate::quantize::gemm_q4_0_m1_from_buffer(&self.cache, device, &b.expert_geglu,
-                    &layer.experts_d_q4, d_off, &mut b.expert_out, h, moe_dim)?;
+                crate::quantize::gemm_q4_0_m1_splitk_from_buffer(&self.cache, device, &b.expert_geglu,
+                    &layer.experts_d_q4, d_off, &mut b.expert_out,
+                    layer.expert_d_n, layer.expert_d_k)?;
 
                 // Accumulate
                 ops::mul_scalar(&self.cache, device, &b.expert_out, &mut b.expert_weighted, weight)?;

@@ -1427,6 +1427,48 @@ pub fn gemm_q4_0_m1_splitk(
     Ok(())
 }
 
+/// Split-K M=1 Q4 GEMM from a buffer offset (for MoE expert slicing).
+pub fn gemm_q4_0_m1_splitk_from_buffer(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    a: &GpuTensor<f32>,
+    buffer: &GpuTensor<u8>,
+    byte_offset: usize,
+    c: &mut GpuTensor<f32>,
+    n: u32, k: u32,
+) -> Result<(), DeviceError> {
+    assert!(k % BLOCK_SIZE == 0);
+    let num_k_blocks = k / BLOCK_SIZE;
+    let threads = 256u32;
+    let n_blocks = (n + threads - 1) / threads;
+    let splits = if k < 2048 || n_blocks >= 128 {
+        1
+    } else {
+        let target = 256u32;
+        let max_splits = (num_k_blocks / 8).max(1);
+        ((target + n_blocks - 1) / n_blocks).max(1).min(max_splits)
+    };
+    let k_blocks_per_split = (num_k_blocks + splits - 1) / splits;
+
+    let f = cache.get_or_compile(device, GEMM_Q4_0_M1_SPLITK_SRC, "warp_gemm_q4_0_m1_splitk")?;
+    device.stream.memset_zeros(&mut c.data)
+        .map_err(|e| DeviceError::Memory(format!("memset: {e}")))?;
+
+    let expected_bytes = ((k / BLOCK_SIZE) * n * Q4_0_BLOCK_BYTES) as usize;
+    let view = buffer.data.slice(byte_offset..byte_offset + expected_bytes);
+
+    let k_i = k as i32; let n_i = n as i32;
+    let nkb = num_k_blocks as i32; let kbps = k_blocks_per_split as i32;
+    let cfg = LaunchConfig { grid_dim: (n_blocks, splits, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut c.data).arg(&a.data).arg(&view)
+            .arg(&k_i).arg(&n_i).arg(&nkb).arg(&kbps)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
 /// M=1 Q4_0 GEMM with block-major weights (coalesced reads).
 pub fn gemm_q4_0_m1_blockmajor(
     cache: &KernelCache,

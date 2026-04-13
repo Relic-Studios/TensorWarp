@@ -151,6 +151,8 @@ pub fn load_moe_q4(
             experts_gu_q4, experts_d_q4,
             gu_q4_per_expert: gu_q4_per,
             d_q4_per_expert: d_q4_per,
+            expert_gu_k: gu_k, expert_gu_n: gu_n,
+            expert_d_k: d_k, expert_d_n: d_n,
         });
     }
 
