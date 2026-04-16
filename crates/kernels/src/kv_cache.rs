@@ -675,7 +675,8 @@ extern "C" __global__ void warp_flash_decode_chunk(
     unsigned int head_dim,
     unsigned int num_chunks,
     unsigned int chunk_size,
-    float scale
+    float scale,
+    float softcap
 ) {
     unsigned int chunk_idx = blockIdx.x;
     unsigned int q_head = blockIdx.y;
@@ -717,6 +718,7 @@ extern "C" __global__ void warp_flash_decode_chunk(
             dot += smem_Q[dd] * K_cache[pos * kv_dim + kv_head * head_dim + dd];
         }
         dot *= scale;
+        if (softcap > 0.0f) dot = tanhf(dot / softcap) * softcap;
         smem_scores[i] = dot;
         local_max = fmaxf(local_max, dot);
     }
@@ -904,6 +906,7 @@ pub fn decode_attention_flash(
             .arg(&num_chunks)
             .arg(&chunk_size)
             .arg(&scale)
+            .arg(&0.0f32)  // softcap disabled for non-Gemma path
             .launch(cfg_chunk)
             .map_err(|e: cudarc::driver::result::DriverError| DeviceError::Launch(e.to_string()))?;
     }
@@ -960,7 +963,8 @@ extern "C" __global__ void warp_flash_decode_chunk_dl(
     unsigned int max_chunks,
     unsigned int chunk_size,
     float scale,
-    unsigned int window_size  // 0 = full attention, >0 = sliding window
+    unsigned int window_size,  // 0 = full attention, >0 = sliding window
+    float softcap  // 0 = disabled, >0 = tanh(x/cap)*cap (Gemma)
 ) {
     unsigned int chunk_idx = blockIdx.x;
     unsigned int q_head = blockIdx.y;
@@ -1019,6 +1023,7 @@ extern "C" __global__ void warp_flash_decode_chunk_dl(
             dot += smem_Q[dd] * K_cache[pos * kv_dim + kv_head * head_dim + dd];
         }
         dot *= scale;
+        if (softcap > 0.0f) dot = tanhf(dot / softcap) * softcap;
         smem_scores[i] = dot;
         local_max = fmaxf(local_max, dot);
     }
@@ -1084,7 +1089,7 @@ pub fn decode_attention_flash_device_len(
     cache_len_buf: &cudarc::driver::CudaSlice<u32>,
 ) -> Result<(), DeviceError> {
     decode_attention_flash_device_len_window(kernel_cache, device, q, kv, out,
-        num_heads, num_kv_heads, head_dim, cache_len_buf, 0)
+        num_heads, num_kv_heads, head_dim, cache_len_buf, 0, 0.0, 0.0)
 }
 
 /// FlashDecoding with device-len and sliding window support.
@@ -1099,11 +1104,12 @@ pub fn decode_attention_flash_device_len_window(
     head_dim: u32,
     cache_len_buf: &cudarc::driver::CudaSlice<u32>,
     window_size: u32,
+    softcap: f32,
+    attn_scale: f32,  // 0.0 = use 1/sqrt(head_dim), >0 = use this value
 ) -> Result<(), DeviceError> {
     let chunk_size = FLASH_DECODE_CHUNK_SIZE;
-    // Always use max_seq_len for grid dims (constant for graph capture)
     let max_chunks = (kv.max_seq_len + chunk_size - 1) / chunk_size;
-    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let scale = if attn_scale > 0.0 { attn_scale } else { 1.0f32 / (head_dim as f32).sqrt() };
 
     // Allocate partial buffers for max capacity
     let mut partial_o = GpuTensor::<f32>::zeros(device,
@@ -1143,6 +1149,7 @@ pub fn decode_attention_flash_device_len_window(
             .arg(&chunk_size)
             .arg(&scale)
             .arg(&window_size)
+            .arg(&softcap)
             .launch(cfg_chunk)
             .map_err(|e: cudarc::driver::result::DriverError| DeviceError::Launch(e.to_string()))?;
     }
@@ -1161,6 +1168,107 @@ pub fn decode_attention_flash_device_len_window(
             .arg(&partial_o.data)
             .arg(&partial_m.data)
             .arg(&partial_l.data)
+            .arg(&num_heads)
+            .arg(&max_chunks)
+            .arg(&head_dim)
+            .launch(cfg_reduce)
+            .map_err(|e: cudarc::driver::result::DriverError| DeviceError::Launch(e.to_string()))?;
+    }
+
+    Ok(())
+}
+
+/// Pre-allocated scratch buffers for flash decode attention.
+/// Eliminates 3 GPU allocations per layer per token (90 allocs/token → 0).
+pub struct FlashDecodeScratch {
+    pub partial_o: GpuTensor<f32>,
+    pub partial_m: GpuTensor<f32>,
+    pub partial_l: GpuTensor<f32>,
+}
+
+impl FlashDecodeScratch {
+    /// Allocate scratch buffers large enough for the largest layer.
+    pub fn new(device: &WarpDevice, num_heads: u32, max_seq_len: u32, head_dim: u32) -> Result<Self, DeviceError> {
+        let chunk_size = FLASH_DECODE_CHUNK_SIZE;
+        let max_chunks = (max_seq_len + chunk_size - 1) / chunk_size;
+        Ok(Self {
+            partial_o: GpuTensor::zeros(device,
+                Shape::from_static(&[num_heads as usize, max_chunks as usize, head_dim as usize]),
+                DType::F32)?,
+            partial_m: GpuTensor::zeros(device,
+                Shape::from_static(&[(num_heads * max_chunks) as usize]),
+                DType::F32)?,
+            partial_l: GpuTensor::zeros(device,
+                Shape::from_static(&[(num_heads * max_chunks) as usize]),
+                DType::F32)?,
+        })
+    }
+}
+
+/// Same as decode_attention_flash_device_len_window but uses pre-allocated scratch buffers.
+pub fn decode_attention_flash_prealloc(
+    kernel_cache: &KernelCache,
+    device: &WarpDevice,
+    q: &GpuTensor<f32>,
+    kv: &LayerKVCache,
+    out: &mut GpuTensor<f32>,
+    scratch: &mut FlashDecodeScratch,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    cache_len_buf: &cudarc::driver::CudaSlice<u32>,
+    window_size: u32,
+    softcap: f32,
+    attn_scale: f32,
+) -> Result<(), DeviceError> {
+    let chunk_size = FLASH_DECODE_CHUNK_SIZE;
+    let max_chunks = (kv.max_seq_len + chunk_size - 1) / chunk_size;
+    let scale = if attn_scale > 0.0 { attn_scale } else { 1.0f32 / (head_dim as f32).sqrt() };
+
+    let f_chunk = kernel_cache.get_or_compile(device, FLASH_DECODE_CHUNK_DEVICE_LEN_SRC, "warp_flash_decode_chunk_dl")?;
+    let smem_bytes = ((head_dim + chunk_size + head_dim) * 4) as u32;
+    let threads_per_block = 256u32.min(chunk_size);
+
+    let cfg_chunk = LaunchConfig {
+        grid_dim: (max_chunks, num_heads, 1),
+        block_dim: (threads_per_block, 1, 1),
+        shared_mem_bytes: smem_bytes,
+    };
+
+    unsafe {
+        device.stream.launch_builder(&f_chunk)
+            .arg(&mut scratch.partial_o.data)
+            .arg(&mut scratch.partial_m.data)
+            .arg(&mut scratch.partial_l.data)
+            .arg(&q.data)
+            .arg(&kv.k.data)
+            .arg(&kv.v.data)
+            .arg(cache_len_buf)
+            .arg(&num_heads)
+            .arg(&num_kv_heads)
+            .arg(&head_dim)
+            .arg(&max_chunks)
+            .arg(&chunk_size)
+            .arg(&scale)
+            .arg(&window_size)
+            .arg(&softcap)
+            .launch(cfg_chunk)
+            .map_err(|e: cudarc::driver::result::DriverError| DeviceError::Launch(e.to_string()))?;
+    }
+
+    let f_reduce = kernel_cache.get_or_compile(device, FLASH_DECODE_REDUCE_SRC, "warp_flash_decode_reduce")?;
+    let cfg_reduce = LaunchConfig {
+        grid_dim: (num_heads, 1, 1),
+        block_dim: (head_dim, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        device.stream.launch_builder(&f_reduce)
+            .arg(&mut out.data)
+            .arg(&scratch.partial_o.data)
+            .arg(&scratch.partial_m.data)
+            .arg(&scratch.partial_l.data)
             .arg(&num_heads)
             .arg(&max_chunks)
             .arg(&head_dim)

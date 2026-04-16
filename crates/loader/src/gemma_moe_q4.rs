@@ -37,18 +37,21 @@ pub fn load_moe_q4(
     drop(embed_f32);
 
     let load_norm = |name: &str| -> Result<GpuTensor<f32>, LoaderError> {
+        // Gemma 4 uses `x * weight` (NOT `x * (1+weight)` like Gemma 3)
         let t = loader.load_f32(name, device)?;
-        let mut h = t.to_host(device).map_err(|e| LoaderError::Device(e.to_string()))?;
-        for v in &mut h { *v += 1.0; }
-        GpuTensor::from_host(device, &h, t.shape.clone(), DType::F32)
-            .map_err(|e| LoaderError::Device(e.to_string()))
+        Ok(t)
     };
 
-    let load_q4 = |name: &str, k: u32, n: u32| -> Result<GpuTensor<u8>, LoaderError> {
-        let c = KernelCache::new();
-        let w = loader.load_f32_transposed(name, device)?;
-        warp_kernels::quantize::quantize_weights_q4_0(&c, device, &w, k, n)
-            .map_err(|e| LoaderError::Device(e.to_string()))
+    // Load weight as F16 for cuBLAS HGEMM (gemm_cublas_f16_transB expects [N, K])
+    // SafeTensors stores as [N, K] row-major, same as what HGEMM needs — no transpose!
+    let load_f16 = |name: &str, _k: u32, _n: u32| -> Result<GpuTensor<half::f16>, LoaderError> {
+        let w_f32 = loader.load_f32(name, device)?;
+        let kcache = KernelCache::new();
+        let mut w_f16 = GpuTensor::<half::f16>::zeros(device, w_f32.shape.clone(), DType::F16)
+            .map_err(|e| LoaderError::Device(e.to_string()))?;
+        warp_kernels::fp16::cast_f32_to_f16(&kcache, device, &w_f32, &mut w_f16)
+            .map_err(|e| LoaderError::Device(e.to_string()))?;
+        Ok(w_f16)
     };
 
     let mut layers = Vec::with_capacity(config.num_layers as usize);
@@ -72,20 +75,20 @@ pub fn load_moe_q4(
         let layer_scalar = loader.load_f32(&format!("{lp}.layer_scalar"), device)
             .ok().and_then(|t| t.to_host(device).ok()).and_then(|v| v.first().copied()).unwrap_or(1.0);
 
-        // Attention Q4
-        let wq = load_q4(&format!("{lp}.self_attn.q_proj.weight"), h, q_dim)?;
-        let wk = load_q4(&format!("{lp}.self_attn.k_proj.weight"), h, kv_dim)?;
-        let wv = match load_q4(&format!("{lp}.self_attn.v_proj.weight"), h, kv_dim) {
+        // Attention — F16 for cuBLAS HGEMM (zero quality loss)
+        let wq = load_f16(&format!("{lp}.self_attn.q_proj.weight"), h, q_dim)?;
+        let wk = load_f16(&format!("{lp}.self_attn.k_proj.weight"), h, kv_dim)?;
+        let wv = match load_f16(&format!("{lp}.self_attn.v_proj.weight"), h, kv_dim) {
             Ok(v) => v,
-            Err(_) => load_q4(&format!("{lp}.self_attn.k_proj.weight"), h, kv_dim)?,
+            Err(_) => load_f16(&format!("{lp}.self_attn.k_proj.weight"), h, kv_dim)?,
         };
-        let wo = load_q4(&format!("{lp}.self_attn.o_proj.weight"), q_dim, h)?;
+        let wo = load_f16(&format!("{lp}.self_attn.o_proj.weight"), q_dim, h)?;
 
-        // Dense MLP Q4
+        // Dense MLP — F16
         let dfn = config.ffn_dim;
-        let w_gate = load_q4(&format!("{lp}.mlp.gate_proj.weight"), h, dfn)?;
-        let w_up = load_q4(&format!("{lp}.mlp.up_proj.weight"), h, dfn)?;
-        let w_down = load_q4(&format!("{lp}.mlp.down_proj.weight"), dfn, h)?;
+        let w_gate = load_f16(&format!("{lp}.mlp.gate_proj.weight"), h, dfn)?;
+        let w_up = load_f16(&format!("{lp}.mlp.up_proj.weight"), h, dfn)?;
+        let w_down = load_f16(&format!("{lp}.mlp.down_proj.weight"), dfn, h)?;
 
         // Router F32
         let router_proj = loader.load_f32(&format!("{lp}.router.proj.weight"), device)?;
@@ -149,17 +152,28 @@ pub fn load_moe_q4(
 
         device.synchronize().map_err(|e| LoaderError::Device(e.to_string()))?;
 
+        // Upload TW-Marlin packed data as raw bytes for the native GEMM path
+        // (SafeTensors path still uses TW-Marlin internally, wrapped as raw buffers)
+        let experts_gu_raw = GpuTensor::from_host(device, &all_gu_packed,
+            Shape::from_static(&[all_gu_packed.len()]), DType::U8)
+            .map_err(|e| LoaderError::Device(e.to_string()))?;
+        let experts_d_raw = GpuTensor::from_host(device, &all_d_packed,
+            Shape::from_static(&[all_d_packed.len()]), DType::U8)
+            .map_err(|e| LoaderError::Device(e.to_string()))?;
+
         layers.push(MoEQ4Layer {
             attn_norm, post_attn_norm, pre_ffn_norm, post_ffn_norm,
             post_ffn_norm_1, pre_ffn_norm_2, post_ffn_norm_2,
             q_norm, k_norm, layer_scalar,
             wq, wk, wv, wo, w_gate, w_up, w_down,
             router_proj, router_scale, per_expert_scale,
-            experts_gu_packed, experts_gu_scales,
-            experts_d_packed, experts_d_scales,
-            gu_packed_per_expert: gu_packed_per,
+            experts_gu_raw, gu_bytes_per_expert: gu_packed_per,
+            experts_d_raw, d_bytes_per_expert: d_packed_per,
+            d_block_bytes: 20, d_block_elems: 32,
+            use_native_gguf_experts: false,
+            experts_gu_scales: Some(experts_gu_scales),
+            experts_d_scales: Some(experts_d_scales),
             gu_scales_per_expert: gu_scales_per,
-            d_packed_per_expert: d_packed_per,
             d_scales_per_expert: d_scales_per,
             expert_gu_k: gu_k, expert_gu_n: gu_n,
             expert_d_k: d_k, expert_d_n: d_n,
@@ -171,7 +185,7 @@ pub fn load_moe_q4(
     eprintln!("[moe-q4] All weights in VRAM!");
     Ok(MoEQ4Engine {
         config, layer_configs, embed_tokens: embed, final_norm,
-        cache: KernelCache::new(), layers,
+        cache: KernelCache::new(), layers, weights_reordered: false,
     })
 }
 

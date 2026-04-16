@@ -220,7 +220,7 @@ impl NVFP4GenerationEngine {
             device.htod_copy(&[kv.len], &mut b.cache_len_buf)?;
             crate::kv_cache::decode_attention_flash_device_len_window(
                 &self.cache, device, &b.q_n, kv, &mut b.attn_out,
-                self.config.num_heads, lc.num_kv_heads, d, &b.cache_len_buf, window)?;
+                self.config.num_heads, lc.num_kv_heads, d, &b.cache_len_buf, window, self.config.final_logit_softcapping, 1.0)?;
 
             // Output projection
             fp4_gemm(&self.cache, device, &b.attn_out,

@@ -124,6 +124,52 @@ pub fn gemm_cublas_f16_transB(
     Ok(())
 }
 
+/// Mixed-precision GEMM: F16 inputs → F32 output, transposed B.
+/// C[M,N](F32) = A[M,K](F16) × B^T[K,N](F16) where B stored as [N,K].
+///
+/// Uses cublasGemmEx with CUBLAS_COMPUTE_32F. Eliminates the need for
+/// cast_f16_to_f32 after every cuBLAS HGEMM — the F32 output comes free.
+pub fn gemm_cublas_f16in_f32out_transB(
+    device: &WarpDevice,
+    a: &GpuTensor<half::f16>,
+    b: &GpuTensor<half::f16>,  // stored as [N, K], will be transposed
+    c: &mut GpuTensor<f32>,     // F32 output!
+    m: u32, n: u32, k: u32,
+) -> Result<(), DeviceError> {
+    use cudarc::cublas::sys;
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+    let blas = device.cublas()?;
+    let alpha: f32 = 1.0;
+    let beta: f32 = 0.0;
+    unsafe {
+        let (b_ptr, _b_guard) = b.data.device_ptr(&device.stream);
+        let (a_ptr, _a_guard) = a.data.device_ptr(&device.stream);
+        let (c_ptr, _c_guard) = c.data.device_ptr_mut(&device.stream);
+        cudarc::cublas::result::gemm_ex(
+            *blas.handle(),
+            sys::cublasOperation_t::CUBLAS_OP_T,  // transpose B
+            sys::cublasOperation_t::CUBLAS_OP_N,  // A as-is
+            n as i32,   // m in col-major = N
+            m as i32,   // n in col-major = M
+            k as i32,
+            (&alpha) as *const f32 as *const _,
+            b_ptr as *const _,
+            sys::cudaDataType_t::CUDA_R_16F,
+            k as i32,   // lda = K (B is [N,K] row-major → [K,N] col-major)
+            a_ptr as *const _,
+            sys::cudaDataType_t::CUDA_R_16F,
+            k as i32,   // ldb = K (A is [M,K] row-major → [K,M] col-major)
+            (&beta) as *const f32 as *const _,
+            c_ptr as *mut _,
+            sys::cudaDataType_t::CUDA_R_32F,     // F32 output!
+            n as i32,   // ldc = N
+            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+        ).map_err(|e| DeviceError::Launch(format!("cuBLAS GemmEx f16→f32 transB: {e}")))?;
+    }
+    Ok(())
+}
+
 /// FP16 GEMM via cuBLAS: C = A @ B (row-major, half precision)
 ///
 /// Uses cuBLAS HGEMM with automatic tensor core dispatch.

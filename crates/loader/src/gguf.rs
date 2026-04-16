@@ -7,9 +7,10 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
+use memmap2::Mmap;
 
 /// Magic number for GGUF files: "GGUF" in little-endian.
-const GGUF_MAGIC: u32 = 0x46475547;
+const GGUF_MAGIC: u32 = 0x46554747; // "GGUF" as u32 little-endian
 
 // ─── Error ───────────────────────────────────────────────────────────────────
 
@@ -98,6 +99,12 @@ pub enum GgufDType {
     Q5_1 = 7,
     Q8_0 = 8,
     Q8_1 = 9,
+    Q2_K = 10,
+    Q3_K = 11,
+    Q4_K = 12,
+    Q5_K = 13,
+    Q6_K = 14,
+    Q8_K = 15,
 }
 
 impl GgufDType {
@@ -111,6 +118,12 @@ impl GgufDType {
             7 => Ok(Self::Q5_1),
             8 => Ok(Self::Q8_0),
             9 => Ok(Self::Q8_1),
+            10 => Ok(Self::Q2_K),
+            11 => Ok(Self::Q3_K),
+            12 => Ok(Self::Q4_K),
+            13 => Ok(Self::Q5_K),
+            14 => Ok(Self::Q6_K),
+            15 => Ok(Self::Q8_K),
             _ => Err(GgufError::InvalidDType(v)),
         }
     }
@@ -121,12 +134,18 @@ impl GgufDType {
         match self {
             Self::F32 => (1, 4),
             Self::F16 => (1, 2),
-            Self::Q4_0 => (32, 18),   // 32 elements: 2 bytes scale + 16 bytes quants
-            Self::Q4_1 => (32, 20),   // 32 elements: 2+2 bytes scale/min + 16 bytes quants
-            Self::Q5_0 => (32, 22),   // 32 elements: 2 bytes scale + 4 bytes high bits + 16 bytes quants
+            Self::Q4_0 => (32, 18),    // 2B scale + 16B quants
+            Self::Q4_1 => (32, 20),    // 2+2B scale/min + 16B quants
+            Self::Q5_0 => (32, 22),    // 2B scale + 4B high + 16B quants
             Self::Q5_1 => (32, 24),
-            Self::Q8_0 => (32, 34),   // 32 elements: 2 bytes scale + 32 bytes quants
+            Self::Q8_0 => (32, 34),    // 2B scale + 32B quants
             Self::Q8_1 => (32, 36),
+            Self::Q2_K => (256, 84),   // 256 elems: scales + quants
+            Self::Q3_K => (256, 110),
+            Self::Q4_K => (256, 144),  // 2B d + 2B dmin + 12B scales + 128B qs
+            Self::Q5_K => (256, 176),
+            Self::Q6_K => (256, 210),  // 128B ql + 64B qh + 16B scales + 2B d
+            Self::Q8_K => (256, 292),
         }
     }
 }
@@ -157,24 +176,103 @@ impl GgufTensorInfo {
 
 // ─── Model ───────────────────────────────────────────────────────────────────
 
-/// A parsed GGUF model file.
+/// A parsed GGUF model file. Uses mmap for large files.
 pub struct GgufModel {
     pub version: u32,
     pub metadata: HashMap<String, GgufValue>,
     pub tensors: Vec<GgufTensorInfo>,
-    pub data: Vec<u8>,
+    /// Raw tensor data — either owned Vec or mmap'd slice
+    data: GgufData,
+    /// Offset from start of file to the data section (for mmap mode)
+    data_offset: u64,
+}
+
+enum GgufData {
+    Owned(Vec<u8>),
+    Mmap(Mmap),
+}
+
+impl GgufData {
+    fn as_slice(&self, data_offset: u64) -> &[u8] {
+        match self {
+            GgufData::Owned(v) => v.as_slice(),
+            GgufData::Mmap(m) => &m[data_offset as usize..],
+        }
+    }
 }
 
 impl GgufModel {
-    /// Load a GGUF file from disk.
+    /// Load a GGUF file from disk. Uses mmap for files > 1 GB.
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, GgufError> {
-        let mut file = std::fs::File::open(path.as_ref())?;
-        Self::read_from(&mut file)
+        let file = std::fs::File::open(path.as_ref())?;
+        let file_size = file.metadata()?.len();
+
+        if file_size > 1_000_000_000 {
+            // Large file: mmap + parse header from the mmap
+            Self::load_mmap(file)
+        } else {
+            let mut file = file;
+            Self::read_from(&mut file)
+        }
+    }
+
+    /// Load using memory-mapped I/O (for large GGUF files).
+    fn load_mmap(file: std::fs::File) -> Result<Self, GgufError> {
+        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| GgufError::Io(e))?;
+        let mut cursor = std::io::Cursor::new(&mmap[..]);
+
+        let magic = read_u32(&mut cursor)?;
+        if magic != GGUF_MAGIC {
+            return Err(GgufError::InvalidMagic(magic));
+        }
+
+        let version = read_u32(&mut cursor)?;
+        if version < 2 || version > 3 {
+            return Err(GgufError::UnsupportedVersion(version));
+        }
+
+        let n_tensors = read_u64(&mut cursor)?;
+        let n_kv = read_u64(&mut cursor)?;
+
+        let mut metadata = HashMap::with_capacity(n_kv as usize);
+        for _ in 0..n_kv {
+            let key = read_gguf_string(&mut cursor)?;
+            let value = read_gguf_value(&mut cursor)?;
+            metadata.insert(key, value);
+        }
+
+        let mut tensors = Vec::with_capacity(n_tensors as usize);
+        for _ in 0..n_tensors {
+            let name = read_gguf_string(&mut cursor)?;
+            let n_dims = read_u32(&mut cursor)? as usize;
+            let mut dims = Vec::with_capacity(n_dims);
+            for _ in 0..n_dims {
+                dims.push(read_u64(&mut cursor)?);
+            }
+            let dtype = GgufDType::from_u32(read_u32(&mut cursor)?)?;
+            let offset = read_u64(&mut cursor)?;
+            tensors.push(GgufTensorInfo { name, dims, dtype, offset });
+        }
+
+        let alignment = metadata
+            .get("general.alignment")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(32) as u64;
+
+        let pos = cursor.position();
+        let data_offset = (pos + alignment - 1) / alignment * alignment;
+
+        Ok(Self {
+            version,
+            metadata,
+            tensors,
+            data: GgufData::Mmap(mmap),
+            data_offset,
+        })
     }
 
     /// Parse GGUF from any reader that supports Read + Seek.
     pub fn read_from<R: Read + Seek>(r: &mut R) -> Result<Self, GgufError> {
-        // ── Header ───────────────────────────────────────────────────────
         let magic = read_u32(r)?;
         if magic != GGUF_MAGIC {
             return Err(GgufError::InvalidMagic(magic));
@@ -188,7 +286,6 @@ impl GgufModel {
         let n_tensors = read_u64(r)?;
         let n_kv = read_u64(r)?;
 
-        // ── Metadata KV ──────────────────────────────────────────────────
         let mut metadata = HashMap::with_capacity(n_kv as usize);
         for _ in 0..n_kv {
             let key = read_gguf_string(r)?;
@@ -196,7 +293,6 @@ impl GgufModel {
             metadata.insert(key, value);
         }
 
-        // ── Tensor infos ─────────────────────────────────────────────────
         let mut tensors = Vec::with_capacity(n_tensors as usize);
         for _ in 0..n_tensors {
             let name = read_gguf_string(r)?;
@@ -210,37 +306,42 @@ impl GgufModel {
             tensors.push(GgufTensorInfo { name, dims, dtype, offset });
         }
 
-        // ── Data section ─────────────────────────────────────────────────
-        // Alignment (default 32)
         let alignment = metadata
             .get("general.alignment")
             .and_then(|v| v.as_u64())
             .unwrap_or(32) as u64;
 
-        // Current position in the file
         let pos = r.stream_position()?;
-        // Align to the next boundary
         let aligned_pos = (pos + alignment - 1) / alignment * alignment;
         r.seek(SeekFrom::Start(aligned_pos))?;
 
-        // Read remaining data
         let mut data = Vec::new();
         r.read_to_end(&mut data)?;
 
-        Ok(Self { version, metadata, tensors, data })
+        Ok(Self { version, metadata, tensors, data: GgufData::Owned(data), data_offset: 0 })
     }
 
-    /// Get tensor data as f32 (dequantizing if needed). Only F32 supported for now.
-    pub fn get_tensor_f32(&self, name: &str) -> Option<Vec<f32>> {
+    /// Get the raw bytes for a tensor.
+    fn tensor_raw(&self, name: &str) -> Option<(&GgufTensorInfo, &[u8])> {
         let info = self.tensors.iter().find(|t| t.name == name)?;
+        let data_slice = self.data.as_slice(self.data_offset);
         let offset = info.offset as usize;
         let byte_size = info.byte_size() as usize;
-
-        if offset + byte_size > self.data.len() {
+        if offset + byte_size > data_slice.len() {
             return None;
         }
+        Some((info, &data_slice[offset..offset + byte_size]))
+    }
 
-        let raw = &self.data[offset..offset + byte_size];
+    /// Get raw bytes for a tensor (no dequantization).
+    pub fn get_tensor_raw(&self, name: &str) -> Option<&[u8]> {
+        let (info, raw) = self.tensor_raw(name)?;
+        Some(raw)
+    }
+
+    /// Get tensor data as f32 (dequantizing if needed).
+    pub fn get_tensor_f32(&self, name: &str) -> Option<Vec<f32>> {
+        let (info, raw) = self.tensor_raw(name)?;
         let numel = info.numel() as usize;
 
         match info.dtype {
@@ -260,7 +361,6 @@ impl GgufModel {
                 Some(out)
             }
             GgufDType::Q8_0 => {
-                // Q8_0: blocks of 32 elements, each block = 2 bytes scale (f16) + 32 bytes quants (i8)
                 let mut out = vec![0.0f32; numel];
                 let (elems_per_block, bytes_per_block) = info.dtype.block_size();
                 let n_blocks = numel / elems_per_block;
@@ -275,7 +375,13 @@ impl GgufModel {
                 }
                 Some(out)
             }
-            _ => None, // Other quantization formats not yet implemented
+            GgufDType::Q4_K => Some(dequantize_q4_k(raw, numel)),
+            GgufDType::Q6_K => Some(dequantize_q6_k(raw, numel)),
+            GgufDType::Q5_K => Some(dequantize_q5_k(raw, numel)),
+            GgufDType::Q8_K => Some(dequantize_q8_k(raw, numel)),
+            GgufDType::Q4_0 => Some(dequantize_q4_0(raw, numel)),
+            GgufDType::Q5_0 => Some(dequantize_q5_0(raw, numel)),
+            _ => None,
         }
     }
 
@@ -320,6 +426,224 @@ impl GgufModel {
         }
         self.metadata.get("general.context_length")?.as_u64()
     }
+}
+
+// ─── K-quant dequantization ──────────────────────────────────────────────────
+
+/// Extract 6-bit scale and min for Q4_K sub-block `j` from the 12-byte scales array.
+#[inline]
+fn get_scale_min_k4(j: usize, scales: &[u8]) -> (u8, u8) {
+    if j < 4 {
+        (scales[j] & 63, scales[j + 4] & 63)
+    } else {
+        let sc = (scales[j + 4] & 0xF) | ((scales[j - 4] >> 6) << 4);
+        let mn = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
+        (sc, mn)
+    }
+}
+
+/// Dequantize Q4_K blocks to f32.
+/// Block layout (144 bytes per 256 elements):
+///   d: f16 (2B), dmin: f16 (2B), scales: [12]u8, qs: [128]u8
+fn dequantize_q4_k(raw: &[u8], numel: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; numel];
+    let block_bytes = 144;
+    let n_blocks = numel / 256;
+
+    for bi in 0..n_blocks {
+        let b = &raw[bi * block_bytes..(bi + 1) * block_bytes];
+        let d = half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32();
+        let dmin = half::f16::from_bits(u16::from_le_bytes([b[2], b[3]])).to_f32();
+        let scales = &b[4..16];
+        let qs = &b[16..144];
+
+        let out_block = &mut out[bi * 256..(bi + 1) * 256];
+        let mut is = 0usize;
+        let mut q_off = 0usize;
+        // 4 chunks of 64 elements each
+        for _chunk in 0..4 {
+            let (sc0, m0) = get_scale_min_k4(is, scales);
+            let d1 = d * sc0 as f32;
+            let m1 = dmin * m0 as f32;
+            let (sc1, m1_val) = get_scale_min_k4(is + 1, scales);
+            let d2 = d * sc1 as f32;
+            let m2 = dmin * m1_val as f32;
+
+            let elem_off = _chunk * 64;
+            for l in 0..32 {
+                out_block[elem_off + l] = d1 * (qs[q_off + l] & 0xF) as f32 - m1;
+            }
+            for l in 0..32 {
+                out_block[elem_off + 32 + l] = d2 * (qs[q_off + l] >> 4) as f32 - m2;
+            }
+            q_off += 32;
+            is += 2;
+        }
+    }
+    out
+}
+
+/// Dequantize Q6_K blocks to f32.
+/// Block layout (210 bytes per 256 elements):
+///   ql: [128]u8, qh: [64]u8, scales: [16]i8, d: f16 (2B)
+fn dequantize_q6_k(raw: &[u8], numel: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; numel];
+    let block_bytes = 210;
+    let n_blocks = numel / 256;
+
+    for bi in 0..n_blocks {
+        let b = &raw[bi * block_bytes..(bi + 1) * block_bytes];
+        let ql = &b[0..128];
+        let qh = &b[128..192];
+        let sc = &b[192..208]; // 16 x i8
+        let d = half::f16::from_bits(u16::from_le_bytes([b[208], b[209]])).to_f32();
+
+        let out_block = &mut out[bi * 256..(bi + 1) * 256];
+
+        // Process in 2 halves of 128 elements each
+        for half_idx in 0..2usize {
+            let ql_off = half_idx * 64;
+            let qh_off = half_idx * 32;
+            let sc_off = half_idx * 8;
+            let out_off = half_idx * 128;
+
+            for l in 0..32 {
+                let q1 = ((ql[ql_off + l] & 0xF) | (((qh[qh_off + l] >> 0) & 3) << 4)) as i32 - 32;
+                let q2 = ((ql[ql_off + 32 + l] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i32 - 32;
+                let q3 = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32 - 32;
+                let q4 = ((ql[ql_off + 32 + l] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i32 - 32;
+
+                out_block[out_off + l]      = d * sc[sc_off] as i8 as f32 * q1 as f32;
+                out_block[out_off + 32 + l] = d * sc[sc_off + 2] as i8 as f32 * q2 as f32;
+                out_block[out_off + 64 + l] = d * sc[sc_off + 4] as i8 as f32 * q3 as f32;
+                out_block[out_off + 96 + l] = d * sc[sc_off + 6] as i8 as f32 * q4 as f32;
+            }
+        }
+    }
+    out
+}
+
+/// Dequantize Q5_K blocks to f32.
+/// Block layout (176 bytes per 256 elements):
+///   d: f16 (2B), dmin: f16 (2B), scales: [12]u8, qh: [32]u8, qs: [128]u8
+fn dequantize_q5_k(raw: &[u8], numel: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; numel];
+    let block_bytes = 176;
+    let n_blocks = numel / 256;
+
+    for bi in 0..n_blocks {
+        let b = &raw[bi * block_bytes..(bi + 1) * block_bytes];
+        let d = half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32();
+        let dmin = half::f16::from_bits(u16::from_le_bytes([b[2], b[3]])).to_f32();
+        let scales = &b[4..16];
+        let qh = &b[16..48];  // 32 bytes = 256 high bits
+        let qs = &b[48..176]; // 128 bytes = 256 low nibbles
+
+        let out_block = &mut out[bi * 256..(bi + 1) * 256];
+        let mut is = 0usize;
+        let mut q_off = 0usize;
+
+        for chunk in 0..4 {
+            let (sc0, m0) = get_scale_min_k4(is, scales);
+            let d1 = d * sc0 as f32;
+            let m1 = dmin * m0 as f32;
+            let (sc1, m1_val) = get_scale_min_k4(is + 1, scales);
+            let d2 = d * sc1 as f32;
+            let m2 = dmin * m1_val as f32;
+
+            let elem_off = chunk * 64;
+            let qh_bit_base = chunk * 64; // bit offset into qh
+
+            for l in 0..32 {
+                // Low nibble + high bit for first 32 elements
+                let qh_byte = qh_bit_base + l;
+                let hb0 = ((qh[qh_byte / 8] >> (qh_byte % 8)) & 1) as u8;
+                let q_low = qs[q_off + l] & 0xF;
+                out_block[elem_off + l] = d1 * (q_low | (hb0 << 4)) as f32 - m1;
+            }
+            for l in 0..32 {
+                let qh_byte = qh_bit_base + 32 + l;
+                let hb1 = ((qh[qh_byte / 8] >> (qh_byte % 8)) & 1) as u8;
+                let q_high = qs[q_off + l] >> 4;
+                out_block[elem_off + 32 + l] = d2 * (q_high | (hb1 << 4)) as f32 - m2;
+            }
+            q_off += 32;
+            is += 2;
+        }
+    }
+    out
+}
+
+/// Dequantize Q8_K blocks to f32.
+/// Block layout (292 bytes per 256 elements):
+///   d: f32 (4B), qs: [256]i8, bsums: [16]i16
+fn dequantize_q8_k(raw: &[u8], numel: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; numel];
+    let block_bytes = 292;
+    let n_blocks = numel / 256;
+
+    for bi in 0..n_blocks {
+        let b = &raw[bi * block_bytes..(bi + 1) * block_bytes];
+        let d = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        let qs = &b[4..260]; // 256 bytes of i8
+
+        for j in 0..256 {
+            out[bi * 256 + j] = d * qs[j] as i8 as f32;
+        }
+    }
+    out
+}
+
+/// Dequantize Q4_0 blocks to f32.
+/// Block layout (18 bytes per 32 elements):
+///   scale: f16 (2B), qs: [16]u8 (packed 4-bit, unsigned with bias -8)
+fn dequantize_q4_0(raw: &[u8], numel: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; numel];
+    let block_bytes = 18;
+    let n_blocks = numel / 32;
+
+    for bi in 0..n_blocks {
+        let b = &raw[bi * block_bytes..(bi + 1) * block_bytes];
+        let d = half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32();
+        let qs = &b[2..18];
+
+        for j in 0..16 {
+            let lo = (qs[j] & 0xF) as i32 - 8;
+            let hi = (qs[j] >> 4) as i32 - 8;
+            out[bi * 32 + 2 * j] = d * lo as f32;
+            out[bi * 32 + 2 * j + 1] = d * hi as f32;
+        }
+    }
+    out
+}
+
+/// Dequantize Q5_0 blocks to f32.
+/// Block layout (22 bytes per 32 elements):
+///   scale: f16 (2B), qh: [4]u8 (32 high bits), qs: [16]u8 (packed 4-bit low nibbles)
+fn dequantize_q5_0(raw: &[u8], numel: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; numel];
+    let block_bytes = 22;
+    let n_blocks = numel / 32;
+
+    for bi in 0..n_blocks {
+        let b = &raw[bi * block_bytes..(bi + 1) * block_bytes];
+        let d = half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32();
+        let qh_bytes = &b[2..6]; // 4 bytes = 32 bits
+        let qh = u32::from_le_bytes([qh_bytes[0], qh_bytes[1], qh_bytes[2], qh_bytes[3]]);
+        let qs = &b[6..22];
+
+        for j in 0..16 {
+            let lo_nibble = (qs[j] & 0xF) as u32;
+            let hi_nibble = (qs[j] >> 4) as u32;
+            let hb0 = (qh >> (2 * j)) & 1;
+            let hb1 = (qh >> (2 * j + 1)) & 1;
+            let q0 = (lo_nibble | (hb0 << 4)) as i32 - 16;
+            let q1 = (hi_nibble | (hb1 << 4)) as i32 - 16;
+            out[bi * 32 + 2 * j] = d * q0 as f32;
+            out[bi * 32 + 2 * j + 1] = d * q1 as f32;
+        }
+    }
+    out
 }
 
 // ─── Binary reader helpers ───────────────────────────────────────────────────

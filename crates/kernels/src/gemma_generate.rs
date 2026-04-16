@@ -324,7 +324,7 @@ impl GemmaGenerationEngine {
                 &self.cache, device, &lb.q_norm, kv_cache, &mut lb.attn_out,
                 num_q_heads, num_kv_heads, d,
                 &buffers.cache_len_bufs[i],
-                window,
+                window, self.config.final_logit_softcapping, 1.0,
             )?;
 
             // Output projection
@@ -494,7 +494,7 @@ impl GemmaGenerationEngine {
             crate::kv_cache::decode_attention_flash_device_len_window(
                 &self.cache, device, &lb.q_norm, kv_cache, &mut lb.attn_out,
                 num_q_heads, num_kv_heads, d,
-                &buffers.cache_len_bufs[i], window,
+                &buffers.cache_len_bufs[i], window, self.config.final_logit_softcapping, 1.0,
             )?;
 
             // Output projection
@@ -672,7 +672,7 @@ impl GemmaGenerationEngine {
                 num_q_heads, num_kv_heads, d,
                 // For non-graph path, create a device buffer with cache_len
                 &device.htod(&[kv_cache.len])?,
-                window,
+                window, self.config.final_logit_softcapping, 1.0,
             )?;
 
             if i == 0 { eprintln!("[decode] layer 0: attention OK"); }

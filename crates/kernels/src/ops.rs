@@ -335,6 +335,71 @@ extern "C" __global__ void warp_rmsnorm(
 }
 "#;
 
+/// Fused RMSNorm with F16 output — eliminates a separate F32→F16 cast kernel.
+/// out_f16[i] = __float2half(x[i] * rms * gamma[i])
+const RMSNORM_F16OUT_SRC: &str = r#"
+extern "C" __global__ void warp_rmsnorm_f16out(
+    unsigned short *out, const float *x, const float *gamma,
+    unsigned int hidden_size, float eps, size_t n_rows
+) {
+    unsigned int row = blockIdx.x;
+    if (row >= n_rows) return;
+
+    const float *x_row = x + row * hidden_size;
+    unsigned short *out_row = out + row * hidden_size;
+
+    float sum_sq = 0.0f;
+    for (unsigned int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        float v = x_row[i];
+        sum_sq += v * v;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+    sum_sq = __shfl_sync(0xffffffff, sum_sq, 0);
+
+    float rms = rsqrtf(sum_sq / (float)hidden_size + eps);
+
+    for (unsigned int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        float val = x_row[i] * rms * gamma[i];
+        unsigned short h;
+        asm volatile("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(val));
+        out_row[i] = h;
+    }
+}
+"#;
+
+/// Fused RMSNorm (no weight) with F16 output.
+const RMSNORM_NO_WEIGHT_F16OUT_SRC: &str = r#"
+extern "C" __global__ void warp_rmsnorm_noweight_f16out(
+    unsigned short *out, const float *x,
+    unsigned int hidden_size, float eps, size_t n_rows
+) {
+    unsigned int row = blockIdx.x;
+    if (row >= n_rows) return;
+
+    const float *x_row = x + row * hidden_size;
+    unsigned short *out_row = out + row * hidden_size;
+
+    float sum_sq = 0.0f;
+    for (unsigned int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        float v = x_row[i];
+        sum_sq += v * v;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+    sum_sq = __shfl_sync(0xffffffff, sum_sq, 0);
+
+    float rms = rsqrtf(sum_sq / (float)hidden_size + eps);
+
+    for (unsigned int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        float val = x_row[i] * rms;
+        unsigned short h;
+        asm volatile("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(val));
+        out_row[i] = h;
+    }
+}
+"#;
+
 /// RMSNorm without learnable weights — used for QK-norm in Gemma 3/4.
 /// Normalizes each row: out[i] = x[i] * rsqrt(mean(x^2) + eps)
 const RMSNORM_NO_WEIGHT_SRC: &str = r#"
@@ -377,6 +442,34 @@ pub fn rmsnorm_no_weight(
     eps: f32,
 ) -> Result<(), DeviceError> {
     let f = cache.get_or_compile(device, RMSNORM_NO_WEIGHT_SRC, "warp_rmsnorm_noweight")?;
+    let n_rows = (x.numel / hidden_size as usize) as usize;
+    let cfg = LaunchConfig {
+        grid_dim: (n_rows as u32, 1, 1),
+        block_dim: (32.min(hidden_size), 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut out.data)
+            .arg(&x.data)
+            .arg(&hidden_size)
+            .arg(&eps)
+            .arg(&n_rows)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+/// RMSNorm without weights, outputting F16 directly. Fuses rmsnorm_no_weight + cast_f32_to_f16.
+pub fn rmsnorm_no_weight_f16out(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    x: &GpuTensor<f32>,
+    out: &mut GpuTensor<half::f16>,
+    hidden_size: u32,
+    eps: f32,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, RMSNORM_NO_WEIGHT_F16OUT_SRC, "warp_rmsnorm_noweight_f16out")?;
     let n_rows = (x.numel / hidden_size as usize) as usize;
     let cfg = LaunchConfig {
         grid_dim: (n_rows as u32, 1, 1),
@@ -883,6 +976,126 @@ extern "C" __global__ void warp_fused_silu_mul(
 }
 "#;
 
+/// Fused triple-norm: reads residual once, produces 3 outputs:
+/// 1. ffn_f16 = f16(rmsnorm(x, gamma1))  — dense MLP input
+/// 2. router_scaled = rmsnorm_noweight(x) * router_scale * scalar_root — router input
+/// 3. moe_in = rmsnorm(x, gamma2) — expert MoE input
+/// Replaces 5 kernels (3 norms + mul + mul_scalar) with 1.
+const FUSED_TRIPLE_NORM_SRC: &str = r#"
+extern "C" __global__ void fused_triple_norm(
+    unsigned short* __restrict__ ffn_f16,     // [H] F16 output
+    float* __restrict__ router_scaled,        // [H] router output (normed * scale * root)
+    float* __restrict__ moe_in,               // [H] MoE input
+    const float* __restrict__ x,              // [H] input (residual)
+    const float* __restrict__ gamma1,         // [H] pre_ffn_norm
+    const float* __restrict__ gamma2,         // [H] pre_ffn_norm_2
+    const float* __restrict__ router_scale,   // [H] router scale weights
+    unsigned int H, float eps, float scalar_root
+) {
+    float sum_sq = 0.0f;
+    for (unsigned int i = threadIdx.x; i < H; i += blockDim.x) {
+        float v = x[i];
+        sum_sq += v * v;
+    }
+    for (int off = 16; off > 0; off >>= 1)
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, off);
+    sum_sq = __shfl_sync(0xffffffff, sum_sq, 0);
+    float rms = rsqrtf(sum_sq / (float)H + eps);
+
+    for (unsigned int i = threadIdx.x; i < H; i += blockDim.x) {
+        float v = x[i];
+        float normed = v * rms;
+        // Output 1: F16 normed with gamma1
+        float f = normed * gamma1[i];
+        unsigned short h;
+        asm volatile("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f));
+        ffn_f16[i] = h;
+        // Output 2: router (no-weight norm * router_scale * scalar_root)
+        router_scaled[i] = normed * router_scale[i] * scalar_root;
+        // Output 3: normed with gamma2
+        moe_in[i] = normed * gamma2[i];
+    }
+}
+"#;
+
+pub fn fused_triple_norm(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    x: &GpuTensor<f32>,
+    gamma1: &GpuTensor<f32>,
+    gamma2: &GpuTensor<f32>,
+    router_scale: &GpuTensor<f32>,
+    ffn_f16: &mut GpuTensor<half::f16>,
+    router_scaled: &mut GpuTensor<f32>,
+    moe_in: &mut GpuTensor<f32>,
+    hidden_size: u32,
+    eps: f32,
+    scalar_root: f32,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, FUSED_TRIPLE_NORM_SRC, "fused_triple_norm")?;
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (32.min(hidden_size), 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut ffn_f16.data).arg(&mut router_scaled.data).arg(&mut moe_in.data)
+            .arg(&x.data).arg(&gamma1.data).arg(&gamma2.data).arg(&router_scale.data)
+            .arg(&hidden_size).arg(&eps).arg(&scalar_root)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+/// Fused rmsnorm + add: out = a + rmsnorm(b, gamma).
+/// Replaces rmsnorm(b) → post_attn + add(x, post_attn) → residual (2 kernels → 1).
+const FUSED_RMSNORM_ADD_SRC: &str = r#"
+extern "C" __global__ void warp_fused_rmsnorm_add(
+    float *out, const float *a, const float *b, const float *gamma,
+    unsigned int hidden_size, float eps
+) {
+    float sum_sq = 0.0f;
+    for (unsigned int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        float v = b[i];
+        sum_sq += v * v;
+    }
+    for (int off = 16; off > 0; off >>= 1)
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, off);
+    sum_sq = __shfl_sync(0xffffffff, sum_sq, 0);
+    float rms = rsqrtf(sum_sq / (float)hidden_size + eps);
+
+    for (unsigned int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        out[i] = a[i] + b[i] * rms * gamma[i];
+    }
+}
+"#;
+
+pub fn fused_rmsnorm_add(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    a: &GpuTensor<f32>,
+    b: &GpuTensor<f32>,
+    gamma: &GpuTensor<f32>,
+    out: &mut GpuTensor<f32>,
+    hidden_size: u32,
+    eps: f32,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, FUSED_RMSNORM_ADD_SRC, "warp_fused_rmsnorm_add")?;
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (32.min(hidden_size), 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut out.data).arg(&a.data).arg(&b.data).arg(&gamma.data)
+            .arg(&hidden_size).arg(&eps)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
 /// Fused residual add + RMSNorm with dual output:
 /// - norm_out = rmsnorm(x + residual, gamma)
 /// - residual_out = x + residual (un-normalized, for downstream residual)
@@ -977,6 +1190,39 @@ pub fn fused_gelu_mul(
     Ok(())
 }
 
+/// Fused split + GeGLU: out[i] = gelu(gate_up[i]) * gate_up[i + dim]
+/// Eliminates split_gate_up + fused_gelu_mul (2 kernels → 1).
+const SPLIT_GEGLU_SRC: &str = r#"
+extern "C" __global__ void warp_split_geglu(
+    float *out, const float *gate_up, size_t dim
+) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < dim) {
+        float g = gate_up[i];
+        float u = gate_up[i + dim];
+        float gelu_g = 0.5f * g * (1.0f + tanhf(0.7978845608f * (g + 0.044715f * g * g * g)));
+        out[i] = gelu_g * u;
+    }
+}
+"#;
+
+pub fn split_geglu(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    gate_up: &GpuTensor<f32>,
+    out: &mut GpuTensor<f32>,
+    dim: u32,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, SPLIT_GEGLU_SRC, "warp_split_geglu")?;
+    let cfg = LaunchConfig::for_num_elems(dim);
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut out.data).arg(&gate_up.data).arg(&(dim as usize))
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
 /// Logit softcapping: out = cap * tanh(x / cap).
 /// Used by Gemma 2/4 to bound logit magnitudes before softmax.
 /// cap=0.0 means disabled (no-op copy).
@@ -1019,6 +1265,196 @@ pub fn mul_scalar(
     Ok(())
 }
 
+/// Fused axpy: acc[i] += alpha * x[i]  (in-place accumulate)
+/// Replaces mul_scalar + add + copy (3 kernels → 1).
+const AXPY_SRC: &str = r#"
+extern "C" __global__ void warp_axpy(float *acc, const float *x, float alpha, size_t n) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) acc[i] += alpha * x[i];
+}
+"#;
+
+pub fn axpy(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    acc: &mut GpuTensor<f32>,
+    x: &GpuTensor<f32>,
+    alpha: f32,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, AXPY_SRC, "warp_axpy")?;
+    let n = x.numel;
+    let cfg = LaunchConfig::for_num_elems(n as u32);
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut acc.data).arg(&x.data).arg(&alpha).arg(&n)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+/// axpy with device-resident weight: acc[i] += (*weight_ptr) * x[i]
+/// Reads the scalar weight from a device pointer — no DtoH needed.
+const AXPY_INDIRECT_SRC: &str = r#"
+extern "C" __global__ void warp_axpy_indirect(float *acc, const float *x, const float *weight_ptr, size_t n) {
+    float alpha = *weight_ptr;
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) acc[i] += alpha * x[i];
+}
+"#;
+
+pub fn axpy_indirect(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    acc: &mut GpuTensor<f32>,
+    x: &GpuTensor<f32>,
+    weight_ptr: &cudarc::driver::CudaView<f32>,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, AXPY_INDIRECT_SRC, "warp_axpy_indirect")?;
+    let n = x.numel;
+    let cfg = LaunchConfig::for_num_elems(n as u32);
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut acc.data).arg(&x.data).arg(weight_ptr).arg(&n)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+/// Compute expert byte offsets on GPU from router topK IDs. No DtoH needed.
+/// Outputs 4 offset arrays (gate+up packed, gate+up scales, down packed, down scales).
+const COMPUTE_EXPERT_OFFSETS_SRC: &str = r#"
+extern "C" __global__ void compute_expert_offsets(
+    unsigned int* gu_offsets,
+    unsigned int* d_offsets,
+    unsigned int* gu_scale_offsets,
+    unsigned int* d_scale_offsets,
+    const float* topk_ids,
+    unsigned int gu_bytes_per_expert,
+    unsigned int d_bytes_per_expert,
+    unsigned int gu_scales_per_expert,
+    unsigned int d_scales_per_expert,
+    int top_k
+) {
+    int i = threadIdx.x;
+    if (i >= top_k) return;
+    unsigned int eid = (unsigned int)topk_ids[i];
+    gu_offsets[i] = eid * gu_bytes_per_expert;
+    d_offsets[i] = eid * d_bytes_per_expert;
+    gu_scale_offsets[i] = eid * gu_scales_per_expert;
+    d_scale_offsets[i] = eid * d_scales_per_expert;
+}
+"#;
+
+pub fn compute_expert_offsets(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    topk_ids: &GpuTensor<f32>,
+    gu_offsets: &mut cudarc::driver::CudaSlice<u32>,
+    d_offsets: &mut cudarc::driver::CudaSlice<u32>,
+    gu_scale_offsets: &mut cudarc::driver::CudaSlice<u32>,
+    d_scale_offsets: &mut cudarc::driver::CudaSlice<u32>,
+    gu_bytes_per_expert: u32,
+    d_bytes_per_expert: u32,
+    gu_scales_per_expert: u32,
+    d_scales_per_expert: u32,
+    top_k: u32,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, COMPUTE_EXPERT_OFFSETS_SRC, "compute_expert_offsets")?;
+    let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (top_k, 1, 1), shared_mem_bytes: 0 };
+    let top_k_i = top_k as i32;
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(gu_offsets)
+            .arg(d_offsets)
+            .arg(gu_scale_offsets)
+            .arg(d_scale_offsets)
+            .arg(&topk_ids.data)
+            .arg(&gu_bytes_per_expert)
+            .arg(&d_bytes_per_expert)
+            .arg(&gu_scales_per_expert)
+            .arg(&d_scales_per_expert)
+            .arg(&top_k_i)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+/// GPU-side router TopK: finds top-K experts from softmax probs, normalizes weights.
+/// Output: out_ids[0..K] = expert indices (as f32 for uniform buffer), out_weights[0..K] = normalized weights.
+/// Single-block kernel for N≤1024 experts, K≤32.
+const ROUTER_TOPK_SRC: &str = r#"
+extern "C" __global__ void warp_router_topk(
+    float *out_ids, float *out_weights,
+    const float *probs, const float *per_expert_scale,
+    int N, int K
+) {
+    // Single-block: each thread handles a subset of experts
+    __shared__ float s_prob[1024];
+    __shared__ int   s_idx[1024];
+
+    int tid = threadIdx.x;
+    // Load probs + indices into shared memory
+    for (int i = tid; i < N; i += blockDim.x) {
+        s_prob[i] = probs[i];
+        s_idx[i] = i;
+    }
+    __syncthreads();
+
+    // Simple selection sort for top-K (K is small, N is small)
+    // Only thread 0 does the selection to avoid complexity
+    if (tid == 0) {
+        for (int k = 0; k < K; k++) {
+            int best = k;
+            float best_val = s_prob[k];
+            for (int j = k + 1; j < N; j++) {
+                if (s_prob[j] > best_val) {
+                    best = j;
+                    best_val = s_prob[j];
+                }
+            }
+            // Swap
+            if (best != k) {
+                float tp = s_prob[k]; s_prob[k] = s_prob[best]; s_prob[best] = tp;
+                int ti = s_idx[k]; s_idx[k] = s_idx[best]; s_idx[best] = ti;
+            }
+        }
+        // Normalize and apply per-expert scale
+        float sum = 0.0f;
+        for (int k = 0; k < K; k++) sum += s_prob[k];
+        float inv_sum = (sum > 0.0f) ? (1.0f / sum) : (1.0f / (float)K);
+        for (int k = 0; k < K; k++) {
+            int eid = s_idx[k];
+            out_ids[k] = (float)eid;
+            out_weights[k] = s_prob[k] * inv_sum * per_expert_scale[eid];
+        }
+    }
+}
+"#;
+
+/// GPU-side router TopK — avoids 2× DtoH of 128 floats per layer.
+/// Returns (expert_ids, expert_weights) on host via single small DtoH.
+pub fn router_topk(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    probs: &GpuTensor<f32>,
+    per_expert_scale: &GpuTensor<f32>,
+    out_ids: &mut GpuTensor<f32>,
+    out_weights: &mut GpuTensor<f32>,
+    num_experts: u32,
+    top_k: u32,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, ROUTER_TOPK_SRC, "warp_router_topk")?;
+    let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut out_ids.data).arg(&mut out_weights.data)
+            .arg(&probs.data).arg(&per_expert_scale.data)
+            .arg(&(num_experts as i32)).arg(&(top_k as i32))
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
 pub fn logit_softcap(
     cache: &KernelCache,
     device: &WarpDevice,
@@ -1027,9 +1463,15 @@ pub fn logit_softcap(
     cap: f32,
 ) -> Result<(), DeviceError> {
     if cap <= 0.0 {
-        // No-op — just copy
-        let data = device.dtoh(&x.data)?;
-        *out = GpuTensor::from_host(device, &data, x.shape.clone(), warp_ir::DType::F32)?;
+        // No-op — GPU-side copy (was DtoH+HtoD roundtrip, ~1MB for 256K vocab)
+        let f = cache.get_or_compile(device, MUL_SCALAR_SRC, "warp_mul_scalar")?;
+        let n = x.numel;
+        let cfg = LaunchConfig::for_num_elems(n as u32);
+        unsafe {
+            launch_err!(device.stream.launch_builder(&f)
+                .arg(&mut out.data).arg(&x.data).arg(&1.0f32).arg(&n)
+                .launch(cfg))?;
+        }
         return Ok(());
     }
     let f = cache.get_or_compile(device, LOGIT_SOFTCAP_SRC, "warp_logit_softcap")?;
@@ -1291,6 +1733,36 @@ pub fn layernorm(
             .arg(&x.data)
             .arg(&gamma.data)
             .arg(&beta.data)
+            .arg(&hidden_size)
+            .arg(&eps)
+            .arg(&n_rows)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+/// Fused RMSNorm → F16 output (eliminates separate cast kernel).
+pub fn rmsnorm_f16out(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    x: &GpuTensor<f32>,
+    gamma: &GpuTensor<f32>,
+    out: &mut GpuTensor<half::f16>,
+    hidden_size: u32,
+    eps: f32,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, RMSNORM_F16OUT_SRC, "warp_rmsnorm_f16out")?;
+    let n_rows = (x.numel / hidden_size as usize) as usize;
+    let cfg = LaunchConfig {
+        grid_dim: (n_rows as u32, 1, 1),
+        block_dim: (32.min(hidden_size), 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut out.data)
+            .arg(&x.data)
+            .arg(&gamma.data)
             .arg(&hidden_size)
             .arg(&eps)
             .arg(&n_rows)
@@ -2273,6 +2745,163 @@ pub fn fused_bias_rope_append(
             .launch(cfg))?;
     }
     Ok(())
+}
+
+// ── Weight layout reorder: column-major-blocks → group-major-blocks ��────────
+// ── Fused MoE combine: 6 kernels → 1 ─────────────────────────────────────────
+// Computes: output_scaled = (residual + rmsnorm(rmsnorm(dense,g1) + rmsnorm(moe,g2), g3)) * scalar
+
+const FUSED_MOE_COMBINE_SRC: &str = r#"
+extern "C" __global__ void fused_moe_combine(
+    float* __restrict__ output_scaled,
+    float* __restrict__ output,
+    const float* __restrict__ dense_out,
+    const float* __restrict__ moe_acc,
+    const float* __restrict__ residual,
+    const float* __restrict__ gamma1,
+    const float* __restrict__ gamma2,
+    const float* __restrict__ gamma3,
+    unsigned int H, float eps, float layer_scalar
+) {
+    // Phase 1: sum_sq for both dense and moe RMSNorms simultaneously
+    float sum_sq_d = 0.0f, sum_sq_m = 0.0f;
+    for (unsigned int i = threadIdx.x; i < H; i += blockDim.x) {
+        float d = dense_out[i], m = moe_acc[i];
+        sum_sq_d += d * d;
+        sum_sq_m += m * m;
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        sum_sq_d += __shfl_down_sync(0xFFFFFFFF, sum_sq_d, off);
+        sum_sq_m += __shfl_down_sync(0xFFFFFFFF, sum_sq_m, off);
+    }
+    sum_sq_d = __shfl_sync(0xFFFFFFFF, sum_sq_d, 0);
+    sum_sq_m = __shfl_sync(0xFFFFFFFF, sum_sq_m, 0);
+    float rms_d = rsqrtf(sum_sq_d / (float)H + eps);
+    float rms_m = rsqrtf(sum_sq_m / (float)H + eps);
+
+    // Phase 2: combined = rmsnorm(dense)*g1 + rmsnorm(moe)*g2, accumulate sum_sq
+    float sum_sq_c = 0.0f;
+    for (unsigned int i = threadIdx.x; i < H; i += blockDim.x) {
+        float c = dense_out[i] * rms_d * gamma1[i] + moe_acc[i] * rms_m * gamma2[i];
+        output[i] = c;  // temp store
+        sum_sq_c += c * c;
+    }
+    for (int off = 16; off > 0; off >>= 1)
+        sum_sq_c += __shfl_down_sync(0xFFFFFFFF, sum_sq_c, off);
+    sum_sq_c = __shfl_sync(0xFFFFFFFF, sum_sq_c, 0);
+    float rms_c = rsqrtf(sum_sq_c / (float)H + eps);
+
+    // Phase 3: output = residual + rmsnorm(combined)*g3, scaled
+    for (unsigned int i = threadIdx.x; i < H; i += blockDim.x) {
+        float out = residual[i] + output[i] * rms_c * gamma3[i];
+        output[i] = out;
+        output_scaled[i] = out * layer_scalar;
+    }
+}
+"#;
+
+pub fn fused_moe_combine(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    output_scaled: &mut GpuTensor<f32>,
+    output: &mut GpuTensor<f32>,
+    dense_out: &GpuTensor<f32>,
+    moe_acc: &GpuTensor<f32>,
+    residual: &GpuTensor<f32>,
+    gamma1: &GpuTensor<f32>,
+    gamma2: &GpuTensor<f32>,
+    gamma3: &GpuTensor<f32>,
+    hidden_size: u32,
+    eps: f32,
+    layer_scalar: f32,
+) -> Result<(), DeviceError> {
+    let f = cache.get_or_compile(device, FUSED_MOE_COMBINE_SRC, "fused_moe_combine")?;
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (32.min(hidden_size), 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut output_scaled.data).arg(&mut output.data)
+            .arg(&dense_out.data).arg(&moe_acc.data).arg(&residual.data)
+            .arg(&gamma1.data).arg(&gamma2.data).arg(&gamma3.data)
+            .arg(&hidden_size).arg(&eps).arg(&layer_scalar)
+            .launch(cfg))?;
+    }
+    Ok(())
+}
+
+// Converts Q4_K/Q8_0 expert weights from (n, kb) to (kb, n) layout for
+// coalesced memory access. Consecutive warp threads then hit adjacent blocks
+// instead of blocks N*block_bytes apart.
+
+const REORDER_BLOCKS_SRC: &str = r#"
+extern "C" __global__ void reorder_blocks(
+    unsigned char* __restrict__ dst,
+    const unsigned char* __restrict__ src,
+    int N, int num_k_blocks, int block_bytes,
+    int num_experts, int expert_bytes
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int blocks_per_expert = N * num_k_blocks;
+    int total = num_experts * blocks_per_expert;
+    if (idx >= total) return;
+
+    int expert = idx / blocks_per_expert;
+    int local = idx % blocks_per_expert;
+    int n = local / num_k_blocks;
+    int kb = local % num_k_blocks;
+
+    long long base = (long long)expert * expert_bytes;
+    long long old_off = base + (long long)(n * num_k_blocks + kb) * block_bytes;
+    long long new_off = base + (long long)(kb * N + n) * block_bytes;
+
+    // Copy one block
+    for (int b = 0; b < block_bytes; b++) {
+        dst[new_off + b] = src[old_off + b];
+    }
+}
+"#;
+
+/// Reorder expert weight blocks from column-major (n, kb) to group-major (kb, n).
+/// Handles multiple experts concatenated in the buffer.
+/// Runs once at engine startup. Returns the reordered buffer.
+pub fn reorder_expert_blocks(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    src: &GpuTensor<u8>,
+    n: u32,            // output columns per expert
+    num_k_blocks: u32, // K / block_elements per expert
+    block_bytes: u32,  // 144 for Q4_K, 34 for Q8_0, 22 for Q5_0
+) -> Result<GpuTensor<u8>, DeviceError> {
+    let expert_blocks = n * num_k_blocks;
+    let expert_bytes = (expert_blocks * block_bytes) as usize;
+    let num_experts = src.numel / expert_bytes;
+    let total_blocks = num_experts as u32 * expert_blocks;
+
+    let dst_data = device.alloc_zeros::<u8>(src.numel)?;
+    let mut dst = GpuTensor {
+        data: dst_data,
+        shape: src.shape.clone(),
+        dtype: src.dtype,
+        numel: src.numel,
+    };
+
+    let f = cache.get_or_compile(device, REORDER_BLOCKS_SRC, "reorder_blocks")?;
+    let threads = 256u32;
+    let grid = (total_blocks + threads - 1) / threads;
+    let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+
+    unsafe {
+        launch_err!(device.stream.launch_builder(&f)
+            .arg(&mut dst.data).arg(&src.data)
+            .arg(&(n as i32)).arg(&(num_k_blocks as i32)).arg(&(block_bytes as i32))
+            .arg(&(num_experts as i32)).arg(&(expert_bytes as i32))
+            .launch(cfg))?;
+    }
+    device.synchronize()?;
+    Ok(dst)
 }
 
 #[cfg(test)]

@@ -251,7 +251,7 @@ impl MoEGenerationEngine {
             device.htod_copy(&[kv.len], &mut b.cache_len_buf)?;
             crate::kv_cache::decode_attention_flash_device_len_window(
                 &self.cache, device, &b.q_n, kv, &mut b.attn_out,
-                num_q_heads, num_kv_heads, d, &b.cache_len_buf, window)?;
+                num_q_heads, num_kv_heads, d, &b.cache_len_buf, window, self.config.final_logit_softcapping, 1.0)?;
 
             // O projection: F16 HGEMM
             crate::fp16::cast_f32_to_f16(&self.cache, device, &b.attn_out, &mut b.attn_out_f16)?;
@@ -333,11 +333,8 @@ impl MoEGenerationEngine {
                     &b.expert_geglu_f16, &b.expert_down_gpu, &mut b.expert_out_f16, 1, h, moe_dim)?;
                 crate::fp16::cast_f16_to_f32(&self.cache, device, &b.expert_out_f16, &mut b.expert_out)?;
 
-                // Accumulate
-                ops::mul_scalar(&self.cache, device, &b.expert_out, &mut b.expert_weighted, weight)?;
-                ops::add(&self.cache, device, &b.moe_accumulated, &b.expert_weighted, &mut b.expert_new_acc)?;
-                // Swap: accumulated = new_acc (pointer swap would be ideal, but copy for now)
-                ops::mul_scalar(&self.cache, device, &b.expert_new_acc, &mut b.moe_accumulated, 1.0)?;
+                // Fused axpy: acc += weight * expert_out  (was 3 kernels)
+                ops::axpy(&self.cache, device, &mut b.moe_accumulated, &b.expert_out, weight)?;
             }
 
             // Combine dense + MoE
