@@ -2252,8 +2252,7 @@ mod tests {
             w_gate: GpuTensor::from_host(&dev, &unfused.w_gate.to_host(&dev).unwrap(), unfused.w_gate.shape.clone(), DType::F32).unwrap(),
             w_up: GpuTensor::from_host(&dev, &unfused.w_up.to_host(&dev).unwrap(), unfused.w_up.shape.clone(), DType::F32).unwrap(),
             w_down: GpuTensor::from_host(&dev, &unfused.w_down.to_host(&dev).unwrap(), unfused.w_down.shape.clone(), DType::F32).unwrap(),
-            bq: None, bk: None, bv: None, q_norm: None, k_norm: None,
-            pre_ffn_norm: None, post_ffn_norm: None, layer_scalar: None,
+            bq: None, bk: None, bv: None,
             wqkv: None, bqkv: None, w_gate_up: None,
         };
         fused.fuse_projections(&dev).unwrap();

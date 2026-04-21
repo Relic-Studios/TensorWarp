@@ -13,6 +13,58 @@ use crate::sampling;
 use crate::tensor::GpuTensor;
 use crate::transformer::{GemmaConfig, GemmaLayerAttentionConfig};
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// Track the first layer in the current forward pass where NaN appeared.
+/// u32::MAX = no NaN yet this pass. Reset at the start of each forward.
+static NAN_FIRST_LAYER: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Diagnostic: readback the post-combine residual and log the first layer
+/// that produces any NaN. Env-gated on `DIDYMUS_PERLAYER_NAN` so the
+/// hot path pays zero cost when diagnostics aren't requested.
+///
+/// When the env var is set, readback happens every layer. The readback
+/// is a ~2816 f32 copy → ~11 KB per layer, ~330 KB per token. Slow for
+/// production, fine for running a handful of prompts to localize the
+/// cliff.
+fn layer_nan_check(
+    device: &WarpDevice,
+    residual: &GpuTensor<f32>,
+    pos: u32,
+    layer_idx: usize,
+) {
+    if std::env::var_os("DIDYMUS_PERLAYER_NAN").is_none() {
+        return;
+    }
+    let Ok(host) = residual.to_host(device) else { return };
+    let nan_count = host.iter().filter(|x| x.is_nan()).count();
+    if nan_count == 0 {
+        return;
+    }
+    // Log every NaN-carrying layer the first time we see it in this pass,
+    // but only the FIRST layer gets the loud banner — cascading NaN
+    // through later layers doesn't help diagnose root cause.
+    let prev = NAN_FIRST_LAYER.load(Ordering::Relaxed);
+    if prev == u32::MAX {
+        NAN_FIRST_LAYER.store(layer_idx as u32, Ordering::Relaxed);
+        log::warn!(
+            "NaN cliff: pos={} FIRST layer with NaN = {} ({}/{} elements NaN)",
+            pos, layer_idx, nan_count, host.len(),
+        );
+    } else {
+        log::debug!(
+            "NaN cascade: pos={} layer={} ({}/{} NaN, first was layer {})",
+            pos, layer_idx, nan_count, host.len(), prev,
+        );
+    }
+}
+
+/// Reset the per-pass NaN tracker. Call once at the top of forward_decode
+/// so each pass gets its own clean window for diagnosis.
+fn reset_nan_tracker() {
+    NAN_FIRST_LAYER.store(u32::MAX, Ordering::Relaxed);
+}
+
 /// Per-layer weights — F16 for attention/MLP, Q4 for experts.
 pub struct MoEQ4Layer {
     // Norms (F32)
@@ -59,7 +111,9 @@ pub struct MoEQ4Layer {
 }
 
 /// Pre-allocated decode buffers — fused RMSNorm→F16 + GemmEx F16→F32 eliminates ~236 cast kernels/token.
-struct Buffers {
+/// Fields are intentionally private; external callers hold this as an
+/// opaque handle via [`MoEQ4Engine::allocate_buffers_for_step`].
+pub struct Buffers {
     // F32 hidden state pipeline
     hidden: GpuTensor<f32>,
     hidden_scaled: GpuTensor<f32>,
@@ -123,10 +177,55 @@ pub struct MoEQ4Engine {
     pub config: GemmaConfig,
     pub layer_configs: Vec<GemmaLayerAttentionConfig>,
     pub embed_tokens: GpuTensor<half::f16>,
+    /// Optional untied output projection. Present when the checkpoint
+    /// explicitly stores `lm_head.weight` (e.g. after PEFT
+    /// merge_and_unload on a resized-vocab model). When `None`, the LM
+    /// head falls back to `embed_tokens` (standard tied-embeddings
+    /// Gemma layout).
+    pub lm_head: Option<GpuTensor<half::f16>>,
     pub final_norm: GpuTensor<f32>,
     pub cache: KernelCache,
     pub layers: Vec<MoEQ4Layer>,
     pub weights_reordered: bool,
+}
+
+impl MoEQ4Engine {
+    /// The weight used for the output LM-head gemm. Untied lm_head when
+    /// available, else the tied embedding matrix.
+    #[inline]
+    fn output_weight(&self) -> &GpuTensor<half::f16> {
+        self.lm_head.as_ref().unwrap_or(&self.embed_tokens)
+    }
+}
+
+/// Layer-tap descriptor for [`MoEQ4Engine::step_from_embedded_with_taps`].
+///
+/// Captures the post-combine residual at the requested layers during one
+/// decode step. Used by the CSM bridge projector, which feeds Gemma hidden
+/// states from layers 15/20/25 into a Perceiver resampler.
+///
+/// Each tapped layer costs one DtoH copy of `hidden_size` floats; budget
+/// for ~3 taps per yield, not per token.
+pub struct LayerTaps {
+    /// Layer indices (0-based) to capture. Order doesn't matter; lookup is
+    /// `Vec::contains` so prefer small lists (e.g. 3 layers).
+    pub want: Vec<usize>,
+    /// Captured (layer_idx, hidden_state) pairs, in the order layers were
+    /// encountered during the forward pass.
+    pub captured: Vec<(usize, Vec<f32>)>,
+}
+
+impl LayerTaps {
+    pub fn new(layers: &[usize]) -> Self {
+        Self { want: layers.to_vec(), captured: Vec::with_capacity(layers.len()) }
+    }
+}
+
+/// Result of [`MoEQ4Engine::step_from_embedded_with_taps`]: logits over
+/// the text vocab plus the per-layer hidden states requested via taps.
+pub struct StepWithTaps {
+    pub logits: Vec<f32>,
+    pub layer_hidden: Vec<(usize, Vec<f32>)>,
 }
 
 impl MoEQ4Engine {
@@ -203,6 +302,7 @@ impl MoEQ4Engine {
     fn forward_decode(
         &self, device: &WarpDevice, b: &mut Buffers,
         kv_caches: &mut [LayerKVCache], pos: u32,
+        taps: &mut Option<LayerTaps>,
     ) -> Result<Vec<f32>, DeviceError> {
         let h = self.config.hidden_size;
         let ffn = self.config.ffn_dim;
@@ -213,6 +313,7 @@ impl MoEQ4Engine {
         // Embedding scaling: x *= sqrt(hidden_size)
         ops::mul_scalar(&self.cache, device, &b.hidden, &mut b.hidden_scaled, (h as f32).sqrt())?;
 
+        reset_nan_tracker();
         let mut last_cache_len = u32::MAX;
         for (i, layer) in self.layers.iter().enumerate() {
             let lc = &self.layer_configs[i];
@@ -361,12 +462,34 @@ impl MoEQ4Engine {
                 &b.dense_out, &b.moe_accumulated, &b.residual,
                 &layer.post_ffn_norm_1, &layer.post_ffn_norm_2, &layer.post_ffn_norm,
                 h, self.config.norm_eps, layer.layer_scalar)?;
+
+            // ── Per-layer NaN detection (diagnostic) ───────────────────
+            // Gated on DIDYMUS_PERLAYER_NAN. When enabled, readback the
+            // post-combine residual every layer and log the first index
+            // that poisons the state. Tells us whether the NaN cliff
+            // lives near the input (attention/QK projection failure),
+            // mid-stack (accumulated drift), or near the output (final
+            // norm / LM head). Cost: one DtoH of ~2816 f32 per layer per
+            // step — negligible for diagnostics, off by default.
+            layer_nan_check(device, &b.output_scaled, pos, i);
+
+            // ── Optional layer tap: capture post-combine residual to host
+            // for callers that need intermediate hidden states (CSM bridge
+            // projector reads layers 15/20/25). Costs one DtoH copy of
+            // `hidden_size` floats per tapped layer — fine for the bridge's
+            // ~once-per-yield rate; avoid for hot-path-only generation.
+            if let Some(t) = taps.as_mut() {
+                if t.want.contains(&i) {
+                    let h_vec = b.output_scaled.to_host(device)?;
+                    t.captured.push((i, h_vec));
+                }
+            }
         }
 
         // ── LM head (fused: rmsnorm_f16out + GemmEx — saves 2 casts) ──
         let vocab = self.config.vocab_size;
         ops::rmsnorm_f16out(&self.cache, device, &b.output_scaled, &self.final_norm, &mut b.lm_normed_f16, h, self.config.norm_eps)?;
-        crate::cublas_gemm::gemm_cublas_f16in_f32out_transB(device, &b.lm_normed_f16, &self.embed_tokens, &mut b.lm_logits, 1, vocab, h)?;
+        crate::cublas_gemm::gemm_cublas_f16in_f32out_transB(device, &b.lm_normed_f16, self.output_weight(), &mut b.lm_logits, 1, vocab, h)?;
 
         if self.config.final_logit_softcapping > 0.0 {
             ops::logit_softcap(&self.cache, device, &b.lm_logits, &mut b.lm_capped, self.config.final_logit_softcapping)?;
@@ -539,12 +662,179 @@ impl MoEQ4Engine {
         let h = self.config.hidden_size;
         let vocab = self.config.vocab_size;
         ops::rmsnorm_f16out(&self.cache, device, &b.output_scaled, &self.final_norm, &mut b.lm_normed_f16, h, self.config.norm_eps)?;
-        crate::cublas_gemm::gemm_cublas_f16in_f32out_transB(device, &b.lm_normed_f16, &self.embed_tokens, &mut b.lm_logits, 1, vocab, h)?;
+        crate::cublas_gemm::gemm_cublas_f16in_f32out_transB(device, &b.lm_normed_f16, self.output_weight(), &mut b.lm_logits, 1, vocab, h)?;
         if self.config.final_logit_softcapping > 0.0 {
             ops::logit_softcap(&self.cache, device, &b.lm_logits, &mut b.lm_capped, self.config.final_logit_softcapping)?;
             return b.lm_capped.to_host(device);
         }
         b.lm_logits.to_host(device)
+    }
+
+    /// Like `generate`, but invokes a user-supplied callback after each
+    /// token's forward pass with the current residual stream (`output_scaled`),
+    /// the token's sequence position, and the token ID that was just
+    /// consumed (the prompt token during prefill, or the just-sampled
+    /// generated token during decode).
+    ///
+    /// The callback runs on the host after the GPU work for that token
+    /// completes but before the next iteration — a safe place to launch
+    /// activation-capture kernels that read the residual AND to emit
+    /// streaming per-token deltas to downstream consumers.
+    ///
+    /// Returning an error from the callback aborts generation — useful
+    /// for cooperative cancellation when a streaming consumer drops the
+    /// output channel.
+    ///
+    /// The callback MUST NOT mutate engine state or issue kernels that get
+    /// captured into a graph — it runs strictly outside graph capture.
+    pub fn generate_with_hook<F>(
+        &mut self,
+        device: &WarpDevice,
+        prompt_ids: &[i32],
+        gen_config: &GenerateConfig,
+        max_seq_len: u32,
+        mut on_residual: F,
+    ) -> Result<GenerationResult, DeviceError>
+    where
+        F: FnMut(&GpuTensor<f32>, u32, i32) -> Result<(), DeviceError>,
+    {
+        self.reorder_expert_weights(device)?;
+        let h = self.config.hidden_size;
+        let mut kv_caches: Vec<LayerKVCache> = self
+            .layer_configs
+            .iter()
+            .map(|lc| {
+                let kv_dim = self.config.kv_dim_for_layer(lc);
+                let cl = if lc.window_size > 0 {
+                    lc.window_size.min(max_seq_len)
+                } else {
+                    max_seq_len
+                };
+                LayerKVCache::new(device, cl, kv_dim).unwrap()
+            })
+            .collect();
+
+        let mut bufs = self.allocate_buffers(device)?;
+        let mut ids_gpu = GpuTensor::from_host(
+            device,
+            &[0i32],
+            Shape::from_static(&[1]),
+            DType::I32,
+        )?;
+
+        // Prefill with hooks.
+        let ps = std::time::Instant::now();
+        let mut last_logits = Vec::new();
+        for (t, &tok) in prompt_ids.iter().enumerate() {
+            device.htod_copy(&[tok], &mut ids_gpu.data)?;
+            sampling::embedding_f16(
+                &self.cache,
+                device,
+                &self.embed_tokens,
+                &ids_gpu,
+                &mut bufs.hidden,
+                1,
+                h,
+            )?;
+            last_logits = self.forward_decode(device, &mut bufs, &mut kv_caches, t as u32, &mut None)?;
+            // Hook: residual is now in bufs.output_scaled. Third arg is
+            // the prompt token we just processed.
+            on_residual(&bufs.output_scaled, t as u32, tok)?;
+        }
+        device.synchronize()?;
+        let pt = ps.elapsed();
+
+        // Decode with EAGER forward_decode — simple path that works
+        // correctly for arbitrary prefill lengths. Graph-replay variant
+        // hit `CUDA_ERROR_INVALID_VALUE` on long ForgeCode-style prompts;
+        // reverting to eager prioritises correctness over the ~2x speed
+        // improvement (fast path lives in `generate()` for non-hook users).
+        let ds = std::time::Instant::now();
+        let mut gen = Vec::new();
+        let mut pos = prompt_ids.len() as u32;
+        let seed: u64 = prompt_ids.iter().fold(42u64, |a, &t| {
+            a.wrapping_mul(6364136223846793005).wrapping_add(t as u64)
+        });
+
+        // Env-gated forensic recorder. Zero cost when DIDYMUS_FORENSICS_DIR
+        // is unset. Paired with the graph-replay recorder on the same
+        // prompt hash so both paths land in one JSONL.
+        let forensic = crate::forensics::new_run_recorder(seed);
+        let prompt_len = prompt_ids.len();
+
+        for step in 0..gen_config.max_tokens {
+            let next = sample_token(&last_logits, gen_config, &gen, seed.wrapping_add(step as u64));
+            if let Some(eos) = gen_config.eos_token_id {
+                if next == eos {
+                    break;
+                }
+            }
+            gen.push(next);
+            if !gen_config.stop_sequences.is_empty()
+                && matches_stop_sequence(&gen, &gen_config.stop_sequences)
+            {
+                break;
+            }
+
+            device.htod_copy(&[next], &mut ids_gpu.data)?;
+            sampling::embedding_f16(
+                &self.cache,
+                device,
+                &self.embed_tokens,
+                &ids_gpu,
+                &mut bufs.hidden,
+                1,
+                h,
+            )?;
+            last_logits = self.forward_decode(device, &mut bufs, &mut kv_caches, pos, &mut None)?;
+
+            if let Some(rec) = forensic.as_ref() {
+                rec.record_eager_step(
+                    device, step, pos, next, prompt_len,
+                    &last_logits, &bufs.output_scaled,
+                );
+            }
+
+            // NaN guard — forward_decode occasionally produces an all-NaN
+            // residual mid-generation (observed around step 55–60 on Gemma 4
+            // MoE Q4). Once the residual is fully poisoned every subsequent
+            // token sampler lands on `<unusedNNNN>` at vocab-1. Stop cleanly
+            // here so the caller gets the valid prefix instead of a tail of
+            // reserved-token spam. Forensics still record the poisoned step
+            // so the root-cause hunt has the transition to look at.
+            if last_logits.iter().all(|x| x.is_nan()) {
+                log::warn!(
+                    "forward_decode produced all-NaN logits at step={} pos={}; truncating generation",
+                    step, pos,
+                );
+                break;
+            }
+
+            // Hook — residual is in bufs.output_scaled after the forward
+            // pass. on_residual can return error to abort generation.
+            on_residual(&bufs.output_scaled, pos, next)?;
+
+            pos += 1;
+        }
+
+        let dt = ds.elapsed();
+        let kb: usize = kv_caches
+            .iter()
+            .map(|kv| kv.k.size_bytes() + kv.v.size_bytes())
+            .sum();
+        Ok(GenerationResult {
+            tokens: gen.clone(),
+            prefill_time: pt,
+            decode_time: dt,
+            tokens_generated: gen.len(),
+            prefill_tokens: prompt_ids.len(),
+            tokens_per_sec: if dt.as_secs_f64() > 0.0 {
+                gen.len() as f64 / dt.as_secs_f64()
+            } else {
+                0.0
+            },
+            kv_cache_memory_bytes: kb,
+        })
     }
 
     pub fn generate(
@@ -569,7 +859,7 @@ impl MoEQ4Engine {
         for (t, &tok) in prompt_ids.iter().enumerate() {
             device.htod_copy(&[tok], &mut ids_gpu.data)?;
             sampling::embedding_f16(&self.cache, device, &self.embed_tokens, &ids_gpu, &mut bufs.hidden, 1, h)?;
-            last_logits = self.forward_decode(device, &mut bufs, &mut kv_caches, t as u32)?;
+            last_logits = self.forward_decode(device, &mut bufs, &mut kv_caches, t as u32, &mut None)?;
         }
         device.synchronize()?;
         let pt = ps.elapsed();
@@ -641,6 +931,11 @@ impl MoEQ4Engine {
         )?;
         eprintln!("[moe] CUDA graph captured!");
 
+        // Env-gated forensic recorder paired by prompt hash to the eager
+        // path. Zero cost when DIDYMUS_FORENSICS_DIR is unset.
+        let forensic = crate::forensics::new_run_recorder(seed);
+        let prompt_len = prompt_ids.len();
+
         // ── Decode loop with graph replay ──
         for step in 1..gen_config.max_tokens {
             let next = sample_token(&last_logits, gen_config, &gen, seed.wrapping_add(step as u64));
@@ -658,8 +953,24 @@ impl MoEQ4Engine {
                 graph_device.htod_copy(&[new_len], &mut bufs.cache_len_bufs[i])?;
             }
 
+            // Snapshot kv lens fed into this replay for forensic pairing.
+            let kv_lens_in: Vec<u32> = kv_caches.iter().map(|kv| kv.len).collect();
+
             // Replay graph (embedding + all transformer layers)
-            graph.replay()?;
+            match graph.replay() {
+                Ok(()) => {
+                    if let Some(rec) = forensic.as_ref() {
+                        rec.record_graph_replay_step(step, pos, prompt_len, &kv_lens_in, None);
+                    }
+                }
+                Err(e) => {
+                    if let Some(rec) = forensic.as_ref() {
+                        let msg = format!("{}", e);
+                        rec.record_graph_replay_step(step, pos, prompt_len, &kv_lens_in, Some(&msg));
+                    }
+                    return Err(e);
+                }
+            }
 
             // LM head (outside graph)
             last_logits = self.run_lm_head(&graph_device, &mut bufs)?;
@@ -679,5 +990,140 @@ impl MoEQ4Engine {
             tokens_per_sec: if dt.as_secs_f64() > 0.0 { gen.len() as f64 / dt.as_secs_f64() } else { 0.0 },
             kv_cache_memory_bytes: kb,
         })
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    //  Step-mode API — for CSM / Moshi-style models that need to inject
+    //  custom pre-computed embeddings (frame embeddings summed across 32
+    //  audio codebooks + 1 text slot, rather than a single token embed).
+    //
+    //  Usage:
+    //    let mut bufs = engine.allocate_buffers_for_step(dev)?;
+    //    let mut kv = engine.allocate_kv_caches_for_step(dev, max_seq_len)?;
+    //    engine.prep_for_step(dev)?;                    // one-time expert reorder
+    //    for pos in 0..N {
+    //        let hidden: Vec<f32> = my_frame_embed(...);  // [hidden_size]
+    //        let logits = engine.step_from_embedded(dev, &hidden, &mut bufs,
+    //                                                &mut kv, pos)?;
+    //        let residual = engine.read_last_residual(dev, &bufs)?;
+    //        // ... sample cb0 from logits OR project residual with custom head
+    //    }
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Allocate the persistent scratch buffers used by [`step_from_embedded`].
+    /// Hold one set per generation stream.
+    pub fn allocate_buffers_for_step(
+        &self,
+        device: &WarpDevice,
+    ) -> Result<Buffers, DeviceError> {
+        self.allocate_buffers(device)
+    }
+
+    /// Allocate per-layer KV caches sized for `max_seq_len`. Respects the
+    /// sliding-window pattern configured on each layer.
+    pub fn allocate_kv_caches_for_step(
+        &self,
+        device: &WarpDevice,
+        max_seq_len: u32,
+    ) -> Result<Vec<LayerKVCache>, DeviceError> {
+        self.layer_configs
+            .iter()
+            .map(|lc| {
+                let kv_dim = self.config.kv_dim_for_layer(lc);
+                let cl = if lc.window_size > 0 {
+                    lc.window_size.min(max_seq_len)
+                } else {
+                    max_seq_len
+                };
+                LayerKVCache::new(device, cl, kv_dim)
+            })
+            .collect()
+    }
+
+    /// One-time setup — groups MoE expert weights into group-major layout.
+    /// MUST be called once before the first `step_from_embedded`. Idempotent
+    /// (repeated calls are cheap no-ops after the first).
+    pub fn prep_for_step(&mut self, device: &WarpDevice) -> Result<(), DeviceError> {
+        self.reorder_expert_weights(device)
+    }
+
+    /// Run one backbone decode step from a pre-computed hidden state.
+    ///
+    /// `hidden_host` is length `hidden_size`. It's copied to GPU and fed
+    /// into the transformer stack in place of the usual token-embed
+    /// lookup — the entry point Moshi / CSM need for their multi-slot
+    /// frame embeddings.
+    ///
+    /// Returns the LM-head logits over the text vocab. For the CSM audio
+    /// head projection, call [`read_last_residual`] instead / in addition.
+    pub fn step_from_embedded(
+        &self,
+        device: &WarpDevice,
+        hidden_host: &[f32],
+        bufs: &mut Buffers,
+        kv_caches: &mut [LayerKVCache],
+        pos: u32,
+    ) -> Result<Vec<f32>, DeviceError> {
+        let h = self.config.hidden_size as usize;
+        if hidden_host.len() != h {
+            return Err(DeviceError::Launch(format!(
+                "step_from_embedded: expected hidden len {h}, got {}",
+                hidden_host.len()
+            )));
+        }
+        // Copy host embedding into the GPU's hidden buffer.
+        device.htod_copy(hidden_host, &mut bufs.hidden.data)?;
+        let logits = self.forward_decode(device, bufs, kv_caches, pos, &mut None)?;
+        Ok(logits)
+    }
+
+    /// Like [`step_from_embedded`] but also captures the post-combine
+    /// residual at each layer index in `tap_layers`. Used by the CSM
+    /// bridge projector for multi-layer hidden state extraction.
+    ///
+    /// Layers outside `0..config.num_layers` are silently ignored.
+    pub fn step_from_embedded_with_taps(
+        &self,
+        device: &WarpDevice,
+        hidden_host: &[f32],
+        bufs: &mut Buffers,
+        kv_caches: &mut [LayerKVCache],
+        pos: u32,
+        tap_layers: &[usize],
+    ) -> Result<StepWithTaps, DeviceError> {
+        let h = self.config.hidden_size as usize;
+        if hidden_host.len() != h {
+            return Err(DeviceError::Launch(format!(
+                "step_from_embedded_with_taps: expected hidden len {h}, got {}",
+                hidden_host.len()
+            )));
+        }
+        device.htod_copy(hidden_host, &mut bufs.hidden.data)?;
+        let mut taps = Some(LayerTaps::new(tap_layers));
+        let logits = self.forward_decode(device, bufs, kv_caches, pos, &mut taps)?;
+        let layer_hidden = taps.expect("just constructed Some").captured;
+        Ok(StepWithTaps { logits, layer_hidden })
+    }
+
+    /// Read the post-last-layer residual (`output_scaled`) after the most
+    /// recent `step_*` call. This is the hidden state the CSM depth decoder
+    /// consumes as `backbone_last_hidden_state`.
+    pub fn read_last_residual(
+        &self,
+        device: &WarpDevice,
+        bufs: &Buffers,
+    ) -> Result<Vec<f32>, DeviceError> {
+        bufs.output_scaled.to_host(device)
+    }
+
+    /// Run the LM head (RMSNorm + shared-embedding projection + optional
+    /// softcap) on the current residual. Exposed so callers can re-run it
+    /// after inspecting the residual without re-running the full decode.
+    pub fn run_lm_head_from_residual(
+        &self,
+        device: &WarpDevice,
+        bufs: &mut Buffers,
+    ) -> Result<Vec<f32>, DeviceError> {
+        self.run_lm_head(device, bufs)
     }
 }

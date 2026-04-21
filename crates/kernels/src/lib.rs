@@ -15,6 +15,7 @@
 
 pub mod attention;
 pub mod attention_ext;
+pub mod cognitive;
 pub mod autotune;
 pub mod batch;
 pub mod bench;
@@ -33,6 +34,7 @@ pub mod edge_ops;
 pub mod elementwise;
 pub mod engine;
 pub mod extended_ops;
+pub mod forensics;
 pub mod fp16;
 pub mod gather;
 pub mod gemm;

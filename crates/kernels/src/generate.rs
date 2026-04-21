@@ -2967,6 +2967,219 @@ impl DequantF16GenerationEngine {
             + self.final_norm.size_bytes()
             + self.lm_head.size_bytes()
     }
+
+    // ─── step-mode API for paired-residual capture ────────────────────
+    //
+    // Used by CSM-TensorWarp's LlamaSidecar. Additive — existing callers
+    // unaffected.
+
+    /// Prefill that also returns the post-final-norm residual. The
+    /// residual is what CSM's depth decoder consumes as
+    /// `backbone_last_hidden_state` — the same tensor the LM head is
+    /// about to project to logits.
+    fn forward_prefill_with_residual(
+        &self,
+        device: &WarpDevice,
+        input_ids: &[i32],
+        kv_cache: &mut ModelKVCache,
+        q_layers: &[QuantizedBlockWeights],
+    ) -> Result<(GpuTensor<f32>, GpuTensor<f32>), DeviceError> {
+        let seq_len = input_ids.len() as u32;
+        let h = self.config.hidden_size;
+
+        let ids = GpuTensor::from_host(
+            device, input_ids,
+            Shape::from_static(&[seq_len as usize]), DType::I32,
+        )?;
+        let mut hidden = GpuTensor::<f32>::zeros(
+            device,
+            Shape::from_static(&[seq_len as usize, h as usize]),
+            DType::F32,
+        )?;
+        sampling::embedding(
+            &self.cache, device, &self.embed_tokens, &ids,
+            &mut hidden, seq_len, h,
+        )?;
+
+        for (i, layer) in q_layers.iter().enumerate() {
+            hidden = crate::transformer::transformer_block_prefill_q4(
+                &self.cache, device, &hidden, layer, &self.config,
+                &mut kv_cache.layers[i], 1, seq_len, 0,
+            )?;
+        }
+
+        let mut normed = GpuTensor::<f32>::zeros(
+            device,
+            Shape::from_static(&[seq_len as usize, h as usize]),
+            DType::F32,
+        )?;
+        ops::rmsnorm(
+            &self.cache, device, &hidden, &self.final_norm,
+            &mut normed, h, self.config.norm_eps,
+        )?;
+
+        let mut logits = GpuTensor::<f32>::zeros(
+            device,
+            Shape::from_static(&[seq_len as usize, self.vocab_size as usize]),
+            DType::F32,
+        )?;
+        ops::gemm(
+            &self.cache, device, &normed, &self.lm_head, &mut logits,
+            seq_len, self.vocab_size, h,
+        )?;
+        Ok((logits, normed))
+    }
+
+    /// Decode that also returns the post-final-norm residual.
+    fn forward_decode_with_residual(
+        &self,
+        device: &WarpDevice,
+        token_id: i32,
+        kv_cache: &mut ModelKVCache,
+        pos: u32,
+    ) -> Result<(GpuTensor<f32>, GpuTensor<f32>), DeviceError> {
+        let h = self.config.hidden_size;
+
+        let ids = GpuTensor::from_host(
+            device, &[token_id],
+            Shape::from_static(&[1]), DType::I32,
+        )?;
+        let mut hidden = GpuTensor::<f32>::zeros(
+            device,
+            Shape::from_static(&[1, h as usize]),
+            DType::F32,
+        )?;
+        sampling::embedding(
+            &self.cache, device, &self.embed_tokens, &ids,
+            &mut hidden, 1, h,
+        )?;
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            hidden = crate::transformer::transformer_block_decode_q4_f16(
+                &self.cache, device, &hidden, layer, &self.config,
+                &mut kv_cache.layers[i], 1, pos,
+            )?;
+        }
+
+        let mut normed = GpuTensor::<f32>::zeros(
+            device,
+            Shape::from_static(&[1, h as usize]),
+            DType::F32,
+        )?;
+        ops::rmsnorm(
+            &self.cache, device, &hidden, &self.final_norm,
+            &mut normed, h, self.config.norm_eps,
+        )?;
+
+        let mut logits = GpuTensor::<f32>::zeros(
+            device,
+            Shape::from_static(&[1, self.vocab_size as usize]),
+            DType::F32,
+        )?;
+        ops::gemm(
+            &self.cache, device, &normed, &self.lm_head, &mut logits,
+            1, self.vocab_size, h,
+        )?;
+        Ok((logits, normed))
+    }
+
+    /// Like [`generate_with_cache`] but fires a user-supplied hook with
+    /// the post-final-norm residual after each forward pass. Mirrors the
+    /// MoE engine's `generate_with_hook` API.
+    ///
+    /// Callback signature: `(residual, pos, token_id)`.
+    /// - `residual` — `[1, hidden_size]` on-device (prefill hook fires once
+    ///   per prompt token; the last call carries the prefill residual).
+    /// - `pos` — absolute position in the sequence.
+    /// - `token_id` — the token just processed (prompt token during
+    ///   prefill, sampled token during decode).
+    ///
+    /// Returning an error from the callback aborts generation.
+    pub fn generate_with_cache_hook<F>(
+        &self,
+        device: &WarpDevice,
+        prompt_ids: &[i32],
+        gen_config: &GenerateConfig,
+        max_seq_len: u32,
+        q_layers: &[QuantizedBlockWeights],
+        mut on_residual: F,
+    ) -> Result<GenerationResult, DeviceError>
+    where
+        F: FnMut(&GpuTensor<f32>, u32, i32) -> Result<(), DeviceError>,
+    {
+        let kv_dim = self.config.kv_dim();
+        let num_layers = self.layers.len() as u32;
+        let vocab = self.vocab_size as usize;
+
+        let mut kv_cache = ModelKVCache::new(device, num_layers, max_seq_len, kv_dim)?;
+
+        let prefill_start = std::time::Instant::now();
+        let (logits, residual_prefill) =
+            self.forward_prefill_with_residual(device, prompt_ids, &mut kv_cache, q_layers)?;
+        device.synchronize()?;
+        let prefill_time = prefill_start.elapsed();
+
+        // Fire the hook for the final prefill position only — the residual
+        // we return covers the whole sequence at seq_len × hidden; callers
+        // that want per-position state can slice. Most consumers (CSM
+        // sidecar) only care about the last position, so this is what we
+        // surface.
+        let prompt_len = prompt_ids.len();
+        let last_prompt_tok = *prompt_ids.last().unwrap_or(&0);
+        on_residual(&residual_prefill, (prompt_len - 1) as u32, last_prompt_tok)?;
+
+        let all_logits = logits.to_host(device)?;
+        let mut last_logits =
+            all_logits[(prompt_len - 1) * vocab..prompt_len * vocab].to_vec();
+
+        let decode_start = std::time::Instant::now();
+        let mut generated = Vec::new();
+        let mut pos = prompt_len as u32;
+
+        let base_seed: u64 = prompt_ids.iter().fold(42u64, |acc, &t| {
+            acc.wrapping_mul(6364136223846793005).wrapping_add(t as u64)
+        });
+
+        for step in 0..gen_config.max_tokens {
+            let rng_seed = base_seed.wrapping_add(step as u64);
+            let next_token = sample_token(&last_logits, gen_config, &generated, rng_seed);
+
+            if let Some(eos) = gen_config.eos_token_id {
+                if next_token == eos { break; }
+            }
+
+            generated.push(next_token);
+
+            if !gen_config.stop_sequences.is_empty()
+                && matches_stop_sequence(&generated, &gen_config.stop_sequences)
+            {
+                break;
+            }
+
+            let (logits, residual) =
+                self.forward_decode_with_residual(device, next_token, &mut kv_cache, pos)?;
+            device.synchronize()?;
+
+            on_residual(&residual, pos, next_token)?;
+
+            last_logits = logits.to_host(device)?;
+            pos += 1;
+        }
+
+        let decode_time = decode_start.elapsed();
+
+        Ok(GenerationResult {
+            tokens: generated.clone(),
+            prefill_time,
+            decode_time,
+            tokens_generated: generated.len(),
+            prefill_tokens: prompt_len,
+            tokens_per_sec: if decode_time.as_secs_f64() > 0.0 {
+                generated.len() as f64 / decode_time.as_secs_f64()
+            } else { 0.0 },
+            kv_cache_memory_bytes: kv_cache.memory_bytes(),
+        })
+    }
 }
 
 /// Estimate weight memory for f32 vs Q4_0 for a given config.

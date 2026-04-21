@@ -396,7 +396,7 @@ pub fn load_moe_gguf<P: AsRef<Path>>(
 
     eprintln!("[gguf] All weights loaded and quantized to TW-Marlin!");
     Ok(MoEQ4Engine {
-        config, layer_configs, embed_tokens: embed_f16, final_norm,
+        config, layer_configs, embed_tokens: embed_f16, lm_head: None, final_norm,
         cache: KernelCache::new(), layers, weights_reordered: false,
     })
 }

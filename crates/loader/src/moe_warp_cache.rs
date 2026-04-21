@@ -244,7 +244,7 @@ pub fn load_moe_cache(
     eprintln!("[warp] Cache loaded in {:.1}s ({} layers)", start.elapsed().as_secs_f64(), num_layers);
 
     Ok(MoEQ4Engine {
-        config, layer_configs, embed_tokens, final_norm,
+        config, layer_configs, embed_tokens, lm_head: None, final_norm,
         cache: KernelCache::new(), layers, weights_reordered: false,
     })
 }
@@ -288,8 +288,18 @@ fn read_tensor_f32(mmap: &[u8], pos: &mut usize, device: &WarpDevice) -> Result<
     *pos += 8;
     let data = &mmap[*pos..*pos+nbytes];
     *pos += nbytes;
-    let floats: &[f32] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, nbytes / 4) };
-    GpuTensor::from_host(device, floats, Shape::from_static(&[nbytes / 4]), DType::F32)
+    // Vec<f32> guarantees 4-byte alignment regardless of the source mmap offset;
+    // a raw cast from &[u8] would be UB when the mmap slice lands unaligned.
+    let n = nbytes / 4;
+    let mut floats = vec![0f32; n];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            data.as_ptr(),
+            floats.as_mut_ptr() as *mut u8,
+            nbytes,
+        );
+    }
+    GpuTensor::from_host(device, &floats, Shape::from_static(&[n]), DType::F32)
         .map_err(|e| LoaderError::Device(e.to_string()))
 }
 
@@ -298,8 +308,18 @@ fn read_tensor_f16(mmap: &[u8], pos: &mut usize, device: &WarpDevice) -> Result<
     *pos += 8;
     let data = &mmap[*pos..*pos+nbytes];
     *pos += nbytes;
-    let halfs: &[half::f16] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const half::f16, nbytes / 2) };
-    GpuTensor::from_host(device, halfs, Shape::from_static(&[nbytes / 2]), DType::F16)
+    // Same alignment concern as the f32 path: copy into a Vec<f16> to guarantee
+    // proper alignment.
+    let n = nbytes / 2;
+    let mut halfs = vec![half::f16::from_f32(0.0); n];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            data.as_ptr(),
+            halfs.as_mut_ptr() as *mut u8,
+            nbytes,
+        );
+    }
+    GpuTensor::from_host(device, &halfs, Shape::from_static(&[n]), DType::F16)
         .map_err(|e| LoaderError::Device(e.to_string()))
 }
 

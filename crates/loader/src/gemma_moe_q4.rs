@@ -36,6 +36,27 @@ pub fn load_moe_q4(
         .map_err(|e| LoaderError::Device(e.to_string()))?;
     drop(embed_f32);
 
+    // Optional untied lm_head (PEFT-merged resized-vocab checkpoints save
+    // this as a separate tensor even when HF config says tied). When
+    // present, the engine uses it for the LM head gemm instead of
+    // embed_tokens — otherwise the model produces gibberish on generated
+    // tokens because embed_tokens alone is no longer the true output
+    // projection.
+    let lm_head = match loader.load_f32("lm_head.weight", device) {
+        Ok(lm_f32) => {
+            eprintln!("[moe-q4] Loading untied lm_head F16 (shape={:?})", lm_f32.shape);
+            let mut lm = GpuTensor::<half::f16>::zeros(device, lm_f32.shape.clone(), DType::F16)
+                .map_err(|e| LoaderError::Device(e.to_string()))?;
+            warp_kernels::fp16::cast_f32_to_f16(&kcache, device, &lm_f32, &mut lm)
+                .map_err(|e| LoaderError::Device(e.to_string()))?;
+            Some(lm)
+        }
+        Err(_) => {
+            eprintln!("[moe-q4] No lm_head.weight — using tied embed_tokens for output");
+            None
+        }
+    };
+
     let load_norm = |name: &str| -> Result<GpuTensor<f32>, LoaderError> {
         // Gemma 4 uses `x * weight` (NOT `x * (1+weight)` like Gemma 3)
         let t = loader.load_f32(name, device)?;
@@ -184,7 +205,7 @@ pub fn load_moe_q4(
 
     eprintln!("[moe-q4] All weights in VRAM!");
     Ok(MoEQ4Engine {
-        config, layer_configs, embed_tokens: embed, final_norm,
+        config, layer_configs, embed_tokens: embed, lm_head, final_norm,
         cache: KernelCache::new(), layers, weights_reordered: false,
     })
 }

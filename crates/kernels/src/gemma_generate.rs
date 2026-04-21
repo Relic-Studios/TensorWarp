@@ -227,6 +227,101 @@ impl GemmaGenerationEngine {
         Ok(())
     }
 
+    // -----------------------------------------------------------------
+    // Public wrappers — enable external drivers (e.g., didymus-tensorwarp's
+    // activation-capture loop) to compose their own decode loop using the
+    // same primitives that generate() uses internally. These delegate to
+    // the private implementations; the internal signatures are free to
+    // change as long as these public surfaces hold.
+    // -----------------------------------------------------------------
+
+    /// Allocate KV caches and pre-allocated decode buffers in one call.
+    /// Public entry point for external decode drivers.
+    pub fn allocate_decode_state(
+        &self,
+        device: &WarpDevice,
+        max_seq_len: u32,
+    ) -> Result<(GemmaDecodeBuffers, Vec<LayerKVCache>), DeviceError> {
+        let kv_caches = self.allocate_kv_caches(device, max_seq_len)?;
+        let buffers = self.allocate_decode_buffers(device)?;
+        Ok((buffers, kv_caches))
+    }
+
+    /// Public wrapper over `forward_decode_prealloc`. Run one decode step —
+    /// populates `buffers.layers[i].residual`, `buffers.layers[i].output`,
+    /// and the rest of the pre-allocated GPU state for the given position.
+    /// After this returns (and after `device.synchronize()` if needed),
+    /// the buffers are ready to be read by an activation-capture pass.
+    pub fn decode_step(
+        &self,
+        device: &WarpDevice,
+        buffers: &mut GemmaDecodeBuffers,
+        kv_caches: &mut [LayerKVCache],
+        pos: u32,
+    ) -> Result<(), DeviceError> {
+        self.forward_decode_prealloc(device, buffers, kv_caches, pos)
+    }
+
+    /// Run the LM head (final rmsnorm + projection to vocab logits) on
+    /// `buffers.layers[last].output`, writing the result into `buffers.logits`.
+    /// Call this AFTER `decode_step` (and optionally an activation-capture
+    /// pass) to produce the next-token distribution.
+    ///
+    /// Handles both tied-weight (shared embedding) and separate-lm-head paths
+    /// transparently — the same logic the internal generate() uses.
+    pub fn apply_lm_head(
+        &self,
+        device: &WarpDevice,
+        buffers: &mut GemmaDecodeBuffers,
+    ) -> Result<(), DeviceError> {
+        let h = self.config.hidden_size;
+        let last = self.layer_configs.len() - 1;
+        ops::rmsnorm(
+            &self.cache,
+            device,
+            &buffers.layers[last].output,
+            &self.final_norm,
+            &mut buffers.normed_final,
+            h,
+            self.config.norm_eps,
+        )?;
+        if self.config.tie_word_embeddings && self.lm_head.numel <= 1 {
+            crate::fp16::cast_f32_to_f16(
+                &self.cache,
+                device,
+                &buffers.normed_final,
+                &mut buffers.normed_f16,
+            )?;
+            crate::cublas_gemm::gemm_cublas_f16_transB(
+                device,
+                &buffers.normed_f16,
+                &self.embed_tokens,
+                &mut buffers.logits_f16,
+                1,
+                self.config.vocab_size,
+                h,
+            )?;
+            crate::fp16::cast_f16_to_f32(
+                &self.cache,
+                device,
+                &buffers.logits_f16,
+                &mut buffers.logits,
+            )?;
+        } else {
+            ops::gemm(
+                &self.cache,
+                device,
+                &buffers.normed_final,
+                &self.lm_head,
+                &mut buffers.logits,
+                1,
+                self.config.vocab_size,
+                h,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Pre-allocated decode step — zero allocation during generation.
     fn forward_decode_prealloc(
         &self,
