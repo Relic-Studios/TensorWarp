@@ -71,7 +71,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(GpuTensor::<f32>::zeros(&device, Shape::from_static(&[a, b, c]), DType::F32)?)
     };
 
+    let alloc1d_f16 = |dim: usize| -> Result<GpuTensor<half::f16>, Box<dyn std::error::Error>> {
+        Ok(GpuTensor::<half::f16>::zeros(&device, Shape::from_static(&[1, dim]), DType::F16)?)
+    };
     let mut bufs = GatedDeltaNetStepBuffers {
+        hidden_f16:   alloc1d_f16(cfg.hidden_size)?,
+        conv_in_pre:  alloc1d(cfg.gdn.conv_dim())?,
+        beta_logit:   alloc1d(cfg.gdn.num_value_heads)?,
+        a_logit:      alloc1d(cfg.gdn.num_value_heads)?,
         q:        alloc3d(1, cfg.gdn.num_value_heads, cfg.gdn.key_head_dim)?,
         k:        alloc3d(1, cfg.gdn.num_value_heads, cfg.gdn.key_head_dim)?,
         v:        alloc3d(1, cfg.gdn.num_value_heads, cfg.gdn.value_head_dim)?,

@@ -116,6 +116,10 @@ impl DeltaNetLayerState {
 // ─── Per-step buffers ───────────────────────────────────────────────────
 
 pub struct GatedDeltaNetStepBuffers {
+    pub hidden_f16: GpuTensor<half::f16>,  // [B, D]    f16-cast input for cuBLAS
+    pub conv_in_pre: GpuTensor<f32>,       // [B, D_conv]  pre-conv matmul output
+    pub beta_logit: GpuTensor<f32>,        // [B, H_v]  pre-sigmoid
+    pub a_logit: GpuTensor<f32>,           // [B, H_v]  pre-g-formula
     pub q: GpuTensor<f32>,        // [B, H_v, dk]
     pub k: GpuTensor<f32>,        // [B, H_v, dk]
     pub v: GpuTensor<f32>,        // [B, H_v, dv]
@@ -130,9 +134,10 @@ pub struct GatedDeltaNetStepBuffers {
 
 const KERNEL_SRC: &str = include_str!("cuda/gated_delta_net.cu");
 
-const PREMIX_FN: &str = "gdn_premix_kernel";
+const PREMIX_POST_FN: &str = "gdn_premix_post_kernel";
 const RECURRENCE_FN: &str = "gdn_recurrence_kernel";
-const POSTMIX_FN: &str = "gdn_postmix_kernel";
+const NORM_GATED_FN: &str = "gdn_norm_gated_kernel";
+const RESIDUAL_ADD_FN: &str = "gdn_residual_add_kernel";
 
 // ─── Public kernel API ─────────────────────────────────────────────────
 
@@ -151,6 +156,7 @@ pub fn gated_delta_net_step(
     out: &mut GpuTensor<f32>,
 ) -> Result<(), DeviceError> {
     let batch = hidden.shape.dims()[0].static_val().unwrap() as i32;
+    let batch_u = batch as u32;
     let d = cfg.hidden_size as i32;
     let k_dim = cfg.key_dim() as i32;
     let v_dim = cfg.value_dim() as i32;
@@ -161,22 +167,40 @@ pub fn gated_delta_net_step(
     let k_conv = cfg.conv_kernel_dim as i32;
     let rmsnorm_eps = cfg.rmsnorm_eps;
 
-    // ── Stage A: premix ───────────────────────────────────────────────
+    // ── Stage A.0: cast hidden f32 → f16 for cuBLAS HGEMM ────────────
+    crate::fp16::cast_f32_to_f16(cache, device, hidden, &mut bufs.hidden_f16)?;
+
+    // ── Stage A.1: cuBLAS HGEMMs for the four projections ─────────────
+    // All weights stored row-major [N, K] which matches HGEMM transB layout.
+    use crate::cublas_gemm::gemm_cublas_f16in_f32out_transB as hgemm_f16f32;
+    let m = batch_u;
+    let k_in = cfg.hidden_size as u32;
+    let n_qkv = cfg.conv_dim() as u32;
+    let n_z = cfg.value_dim() as u32;
+    let n_ba = cfg.num_value_heads as u32;
+    hgemm_f16f32(device, &bufs.hidden_f16, &weights.w_qkv,
+                 &mut bufs.conv_in_pre, m, n_qkv, k_in)?;
+    hgemm_f16f32(device, &bufs.hidden_f16, &weights.w_z,
+                 &mut bufs.z, m, n_z, k_in)?;
+    hgemm_f16f32(device, &bufs.hidden_f16, &weights.w_b,
+                 &mut bufs.beta_logit, m, n_ba, k_in)?;
+    hgemm_f16f32(device, &bufs.hidden_f16, &weights.w_a,
+                 &mut bufs.a_logit, m, n_ba, k_in)?;
+
+    // ── Stage A.2: small post-matmul kernel (conv1d + split + l2norm + sigmoid + g) ─
     {
-        let f = cache.get_or_compile_with_opts(device, KERNEL_SRC, PREMIX_FN, &[WarpDevice::cuda_include_path()], None)?;
-        let smem_bytes = (cfg.conv_dim() * 4) as u32;   // conv_out_sh [D_conv]
+        let f = cache.get_or_compile_with_opts(device, KERNEL_SRC, PREMIX_POST_FN, &[WarpDevice::cuda_include_path()], None)?;
+        let smem_bytes = (cfg.conv_dim() * 4) as u32;
         let cfg_launch = LaunchConfig {
-            grid_dim: (batch as u32, 1, 1),
+            grid_dim: (batch_u, 1, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: smem_bytes,
         };
         unsafe {
             device.stream.launch_builder(&f)
-                .arg(&hidden.data)
-                .arg(&weights.w_qkv.data)
-                .arg(&weights.w_z.data)
-                .arg(&weights.w_b.data)
-                .arg(&weights.w_a.data)
+                .arg(&bufs.conv_in_pre.data)
+                .arg(&bufs.beta_logit.data)
+                .arg(&bufs.a_logit.data)
                 .arg(&weights.conv_w.data)
                 .arg(&weights.a_log.data)
                 .arg(&weights.dt_bias.data)
@@ -184,24 +208,21 @@ pub fn gated_delta_net_step(
                 .arg(&mut bufs.q.data)
                 .arg(&mut bufs.k.data)
                 .arg(&mut bufs.v.data)
-                .arg(&mut bufs.z.data)
                 .arg(&mut bufs.beta.data)
                 .arg(&mut bufs.g.data)
-                .arg(&batch).arg(&d)
-                .arg(&k_dim).arg(&v_dim)
-                .arg(&h_v).arg(&h_k)
-                .arg(&dk).arg(&dv)
+                .arg(&batch).arg(&k_dim).arg(&v_dim)
+                .arg(&h_v).arg(&h_k).arg(&dk).arg(&dv)
                 .arg(&k_conv)
                 .launch(cfg_launch)
                 .map_err(|e: cudarc::driver::result::DriverError| DeviceError::Launch(e.to_string()))?;
         }
     }
 
-    // ── Stage B: per-head recurrent step ───────────────────────────────
+    // ── Stage B: per-head recurrent step (unchanged) ──────────────────
     {
         let f = cache.get_or_compile_with_opts(device, KERNEL_SRC, RECURRENCE_FN, &[WarpDevice::cuda_include_path()], None)?;
         let cfg_launch = LaunchConfig {
-            grid_dim: (batch as u32, cfg.num_value_heads as u32, 1),
+            grid_dim: (batch_u, cfg.num_value_heads as u32, 1),
             block_dim: (cfg.value_head_dim as u32, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -220,11 +241,11 @@ pub fn gated_delta_net_step(
         }
     }
 
-    // ── Stage C: RMSNormGated + out_proj + residual ───────────────────
+    // ── Stage C.1: RMSNormGated → y_gated ──────────────────────────────
     {
-        let f = cache.get_or_compile_with_opts(device, KERNEL_SRC, POSTMIX_FN, &[WarpDevice::cuda_include_path()], None)?;
+        let f = cache.get_or_compile_with_opts(device, KERNEL_SRC, NORM_GATED_FN, &[WarpDevice::cuda_include_path()], None)?;
         let cfg_launch = LaunchConfig {
-            grid_dim: (batch as u32, 1, 1),
+            grid_dim: (batch_u, 1, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -232,13 +253,34 @@ pub fn gated_delta_net_step(
             device.stream.launch_builder(&f)
                 .arg(&bufs.y.data)
                 .arg(&bufs.z.data)
-                .arg(&x_residual.data)
                 .arg(&weights.norm_w.data)
-                .arg(&weights.w_out.data)
                 .arg(&mut bufs.y_gated.data)
-                .arg(&mut out.data)
-                .arg(&batch).arg(&d).arg(&h_v).arg(&dv)
+                .arg(&batch).arg(&h_v).arg(&dv)
                 .arg(&rmsnorm_eps)
+                .launch(cfg_launch)
+                .map_err(|e: cudarc::driver::result::DriverError| DeviceError::Launch(e.to_string()))?;
+        }
+    }
+
+    // ── Stage C.2: cuBLAS HGEMM for output projection ─────────────────
+    // out = w_out @ y_gated     [B, D] = w_out[D, V_dim] @ y_gated[B, V_dim]
+    // We need y_gated as f16 for the HGEMM input. Reuse hidden_f16-shape buffer?
+    // No — y_gated is V_dim=4096, hidden is also D=4096 (same size for Qwen3.5).
+    // Cast in place into hidden_f16 buffer (we don't need its old contents).
+    crate::fp16::cast_f32_to_f16(cache, device, &bufs.y_gated, &mut bufs.hidden_f16)?;
+    hgemm_f16f32(device, &bufs.hidden_f16, &weights.w_out,
+                 out, m, cfg.hidden_size as u32, cfg.value_dim() as u32)?;
+
+    // ── Stage C.3: residual add ──────────────────────────────────────
+    {
+        let f = cache.get_or_compile_with_opts(device, KERNEL_SRC, RESIDUAL_ADD_FN, &[WarpDevice::cuda_include_path()], None)?;
+        let total = (batch * d) as u32;
+        let cfg_launch = LaunchConfig::for_num_elems(total);
+        unsafe {
+            device.stream.launch_builder(&f)
+                .arg(&x_residual.data)
+                .arg(&mut out.data)
+                .arg(&batch).arg(&d)
                 .launch(cfg_launch)
                 .map_err(|e: cudarc::driver::result::DriverError| DeviceError::Launch(e.to_string()))?;
         }

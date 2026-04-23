@@ -44,17 +44,38 @@ fn layer_nan_check(
     // Log every NaN-carrying layer the first time we see it in this pass,
     // but only the FIRST layer gets the loud banner — cascading NaN
     // through later layers doesn't help diagnose root cause.
+    // Additional stats to help narrow further: min/max of finite values,
+    // so we can see if the layer was building up huge magnitudes just
+    // before exploding (softmax overflow signature) vs producing zero
+    // norms (RMSNorm div-by-zero signature).
+    let mut finite_max = 0.0f32;
+    let mut finite_min = 0.0f32;
+    let mut finite_count = 0usize;
+    for &x in &host {
+        if x.is_finite() {
+            if finite_count == 0 {
+                finite_min = x;
+                finite_max = x;
+            } else {
+                if x < finite_min { finite_min = x; }
+                if x > finite_max { finite_max = x; }
+            }
+            finite_count += 1;
+        }
+    }
     let prev = NAN_FIRST_LAYER.load(Ordering::Relaxed);
     if prev == u32::MAX {
         NAN_FIRST_LAYER.store(layer_idx as u32, Ordering::Relaxed);
-        log::warn!(
-            "NaN cliff: pos={} FIRST layer with NaN = {} ({}/{} elements NaN)",
+        eprintln!(
+            "[nan-cliff] pos={} FIRST_LAYER={} nan={}/{} finite_range=[{:.3}, {:.3}] finite_n={}",
             pos, layer_idx, nan_count, host.len(),
+            finite_min, finite_max, finite_count,
         );
     } else {
-        log::debug!(
-            "NaN cascade: pos={} layer={} ({}/{} NaN, first was layer {})",
+        eprintln!(
+            "[nan-cascade] pos={} layer={} nan={}/{} (first was {}) finite_range=[{:.3}, {:.3}]",
             pos, layer_idx, nan_count, host.len(), prev,
+            finite_min, finite_max,
         );
     }
 }
@@ -63,6 +84,133 @@ fn layer_nan_check(
 /// so each pass gets its own clean window for diagnosis.
 fn reset_nan_tracker() {
     NAN_FIRST_LAYER.store(u32::MAX, Ordering::Relaxed);
+}
+
+/// True once we've already printed the first sub-layer NaN for the current
+/// pass. Prevents the entire downstream of a layer from spamming stderr
+/// once one op has already detonated.
+static SUBLAYER_REPORTED: AtomicU32 = AtomicU32::new(0);
+
+/// Fine-grained check inside a specific target layer. Reports the first
+/// sub-op (RMSNorm, QKV proj, attention, MoE combine, etc.) that produces
+/// NaN or pushes finite values to extreme magnitudes. Only fires for the
+/// layer index supplied via `DIDYMUS_SUBLAYER` (defaults to 11, the cliff
+/// we found with per-layer instrumentation).
+fn sublayer_check(
+    device: &WarpDevice,
+    t: &GpuTensor<f32>,
+    name: &str,
+    layer_idx: usize,
+    pos: u32,
+) {
+    if std::env::var_os("DIDYMUS_PERLAYER_NAN").is_none() {
+        return;
+    }
+    let target: usize = std::env::var("DIDYMUS_SUBLAYER")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(11);
+    if layer_idx != target {
+        return;
+    }
+    let Ok(host) = t.to_host(device) else { return };
+    let nan_count = host.iter().filter(|x| x.is_nan()).count();
+    let mut min_v = f32::INFINITY;
+    let mut max_v = f32::NEG_INFINITY;
+    let mut finite_n = 0;
+    let mut sum_abs = 0.0f64;
+    for &x in &host {
+        if x.is_finite() {
+            if x < min_v { min_v = x; }
+            if x > max_v { max_v = x; }
+            sum_abs += x.abs() as f64;
+            finite_n += 1;
+        }
+    }
+    let (min_v, max_v) = if finite_n == 0 { (0.0, 0.0) } else { (min_v, max_v) };
+    let mean_abs = if finite_n > 0 { sum_abs / (finite_n as f64) } else { 0.0 };
+    let reported = SUBLAYER_REPORTED.load(Ordering::Relaxed);
+    let first_nan = nan_count > 0 && reported == 0;
+    if first_nan {
+        SUBLAYER_REPORTED.store(1, Ordering::Relaxed);
+        eprintln!(
+            "[sub-cliff] L{} pos={} op={}: FIRST NAN nan={}/{} finite=[{:.4},{:.4}] mean_abs={:.4} n={}",
+            layer_idx, pos, name, nan_count, host.len(),
+            min_v, max_v, mean_abs, finite_n,
+        );
+    } else if nan_count == 0 {
+        // Track healthy sub-op stats too — tells us the magnitude ramp
+        // leading up to the cliff when we diff against prior step.
+        eprintln!(
+            "[sub-ok]    L{} pos={} op={}: range=[{:.4},{:.4}] mean_abs={:.4}",
+            layer_idx, pos, name, min_v, max_v, mean_abs,
+        );
+    }
+}
+
+/// Reset the per-pass sub-layer tracker at the start of each forward pass.
+fn reset_sublayer_tracker() {
+    SUBLAYER_REPORTED.store(0, Ordering::Relaxed);
+}
+
+static REPAIR_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// NaN-repair bandaid: if the FlashDecoding attention output contains any
+/// NaN, zero the entire buffer so the residual path (x + RMSNorm(O·0) = x)
+/// preserves upstream information rather than poisoning every downstream
+/// layer. One token's attention is effectively skipped at one layer, which
+/// degrades output quality locally but keeps generation flowing.
+///
+/// Gated on `DIDYMUS_NAN_REPAIR`. Returns true if repair was applied — the
+/// caller should probably log the event. Cost: one ~32KB DtoH readback per
+/// layer per token, ~1MB per token total across 30 layers. Negligible at
+/// 25 tok/s.
+fn repair_attn_nan(
+    device: &WarpDevice,
+    attn_out: &mut GpuTensor<f32>,
+    layer_idx: usize,
+    pos: u32,
+) -> Result<bool, DeviceError> {
+    if std::env::var_os("DIDYMUS_NAN_REPAIR").is_none() {
+        return Ok(false);
+    }
+    let host = match attn_out.to_host(device) {
+        Ok(h) => h,
+        Err(_) => return Ok(false),
+    };
+    let nan_count = host.iter().filter(|x| x.is_nan()).count();
+    if nan_count == 0 {
+        return Ok(false);
+    }
+    device.stream.memset_zeros(&mut attn_out.data)
+        .map_err(|e| DeviceError::Memory(format!("nan repair memset: {e}")))?;
+    let total = REPAIR_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    eprintln!(
+        "[nan-repair] L{} pos={}: zeroed attn_out ({} NaN of {}) — total repairs this process: {}",
+        layer_idx, pos, nan_count, host.len(), total,
+    );
+    Ok(true)
+}
+
+/// One-time dump of all layer configs so we can see structural differences
+/// (window size, kv heads, rope theta, partial rotary factor). Called from
+/// the first forward_decode invocation when diagnostics are enabled.
+static LAYER_CONFIGS_DUMPED: AtomicU32 = AtomicU32::new(0);
+fn dump_layer_configs_once(layer_configs: &[GemmaLayerAttentionConfig]) {
+    if std::env::var_os("DIDYMUS_PERLAYER_NAN").is_none() {
+        return;
+    }
+    if LAYER_CONFIGS_DUMPED.swap(1, Ordering::Relaxed) != 0 {
+        return;
+    }
+    eprintln!("[layer-configs] dumping {} configs (one-time):", layer_configs.len());
+    for (i, lc) in layer_configs.iter().enumerate() {
+        eprintln!(
+            "  L{:>2}: kv_heads={} head_dim={} window={} rope_theta={} partial_rotary={:.2} is_global={}",
+            i, lc.num_kv_heads, lc.head_dim, lc.window_size,
+            lc.rope_theta, lc.partial_rotary_factor, lc.is_global,
+        );
+    }
 }
 
 /// Per-layer weights — F16 for attention/MLP, Q4 for experts.
@@ -314,6 +462,8 @@ impl MoEQ4Engine {
         ops::mul_scalar(&self.cache, device, &b.hidden, &mut b.hidden_scaled, (h as f32).sqrt())?;
 
         reset_nan_tracker();
+        reset_sublayer_tracker();
+        dump_layer_configs_once(&self.layer_configs);
         let mut last_cache_len = u32::MAX;
         for (i, layer) in self.layers.iter().enumerate() {
             let lc = &self.layer_configs[i];
@@ -326,18 +476,24 @@ impl MoEQ4Engine {
             ops::rmsnorm_f16out(&self.cache, device, x, &layer.attn_norm, &mut b.normed_f16, h, self.config.norm_eps)?;
 
             crate::cublas_gemm::gemm_cublas_f16in_f32out_transB(device, &b.normed_f16, &layer.wq, &mut b.q, 1, q_dim, h)?;
+            sublayer_check(device, &b.q, "q_proj", i, pos);
             crate::cublas_gemm::gemm_cublas_f16in_f32out_transB(device, &b.normed_f16, &layer.wk, &mut b.k, 1, kv_dim, h)?;
+            sublayer_check(device, &b.k, "k_proj", i, pos);
 
             if self.config.k_eq_v && lc.is_global {
                 ops::mul_scalar(&self.cache, device, &b.k, &mut b.v, 1.0)?;
             } else {
                 crate::cublas_gemm::gemm_cublas_f16in_f32out_transB(device, &b.normed_f16, &layer.wv, &mut b.v, 1, kv_dim, h)?;
             }
+            sublayer_check(device, &b.v, "v_proj", i, pos);
 
             // QK-norm → V-norm → RoPE (Gemma 4: norm BEFORE RoPE)
             ops::rmsnorm(&self.cache, device, &b.q, &layer.q_norm, &mut b.q_n, d, self.config.norm_eps)?;
+            sublayer_check(device, &b.q_n, "q_norm", i, pos);
             ops::rmsnorm(&self.cache, device, &b.k, &layer.k_norm, &mut b.k_n, d, self.config.norm_eps)?;
+            sublayer_check(device, &b.k_n, "k_norm", i, pos);
             ops::rmsnorm_no_weight(&self.cache, device, &b.v, &mut b.v_normed, d, self.config.norm_eps)?;
+            sublayer_check(device, &b.v_normed, "v_normed", i, pos);
 
             let rotary_dim = (d as f32 * lc.partial_rotary_factor) as u32;
             if rotary_dim < d {
@@ -358,17 +514,47 @@ impl MoEQ4Engine {
                 device.htod_copy(&[kv.len], &mut b.cache_len_buf)?;
                 last_cache_len = kv.len;
             }
-            crate::kv_cache::decode_attention_flash_prealloc(
-                &self.cache, device, &b.q_rope, kv, &mut b.attn_out,
-                &mut b.attn_scratch,
-                self.config.num_heads, lc.num_kv_heads, d, &b.cache_len_buf, win,
-                0.0, 1.0)?;
+            sublayer_check(device, &b.q_rope, "q_rope", i, pos);
+            sublayer_check(device, &b.k_rope, "k_rope", i, pos);
+            // Attention kernel selection:
+            //   * Local (windowed) layers → FlashDecoding Split-K. Fast
+            //     and stable on this model's local-attn shape
+            //     (kv_heads=8, head_dim=256, window=1024).
+            //   * Global (no-window) layers → reference multihead kernel.
+            //     FlashDecoding was observed to emit NaN from one Q head
+            //     at a time on Gemma 4's global-attn shape (kv_heads=2,
+            //     head_dim=512, window=0). The reference kernel is slower
+            //     but numerically clean — a straightforward online
+            //     softmax, no chunk combine step, no edge case.
+            //   5 global layers × ~590-token prompts is ~3000 Q·K
+            //     dot-products per token, nothing the reference kernel
+            //     can't handle at decode speeds we already tolerate.
+            if win == 0 {
+                crate::kv_cache::decode_attention_multihead_device_len(
+                    &self.cache, device, &b.q_rope, kv, &mut b.attn_out,
+                    self.config.num_heads, lc.num_kv_heads, d, &b.cache_len_buf,
+                )?;
+            } else {
+                crate::kv_cache::decode_attention_flash_prealloc(
+                    &self.cache, device, &b.q_rope, kv, &mut b.attn_out,
+                    &mut b.attn_scratch,
+                    self.config.num_heads, lc.num_kv_heads, d, &b.cache_len_buf, win,
+                    0.0, 1.0)?;
+            }
+            // Keep the repair bandaid as a belt-and-suspenders safeguard —
+            // costs one readback per layer when DIDYMUS_NAN_REPAIR is set,
+            // zero cost otherwise. If it never fires after this kernel
+            // swap, we'll remove it entirely.
+            repair_attn_nan(device, &mut b.attn_out, i, pos)?;
+            sublayer_check(device, &b.attn_out, "attn_out", i, pos);
 
             // O projection: cast + GemmEx F16→F32 (was: cast + GEMM_f16 + cast — saves 1 cast)
             crate::fp16::cast_f32_to_f16(&self.cache, device, &b.attn_out, &mut b.attn_out_f16)?;
             crate::cublas_gemm::gemm_cublas_f16in_f32out_transB(device, &b.attn_out_f16, &layer.wo, &mut b.attn_proj, 1, h, q_dim)?;
+            sublayer_check(device, &b.attn_proj, "attn_proj", i, pos);
             // Fused: residual = x + rmsnorm(attn_proj, post_attn_norm)  (2 kernels → 1)
             ops::fused_rmsnorm_add(&self.cache, device, x, &b.attn_proj, &layer.post_attn_norm, &mut b.residual, h, self.config.norm_eps)?;
+            sublayer_check(device, &b.residual, "residual_post_attn", i, pos);
 
             // ── 2+3. Dense MLP + MoE
             let scalar_root = 1.0 / (h as f32).sqrt();
@@ -456,12 +642,16 @@ impl MoEQ4Engine {
                     layer.expert_d_n, layer.expert_d_k, top_k)?;
             }
 
+            sublayer_check(device, &b.dense_out, "dense_out", i, pos);
+            sublayer_check(device, &b.moe_accumulated, "moe_accumulated", i, pos);
+
             // ── 4. Combine
             ops::fused_moe_combine(&self.cache, device,
                 &mut b.output_scaled, &mut b.output,
                 &b.dense_out, &b.moe_accumulated, &b.residual,
                 &layer.post_ffn_norm_1, &layer.post_ffn_norm_2, &layer.post_ffn_norm,
                 h, self.config.norm_eps, layer.layer_scalar)?;
+            sublayer_check(device, &b.output_scaled, "output_scaled", i, pos);
 
             // ── Per-layer NaN detection (diagnostic) ───────────────────
             // Gated on DIDYMUS_PERLAYER_NAN. When enabled, readback the

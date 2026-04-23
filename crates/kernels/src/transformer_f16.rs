@@ -136,6 +136,101 @@ pub fn transformer_block_forward_f16(
     Ok(output)
 }
 
+/// FP16 transformer block PREFILL — same compute as
+/// [`transformer_block_forward_f16`] but also writes the post-RoPE K and V
+/// of every prefill token into the supplied KV cache at offset 0.
+///
+/// Used to prime the KV cache from a prompt in a single call, replacing
+/// the N sequential `transformer_block_decode_full_f16(seq_len=1)` calls
+/// that one would otherwise make for an N-frame prompt. With seq_len in
+/// the dozens-to-hundreds the GEMM utilization climbs from GEMV-class
+/// (memory-bound) to tensor-core-class (compute-bound), giving a
+/// 10-30× speedup per layer.
+///
+/// The cache is reset to length `seq_len` after the call. A subsequent
+/// per-token decode then starts at position `seq_len`.
+pub fn transformer_block_prefill_f16(
+    cache: &KernelCache,
+    device: &WarpDevice,
+    x: &GpuTensor<half::f16>,
+    weights: &F16BlockWeights,
+    config: &TransformerConfig,
+    kv: &mut crate::kv_cache::LayerKVCacheF16,
+    batch: u32,
+    seq_len: u32,
+) -> Result<GpuTensor<half::f16>, DeviceError> {
+    let h = config.hidden_size;
+    let d = config.head_dim;
+    let kv_dim = config.kv_dim();
+    let ffn = config.ffn_dim;
+    let bn = batch * seq_len;
+
+    let shape_bnh = Shape::from_static(&[batch as usize, seq_len as usize, h as usize]);
+    let shape_bnk = Shape::from_static(&[batch as usize, seq_len as usize, kv_dim as usize]);
+    let shape_bnf = Shape::from_static(&[batch as usize, seq_len as usize, ffn as usize]);
+
+    // 1. RMSNorm
+    let mut normed = GpuTensor::<half::f16>::zeros(device, shape_bnh.clone(), DType::F16)?;
+    fp16::f16_rmsnorm(cache, device, x, &weights.attn_norm, &mut normed, h, config.norm_eps)?;
+
+    // 2. QKV projections
+    let mut q = GpuTensor::<half::f16>::zeros(device, shape_bnh.clone(), DType::F16)?;
+    let mut k = GpuTensor::<half::f16>::zeros(device, shape_bnk.clone(), DType::F16)?;
+    let mut v = GpuTensor::<half::f16>::zeros(device, shape_bnk.clone(), DType::F16)?;
+    fp16::f16_gemm(cache, device, &normed, &weights.wq, &mut q, bn, h, h)?;
+    fp16::f16_gemm(cache, device, &normed, &weights.wk, &mut k, bn, kv_dim, h)?;
+    fp16::f16_gemm(cache, device, &normed, &weights.wv, &mut v, bn, kv_dim, h)?;
+
+    // 3. RoPE on Q and K
+    let mut q_rope = GpuTensor::<half::f16>::zeros(device, shape_bnh.clone(), DType::F16)?;
+    let mut k_rope = GpuTensor::<half::f16>::zeros(device, shape_bnk.clone(), DType::F16)?;
+    fp16::f16_rope(cache, device, &q, &mut q_rope,
+        batch * config.num_heads, seq_len, d, config.rope_base, 0)?;
+    fp16::f16_rope(cache, device, &k, &mut k_rope,
+        batch * config.num_kv_heads, seq_len, d, config.rope_base, 0)?;
+
+    // 3b. Persist post-RoPE K and V into the per-layer KV cache. The
+    //     subsequent per-token decode path reads these as cached context.
+    kv.prefill(cache, device, &k_rope, &v, seq_len)?;
+
+    // 4. Causal attention over the full prefill batch
+    let attn_batch = batch * config.num_heads;
+    let shape_attn = Shape::from_static(&[attn_batch as usize, seq_len as usize, d as usize]);
+    let mut attn_out = GpuTensor::<half::f16>::zeros(device, shape_attn, DType::F16)?;
+    fp16::f16_attention(cache, device, &q_rope, &k_rope, &v,
+        &mut attn_out, attn_batch, seq_len, d, true)?;
+
+    // 5. Output projection
+    let mut attn_projected = GpuTensor::<half::f16>::zeros(device, shape_bnh.clone(), DType::F16)?;
+    fp16::f16_gemm(cache, device, &attn_out, &weights.wo, &mut attn_projected, bn, h, h)?;
+
+    // 6+7. Fused residual + RMSNorm
+    let mut residual = GpuTensor::<half::f16>::zeros(device, shape_bnh.clone(), DType::F16)?;
+    let mut ffn_normed = GpuTensor::<half::f16>::zeros(device, shape_bnh.clone(), DType::F16)?;
+    fp16::f16_fused_residual_rmsnorm(cache, device, &attn_projected, x, &weights.ffn_norm,
+        &mut ffn_normed, &mut residual, h, config.norm_eps)?;
+
+    // 8. Gate + Up
+    let mut gate = GpuTensor::<half::f16>::zeros(device, shape_bnf.clone(), DType::F16)?;
+    let mut up = GpuTensor::<half::f16>::zeros(device, shape_bnf.clone(), DType::F16)?;
+    fp16::f16_gemm(cache, device, &ffn_normed, &weights.w_gate, &mut gate, bn, ffn, h)?;
+    fp16::f16_gemm(cache, device, &ffn_normed, &weights.w_up, &mut up, bn, ffn, h)?;
+
+    // 9. Fused SwiGLU
+    let mut swiglu = GpuTensor::<half::f16>::zeros(device, shape_bnf, DType::F16)?;
+    fp16::f16_fused_silu_mul(cache, device, &gate, &up, &mut swiglu)?;
+
+    // 10. Down projection
+    let mut ffn_out = GpuTensor::<half::f16>::zeros(device, shape_bnh.clone(), DType::F16)?;
+    fp16::f16_gemm(cache, device, &swiglu, &weights.w_down, &mut ffn_out, bn, h, ffn)?;
+
+    // 11. Final residual
+    let mut output = GpuTensor::<half::f16>::zeros(device, shape_bnh, DType::F16)?;
+    fp16::f16_add(cache, device, &residual, &ffn_out, &mut output)?;
+
+    Ok(output)
+}
+
 /// Memory usage estimate for FP16 vs F32 weights.
 pub fn weight_memory_f16(config: &TransformerConfig, num_layers: u32) -> (usize, usize) {
     let h = config.hidden_size as usize;

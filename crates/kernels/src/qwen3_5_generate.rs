@@ -238,11 +238,20 @@ fn alloc_gdn_bufs(
         GpuTensor::<f32>::zeros(device, Shape::from_static(dims), DType::F32)
     };
     let v_dim = cfg.value_dim();
+    let d_conv = cfg.conv_dim();
     let h_v = cfg.num_value_heads;
     let dk = cfg.key_head_dim;
     let dv = cfg.value_head_dim;
 
+    let alloc_f16 = |dims: &[usize]| -> Result<GpuTensor<half::f16>, DeviceError> {
+        GpuTensor::<half::f16>::zeros(device, Shape::from_static(dims), DType::F16)
+    };
+
     Ok(GatedDeltaNetStepBuffers {
+        hidden_f16:   alloc_f16(&[batch, cfg.hidden_size])?,
+        conv_in_pre:  alloc(&[batch, d_conv])?,
+        beta_logit:   alloc(&[batch, h_v])?,
+        a_logit:      alloc(&[batch, h_v])?,
         q:        alloc(&[batch, h_v, dk])?,
         k:        alloc(&[batch, h_v, dk])?,
         v:        alloc(&[batch, h_v, dv])?,
