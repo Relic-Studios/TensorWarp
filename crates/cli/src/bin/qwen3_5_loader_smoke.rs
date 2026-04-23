@@ -17,6 +17,7 @@ use warp_kernels::tensor::GpuTensor;
 use warp_kernels::gated_delta_net::{
     gated_delta_net_step, GatedDeltaNetStepBuffers,
 };
+use warp_kernels::qwen3_5_blocks::{ffn_block_step, FfnStepBuffers};
 use warp_loader::safetensors_loader::ShardedSafeTensorsLoader;
 use warp_loader::qwen3_5_dense_q4::{
     Qwen35Config, Qwen35LayerWeights, alloc_delta_state, load_qwen3_5,
@@ -159,6 +160,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                    correctly OR input was zero (which it was — this is a smoke test).");
     }
 
-    eprintln!("[smoke] ✓ SUCCESS — kernels compile + launch end-to-end.");
+    // ── 5. Benchmark FFN block on layer 0 ────────────────────────────
+    eprintln!("\n[smoke] ── FFN block benchmark ──");
+    let mut ffn_bufs = FfnStepBuffers::new(
+        &device, 1, cfg.hidden_size, cfg.intermediate_size,
+    )?;
+    let mut hidden_for_ffn = GpuTensor::<f32>::from_host(
+        &device, &host_hidden,
+        Shape::from_static(&[1, cfg.hidden_size]), DType::F32,
+    )?;
+    // Pull ffn weights from layer 0 (which is Linear, has w_gate/w_up/w_down)
+    let (post_norm, w_gate, w_up, w_down) = match &model.layers[0] {
+        Qwen35LayerWeights::Linear { post_attn_norm, w_gate, w_up, w_down, .. } =>
+            (post_attn_norm, w_gate, w_up, w_down),
+        _ => panic!("layer 0 should be Linear"),
+    };
+
+    eprintln!("[smoke] cold FFN step (NVRTC compile included)");
+    let t0 = Instant::now();
+    ffn_block_step(&device, &cache, &mut hidden_for_ffn,
+                   post_norm, w_gate, w_up, w_down,
+                   &mut ffn_bufs, cfg.rmsnorm_eps)?;
+    device.stream.synchronize()?;
+    eprintln!("[smoke] cold FFN: {:.2} ms", t0.elapsed().as_secs_f64() * 1000.0);
+
+    eprintln!("[smoke] running 100 warm FFN steps...");
+    let t0 = Instant::now();
+    for _ in 0..100 {
+        ffn_block_step(&device, &cache, &mut hidden_for_ffn,
+                       post_norm, w_gate, w_up, w_down,
+                       &mut ffn_bufs, cfg.rmsnorm_eps)?;
+    }
+    device.stream.synchronize()?;
+    let total = t0.elapsed().as_secs_f64();
+    eprintln!("[smoke] warm FFN: {:.1} ms total / {:.3} ms per step / {:.1} blocks/sec",
+              total * 1000.0, total * 10.0, 100.0 / total);
+
+    let ffn_out_host: Vec<f32> = hidden_for_ffn.to_host(&device)?;
+    let nonzero = ffn_out_host.iter().filter(|&&x| x.abs() > 1e-9).count();
+    let max_abs = ffn_out_host.iter().map(|&x| x.abs()).fold(0.0f32, f32::max);
+    eprintln!("[smoke] FFN output: {} / {} nonzero, max |x| = {:e}",
+              nonzero, ffn_out_host.len(), max_abs);
+
+    // ── Per-token projection ─────────────────────────────────────────
+    eprintln!("\n[smoke] ── Per-token projection ──");
+    let gdn_per_layer = (total * 1000.0) / 100.0;   // FFN ms per step
+    let _ = gdn_per_layer;
+    eprintln!("[smoke] (estimate per-token = 24 × gdn + 32 × ffn + 8 × full_attn + lm_head)");
+    eprintln!("[smoke] (full_attn not yet wired — placeholder)");
+
+    eprintln!("\n[smoke] ✓ SUCCESS — Gated DeltaNet + FFN running end-to-end.");
     Ok(())
 }

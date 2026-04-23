@@ -134,6 +134,11 @@ pub struct GatedDeltaNetStepBuffers {
 
 const KERNEL_SRC: &str = include_str!("cuda/gated_delta_net.cu");
 
+/// Expose kernel source so other modules can reuse the residual_add kernel.
+pub fn residual_add_kernel_src() -> &'static str {
+    KERNEL_SRC
+}
+
 const PREMIX_POST_FN: &str = "gdn_premix_post_kernel";
 const RECURRENCE_FN: &str = "gdn_recurrence_kernel";
 const NORM_GATED_FN: &str = "gdn_norm_gated_kernel";
