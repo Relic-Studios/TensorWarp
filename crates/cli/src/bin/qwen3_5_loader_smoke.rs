@@ -17,7 +17,11 @@ use warp_kernels::tensor::GpuTensor;
 use warp_kernels::gated_delta_net::{
     gated_delta_net_step, GatedDeltaNetStepBuffers,
 };
-use warp_kernels::qwen3_5_blocks::{ffn_block_step, FfnStepBuffers};
+use warp_kernels::qwen3_5_blocks::{
+    ffn_block_step, FfnStepBuffers,
+    full_attn_block_step, FullAttnStepBuffers,
+};
+use warp_kernels::kv_cache::LayerKVCache;
 use warp_loader::safetensors_loader::ShardedSafeTensorsLoader;
 use warp_loader::qwen3_5_dense_q4::{
     Qwen35Config, Qwen35LayerWeights, alloc_delta_state, load_qwen3_5,
@@ -202,13 +206,83 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("[smoke] FFN output: {} / {} nonzero, max |x| = {:e}",
               nonzero, ffn_out_host.len(), max_abs);
 
-    // ── Per-token projection ─────────────────────────────────────────
-    eprintln!("\n[smoke] ── Per-token projection ──");
-    let gdn_per_layer = (total * 1000.0) / 100.0;   // FFN ms per step
-    let _ = gdn_per_layer;
-    eprintln!("[smoke] (estimate per-token = 24 × gdn + 32 × ffn + 8 × full_attn + lm_head)");
-    eprintln!("[smoke] (full_attn not yet wired — placeholder)");
+    let ffn_ms = total * 10.0;
 
-    eprintln!("\n[smoke] ✓ SUCCESS — Gated DeltaNet + FFN running end-to-end.");
+    // ── 6. Benchmark Full-Attention block on first full layer ────────
+    eprintln!("\n[smoke] ── Full-Attention block benchmark ──");
+    let (full_idx, full_w) = model.layers.iter().enumerate()
+        .find_map(|(i, l)| match l {
+            Qwen35LayerWeights::Full(w) => Some((i, w)),
+            _ => None,
+        })
+        .ok_or("no full-attn layer found?!")?;
+    eprintln!("[smoke] using layer {} for benchmark", full_idx);
+
+    let mut full_bufs = FullAttnStepBuffers::new(
+        &device, 1, cfg.hidden_size,
+        cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim,
+    )?;
+    let kv_dim = (cfg.num_key_value_heads * cfg.head_dim) as u32;
+    let mut kv_cache = LayerKVCache::new(&device, 4096, kv_dim)?;
+    let cache_len_buf: cudarc::driver::CudaSlice<u32> =
+        device.stream.memcpy_stod(&[0u32])?;
+    let mut hidden_for_attn = GpuTensor::<f32>::from_host(
+        &device, &host_hidden,
+        Shape::from_static(&[1, cfg.hidden_size]), DType::F32,
+    )?;
+
+    eprintln!("[smoke] cold full-attn step (NVRTC compile included)");
+    let t0 = Instant::now();
+    full_attn_block_step(
+        &device, &cache, &mut hidden_for_attn,
+        &full_w.input_norm, &full_w.wq, &full_w.wk, &full_w.wv, &full_w.wo,
+        &full_w.q_norm, &full_w.k_norm,
+        &mut kv_cache, &mut full_bufs,
+        cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim,
+        cfg.rope_theta, cfg.rmsnorm_eps,
+        &cache_len_buf,
+    )?;
+    device.stream.synchronize()?;
+    eprintln!("[smoke] cold full-attn: {:.2} ms", t0.elapsed().as_secs_f64() * 1000.0);
+
+    eprintln!("[smoke] running 100 warm full-attn steps...");
+    let t0 = Instant::now();
+    for _ in 0..100 {
+        full_attn_block_step(
+            &device, &cache, &mut hidden_for_attn,
+            &full_w.input_norm, &full_w.wq, &full_w.wk, &full_w.wv, &full_w.wo,
+            &full_w.q_norm, &full_w.k_norm,
+            &mut kv_cache, &mut full_bufs,
+            cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim,
+            cfg.rope_theta, cfg.rmsnorm_eps,
+            &cache_len_buf,
+        )?;
+    }
+    device.stream.synchronize()?;
+    let total = t0.elapsed().as_secs_f64();
+    let attn_ms = total * 10.0;
+    eprintln!("[smoke] warm full-attn: {:.1} ms total / {:.3} ms per step / {:.1} blocks/sec",
+              total * 1000.0, attn_ms, 100.0 / total);
+
+    let attn_out_host: Vec<f32> = hidden_for_attn.to_host(&device)?;
+    let nonzero = attn_out_host.iter().filter(|&&x| x.abs() > 1e-9).count();
+    let max_abs = attn_out_host.iter().map(|&x| x.abs()).fold(0.0f32, f32::max);
+    eprintln!("[smoke] attn output: {} / {} nonzero, max |x| = {:e}",
+              nonzero, attn_out_host.len(), max_abs);
+
+    // ── Per-token projection ─────────────────────────────────────────
+    let gdn_ms = 0.296_f64;  // measured above
+    let estimated_per_token =
+        24.0 * gdn_ms + 32.0 * ffn_ms + 8.0 * attn_ms;
+    let estimated_tps = 1000.0 / estimated_per_token;
+    eprintln!("\n[smoke] ── Per-token projection ──");
+    eprintln!("[smoke] 24 × gdn ({:.3} ms) = {:.2} ms", gdn_ms, 24.0 * gdn_ms);
+    eprintln!("[smoke] 32 × ffn ({:.3} ms) = {:.2} ms", ffn_ms, 32.0 * ffn_ms);
+    eprintln!("[smoke]  8 × attn({:.3} ms) = {:.2} ms", attn_ms, 8.0 * attn_ms);
+    eprintln!("[smoke] (excluding embed + final norm + lm_head + sample)");
+    eprintln!("[smoke] estimated decode latency: {:.1} ms / {:.1} tok/s",
+              estimated_per_token, estimated_tps);
+
+    eprintln!("\n[smoke] ✓ SUCCESS — All 3 block types running on real Qwen3.5-9B weights.");
     Ok(())
 }
