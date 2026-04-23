@@ -71,6 +71,8 @@ pub mod sliding_window;
 pub mod speculative;
 mod stress_tests;
 pub mod swiglu;
+pub mod gated_delta_net;
+pub mod qwen3_5_generate;
 pub mod tensor;
 pub mod transformer;
 pub mod transformer_f16;

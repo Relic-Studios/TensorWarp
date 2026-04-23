@@ -9,6 +9,10 @@ description = "TensorWarp — a self-optimizing GPU inference engine"
 name = "tensorwarp"
 path = "src/main.rs"
 
+[[bin]]
+name = "qwen3_5_loader_smoke"
+path = "src/bin/qwen3_5_loader_smoke.rs"
+
 [dependencies]
 warp-ir.workspace = true
 warp-kernels.workspace = true
